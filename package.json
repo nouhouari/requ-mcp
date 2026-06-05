@@ -1,0 +1,36 @@
+{
+  "name": "requ-mcp",
+  "version": "0.1.0",
+  "description": "MCP server to track requirements coverage: Requirement → User Story → Acceptance Criterion → Conductor test.",
+  "type": "module",
+  "bin": {
+    "requ-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "prepare": "tsc"
+  },
+  "keywords": [
+    "mcp",
+    "requirements",
+    "traceability",
+    "coverage",
+    "conductor"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "yaml": "^2.5.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
