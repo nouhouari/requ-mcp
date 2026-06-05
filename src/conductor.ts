@@ -105,6 +105,83 @@ function parseFeatureFile(content: string, file: string): ConductorScenario[] {
   return scenarios;
 }
 
+async function dirExists(p: string): Promise<boolean> {
+  try {
+    return (await fs.stat(p)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    return (await fs.stat(p)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+const CUCUMBER_CONFIGS = [
+  "cucumber.js",
+  "cucumber.cjs",
+  "cucumber.mjs",
+  "cucumber.json",
+  "cucumber.yaml",
+  "cucumber.yml",
+];
+
+export interface ConductorInfo {
+  path: string;
+  exists: boolean;
+  /** Looks like a Conductor/cucumber project: has features/ or a cucumber config. */
+  isConductorProject: boolean;
+  hasFeaturesDir: boolean;
+  /** The cucumber config file found at the root, if any. */
+  cucumberConfig: string | null;
+  /** Project name: package.json "name" if present, else the folder name. */
+  name: string;
+  featureFiles: number;
+}
+
+/** Inspect a candidate Conductor project directory without modifying anything. */
+export async function inspectConductorProject(root: string): Promise<ConductorInfo> {
+  const exists = await dirExists(root);
+  const hasFeaturesDir = exists && (await dirExists(path.join(root, "features")));
+
+  let cucumberConfig: string | null = null;
+  if (exists) {
+    for (const c of CUCUMBER_CONFIGS) {
+      if (await fileExists(path.join(root, c))) {
+        cucumberConfig = c;
+        break;
+      }
+    }
+  }
+
+  let name = path.basename(root);
+  try {
+    const pkg = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
+    if (pkg && typeof pkg.name === "string" && pkg.name) name = pkg.name;
+  } catch {
+    // no package.json — keep folder name
+  }
+
+  let featureFiles = 0;
+  if (hasFeaturesDir) {
+    featureFiles = (await walk(path.join(root, "features"), (f) => f.endsWith(".feature"))).length;
+  }
+
+  return {
+    path: root,
+    exists,
+    isConductorProject: exists && (hasFeaturesDir || cucumberConfig !== null),
+    hasFeaturesDir,
+    cucumberConfig,
+    name,
+    featureFiles,
+  };
+}
+
 /** Build an index of all scenarios in a Conductor project. */
 export async function indexConductor(conductorRoot: string): Promise<ConductorIndex> {
   const featureFiles = await walk(path.join(conductorRoot, "features"), (f) => f.endsWith(".feature"));

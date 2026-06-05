@@ -74,7 +74,8 @@ npm run smoke      # optional: end-to-end self-test
 
 Then a typical flow, all driven through the agent:
 
-1. `init_project` — create `.requ/` and point at your Conductor project (`conductorPath`), optionally create a first phase.
+0. `check_conductor` *(optional)* — confirm the Conductor folder exists and see its detected name before initializing.
+1. `init_project` — points at your Conductor project (`conductorPath`); it **verifies the folder exists and is a real Conductor project** (has `features/` or a cucumber config) and reports its name before creating `.requ/`. Pass `force:true` to override.
 2. `create_requirement` — import the requirements (with `components`).
 3. `create_user_story` — PO authors stories, each tracing to ≥1 requirement.
 4. **Tag scenarios** `@US-007` in your feature files — that *is* the test link.
@@ -143,7 +144,8 @@ reviewable in PRs:
 
 | Tool | Actor | Purpose |
 |------|-------|---------|
-| `init_project` | setup | Create `.requ/`, record Conductor + report path, optional first phase |
+| `init_project` | setup | Verify the Conductor folder exists & is valid, then create `.requ/`, record Conductor + report path, optional first phase |
+| `check_conductor` | setup | Inspect the Conductor folder (exists? valid? name? feature count?) without writing anything |
 | `create_requirement` / `list_requirements` / `get_requirement` / `update_requirement` | server | Manage imported requirements (with `components`) |
 | `create_user_story` | PO | Author a story (rejects unless it links ≥1 existing requirement) |
 | `update_user_story` / `add_acceptance_criterion` / `list_user_stories` / `get_user_story` | PO | Edit stories & criteria |

@@ -162,6 +162,8 @@ export const Config = z.object({
    * Absolute, or relative to the .requ/ parent (the repo root).
    */
   conductorPath: z.string().default("."),
+  /** Detected name of the Conductor project (package.json name or folder name). */
+  conductorName: z.string().optional(),
   /** Default path to Conductor's cucumber-json result file (for import). */
   conductorReportPath: z.string().optional(),
   /** The phase new executions are recorded against by default. */

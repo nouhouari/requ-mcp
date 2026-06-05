@@ -23,6 +23,7 @@ import {
 import {
   danglingStoryTags,
   indexConductor,
+  inspectConductorProject,
   linkedScenarioKeys,
   scenariosByStory,
   validateTestRef,
@@ -152,7 +153,7 @@ tool(
   {
     title: "Initialize requ project",
     description:
-      "Create the `.requ/` directory at the resolved project root, record the Conductor project path and optional cucumber-json report path, and optionally create an initial phase. Idempotent.",
+      "Create the `.requ/` directory at the resolved project root, record the Conductor project path and optional cucumber-json report path, and optionally create an initial phase. Before writing, it verifies the Conductor folder exists and is a real Conductor project (has features/ or a cucumber config), and reports its detected name. Refuses if the folder is missing/invalid unless force=true. Idempotent.",
     inputSchema: {
       name: z.string().optional(),
       conductorPath: z.string().optional().describe("Path to the Conductor project root (has features/). Default '.'."),
@@ -161,13 +162,30 @@ tool(
         .optional()
         .describe("Default path to Conductor's cucumber-json result file, for import_execution_report."),
       initialPhase: z.string().optional().describe("If set, create and activate a first phase with this name."),
+      force: z.boolean().optional().describe("Initialize even if the Conductor folder is missing or not a Conductor project."),
     },
   },
   async (args, store) => {
     const existing = (await store.isInitialized()) ? await store.readConfig() : null;
+    const conductorPath = args.conductorPath ?? existing?.conductorPath ?? ".";
+
+    // Verify the Conductor folder is present and looks like a Conductor project
+    // BEFORE writing anything, and surface its detected name.
+    const conductorAbs = store.resolvePath(conductorPath);
+    const conductor = await inspectConductorProject(conductorAbs);
+    if (!conductor.isConductorProject && !args.force) {
+      return fail(
+        conductor.exists
+          ? `'${conductorAbs}' exists but doesn't look like a Conductor project (no features/ directory or cucumber config). Pass force:true to init anyway, or set the correct conductorPath.`
+          : `Conductor folder not found at '${conductorAbs}'. Set conductorPath to your Conductor project root (the folder containing features/), or pass force:true.`,
+        { conductor },
+      );
+    }
+
     const config = {
       name: args.name ?? existing?.name ?? path.basename(store.root),
-      conductorPath: args.conductorPath ?? existing?.conductorPath ?? ".",
+      conductorPath,
+      conductorName: conductor.isConductorProject ? conductor.name : existing?.conductorName,
       conductorReportPath: args.conductorReportPath ?? existing?.conductorReportPath,
       activePhase: existing?.activePhase,
     };
@@ -186,7 +204,40 @@ tool(
       await store.writePhase(phase);
       await store.writeConfig({ ...config, activePhase: phase.id });
     }
-    return json({ initialized: true, root: store.root, config: await store.readConfig(), phase });
+    return json({
+      initialized: true,
+      root: store.root,
+      config: await store.readConfig(),
+      conductor: {
+        path: conductor.path,
+        name: conductor.name,
+        isConductorProject: conductor.isConductorProject,
+        featureFiles: conductor.featureFiles,
+        cucumberConfig: conductor.cucumberConfig,
+      },
+      phase,
+    });
+  },
+);
+
+tool(
+  "check_conductor",
+  {
+    title: "Check the Conductor project",
+    description:
+      "Inspect the Conductor folder without modifying anything: whether it exists, looks like a Conductor project, its detected name, cucumber config, and number of .feature files. Pass conductorPath to check a candidate before init; otherwise uses the configured path.",
+    inputSchema: {
+      conductorPath: z.string().optional().describe("Candidate Conductor project root. Defaults to the configured conductorPath."),
+    },
+  },
+  async (args, store) => {
+    const candidate =
+      args.conductorPath !== undefined
+        ? store.resolvePath(args.conductorPath)
+        : (await store.isInitialized())
+          ? await store.conductorRoot()
+          : store.root;
+    return json(await inspectConductorProject(candidate));
   },
 );
 

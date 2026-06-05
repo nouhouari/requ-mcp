@@ -98,8 +98,17 @@ async function main() {
   };
 
   try {
+    // check_conductor inspects the folder without writing anything.
+    const pre = await call("check_conductor", { conductorPath: "." });
+    check("check_conductor detects a Conductor project (2 features)", pre.data.isConductorProject === true && pre.data.featureFiles === 2, pre.data);
+
+    // init refuses when the Conductor folder is missing.
+    const bad = await call("init_project", { conductorPath: "no-such-conductor" });
+    check("init refuses a missing Conductor folder", bad.isError === true, bad.data);
+
     const init = await call("init_project", { name: "Smoke", conductorPath: ".", initialPhase: "v1.0" });
     check("init creates active phase v1.0", init.data.phase?.id === "PHASE-001", init.data);
+    check("init reports the Conductor name + feature count", init.data.conductor?.featureFiles === 2 && typeof init.data.conductor?.name === "string", init.data.conductor);
 
     // Explicit projectPath argument resolves the same project.
     const viaPath = await call("list_phases", { projectPath: tmp });
