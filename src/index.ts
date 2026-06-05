@@ -46,7 +46,7 @@ function fail(message: string, extra?: Record<string, unknown>) {
   };
 }
 
-const server = new McpServer({ name: "requ-mcp", version: "0.4.0" });
+const server = new McpServer({ name: "requ-mcp", version: "0.1.0" });
 
 // ===========================================================================
 // Project resolution

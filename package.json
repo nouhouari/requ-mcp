@@ -1,7 +1,7 @@
 {
   "name": "requ-mcp",
   "version": "0.1.0",
-  "description": "MCP server to track requirements coverage: Requirement → User Story → Acceptance Criterion → Conductor test.",
+  "description": "MCP server to track requirements coverage and its evolution across phases/releases. Pairs with Conductor for e2e tests; links scenarios to user stories via @US-xxx tags.",
   "type": "module",
   "bin": {
     "requ-mcp": "dist/index.js"
@@ -9,20 +9,39 @@
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "smoke": "tsx scripts/smoke.ts",
-    "prepare": "tsc"
+    "prepare": "tsc",
+    "prepublishOnly": "tsc"
   },
   "keywords": [
     "mcp",
+    "model-context-protocol",
     "requirements",
     "traceability",
     "coverage",
-    "conductor"
+    "cucumber",
+    "conductor",
+    "e2e"
   ],
+  "author": "Nourreddine HOUARI <houarinourredine@gmail.com>",
   "license": "MIT",
+  "homepage": "https://github.com/nouhouari/requ-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nouhouari/requ-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nouhouari/requ-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "yaml": "^2.5.0",

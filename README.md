@@ -185,6 +185,30 @@ advertise the open workspace as a root, and you can always pass `projectPath`
 explicitly. The Conductor `features/` location is read from `.requ/config.yaml`
 relative to that resolved root.
 
+## Releasing (npm)
+
+Publishing is automated by `.github/workflows/publish.yml`, which runs on a
+GitHub Release and ships to npm with provenance.
+
+One-time setup:
+
+1. Create an npm **Automation** access token at npmjs.com → Access Tokens.
+2. Add it as a repo secret named `NPM_TOKEN`
+   (`gh secret set NPM_TOKEN`, or repo → Settings → Secrets → Actions).
+
+To cut a release:
+
+```bash
+# bump the version in package.json (e.g. 0.1.0), commit, then:
+git tag v0.1.0
+git push origin v0.1.0
+gh release create v0.1.0 --generate-notes
+```
+
+The workflow verifies the tag matches `package.json`, builds, runs the smoke
+test, and publishes. The release tag (`vX.Y.Z`) must match the `package.json`
+version.
+
 ## Coverage metrics (story-level)
 
 - **Story coverage** — % of active requirements that trace to ≥1 story.
