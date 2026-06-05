@@ -1,6 +1,9 @@
 # requ-mcp
 
 [![CI](https://github.com/nouhouari/requ-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/nouhouari/requ-mcp/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/requ-mcp.svg)](https://www.npmjs.com/package/requ-mcp)
+
+📦 **Published on npm:** [npmjs.com/package/requ-mcp](https://www.npmjs.com/package/requ-mcp)
 
 An MCP server that tracks **requirements coverage** for a project, and how it
 **evolves across phases/releases**. It gives AI agents structured tools to
@@ -21,6 +24,37 @@ release over release.
 
 ## Quickstart
 
+It's on npm — no clone or build needed. Register it with your MCP client
+(e.g. Claude Code) once, globally, via `npx`:
+
+```json
+{
+  "mcpServers": {
+    "requ": {
+      "command": "npx",
+      "args": ["-y", "requ-mcp"]
+    }
+  }
+}
+```
+
+Or install it globally and point at the binary:
+
+```bash
+npm install -g requ-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "requ": { "command": "requ-mcp" }
+  }
+}
+```
+
+<details>
+<summary>From source instead</summary>
+
 ```bash
 git clone https://github.com/nouhouari/requ-mcp.git
 cd requ-mcp
@@ -29,18 +63,14 @@ npm run build      # compiles to dist/
 npm run smoke      # optional: end-to-end self-test
 ```
 
-Register it with your MCP client (e.g. Claude Code) — once, globally:
-
 ```json
 {
   "mcpServers": {
-    "requ": {
-      "command": "node",
-      "args": ["/absolute/path/to/requ-mcp/dist/index.js"]
-    }
+    "requ": { "command": "node", "args": ["/absolute/path/to/requ-mcp/dist/index.js"] }
   }
 }
 ```
+</details>
 
 Then a typical flow, all driven through the agent:
 
@@ -153,26 +183,15 @@ npm run smoke      # end-to-end test against the built server over stdio
 npm run dev        # run from source with tsx
 ```
 
-## Register with an MCP client
+## How it finds the project
 
-The server talks stdio. It can be installed **once at the user level** and serve
-any project — it resolves the target project per call:
-
-```json
-{
-  "mcpServers": {
-    "requ": {
-      "command": "node",
-      "args": ["/absolute/path/to/requ-mcp/dist/index.js"]
-    }
-  }
-}
-```
-
-### How it finds the project
+The server talks stdio and can be installed **once at the user level**
+(see [Quickstart](#quickstart)) to serve any project — it resolves the target
+project per call.
 
 For each tool call, the project root (the directory containing `.requ/`) is
-resolved in this order:
+resolved in this order (pass `REQU_ROOT` via an `env` block in the MCP config to
+pin one explicitly):
 
 1. The tool's explicit **`projectPath`** argument, if given (use this in monorepos).
 2. The **`REQU_ROOT`** env var, if set at launch (a hard pin).
