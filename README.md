@@ -1,19 +1,55 @@
 # requ-mcp
 
+[![CI](https://github.com/nouhouari/requ-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/nouhouari/requ-mcp/actions/workflows/ci.yml)
+
 An MCP server that tracks **requirements coverage** for a project, and how it
 **evolves across phases/releases**. It gives AI agents structured tools to
 maintain a living traceability graph:
 
 ```
-Requirement → User Story → Acceptance Criterion → TestLink ──┐
-                                                              │ resolved per phase
-Phase (v1.0, v1.1, …) → Execution (a test result for a run) ─┘
+Requirement → User Story → (descriptive acceptance criteria)
+                 ▲
+                 │  link = an @US-xxx tag on a cucumber scenario
+                 │
+Phase (v1.0, v1.1, …) → Execution (a scenario result for a run)
 ```
 
 At the end of a working session — or for any release — you ask the server one
 question — *"what's our coverage?"* — and get a precise, always-current answer
 instead of a stale spreadsheet, plus the **trend** of how coverage changed
 release over release.
+
+## Quickstart
+
+```bash
+git clone https://github.com/nouhouari/requ-mcp.git
+cd requ-mcp
+npm install
+npm run build      # compiles to dist/
+npm run smoke      # optional: end-to-end self-test
+```
+
+Register it with your MCP client (e.g. Claude Code) — once, globally:
+
+```json
+{
+  "mcpServers": {
+    "requ": {
+      "command": "node",
+      "args": ["/absolute/path/to/requ-mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+Then a typical flow, all driven through the agent:
+
+1. `init_project` — create `.requ/` and point at your Conductor project (`conductorPath`), optionally create a first phase.
+2. `create_requirement` — import the requirements (with `components`).
+3. `create_user_story` — PO authors stories, each tracing to ≥1 requirement.
+4. **Tag scenarios** `@US-007` in your feature files — that *is* the test link.
+5. `import_execution_report` — ingest a Conductor cucumber-json run into the active phase.
+6. `coverage_report` / `find_gaps` / `coverage_trend` — see coverage now and how it evolves.
 
 ## Why
 
