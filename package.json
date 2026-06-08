@@ -15,6 +15,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
+    "start:http": "REQU_TRANSPORT=http tsx src/index.ts",
     "smoke": "tsx scripts/smoke.ts",
     "prepare": "tsc",
     "prepublishOnly": "tsc"
@@ -43,11 +44,13 @@
     "access": "public"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.1.0",
+    "better-sqlite3": "^9.0.0",
     "yaml": "^2.5.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"

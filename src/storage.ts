@@ -2,12 +2,14 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import {
+  Component,
   Config,
   Execution,
   ExecutionLog,
   Phase,
   Requirement,
   UserStory,
+  type Component as TComponent,
   type Config as TConfig,
   type Execution as TExecution,
   type Phase as TPhase,
@@ -16,13 +18,14 @@ import {
 } from "./schema.js";
 
 /**
- * File-backed store for the `.requ/` directory.
+ * File-backed store for the `.requ/` directory (stdio / YAML mode).
  *
  *   <root>/.requ/config.yaml
+ *   <root>/.requ/components/C-auth.yaml
  *   <root>/.requ/requirements/REQ-001.yaml
  *   <root>/.requ/stories/US-001.yaml
- *   <root>/.requ/phases/PHASE-001.yaml
- *   <root>/.requ/executions/PHASE-001.yaml   (append-style run log)
+ *   <root>/.requ/phases/P1.yaml
+ *   <root>/.requ/executions/P1.yaml   (append-style run log)
  */
 export class Store {
   readonly root: string;
@@ -33,36 +36,23 @@ export class Store {
     this.baseDir = path.join(this.root, ".requ");
   }
 
-  private get reqDir() {
-    return path.join(this.baseDir, "requirements");
-  }
-  private get storyDir() {
-    return path.join(this.baseDir, "stories");
-  }
-  private get phaseDir() {
-    return path.join(this.baseDir, "phases");
-  }
-  private get execDir() {
-    return path.join(this.baseDir, "executions");
-  }
-  private get configPath() {
-    return path.join(this.baseDir, "config.yaml");
-  }
+  private get componentDir() { return path.join(this.baseDir, "components"); }
+  private get reqDir()       { return path.join(this.baseDir, "requirements"); }
+  private get storyDir()     { return path.join(this.baseDir, "stories"); }
+  private get phaseDir()     { return path.join(this.baseDir, "phases"); }
+  private get execDir()      { return path.join(this.baseDir, "executions"); }
+  private get configPath()   { return path.join(this.baseDir, "config.yaml"); }
 
   async isInitialized(): Promise<boolean> {
-    try {
-      await fs.access(this.configPath);
-      return true;
-    } catch {
-      return false;
-    }
+    try { await fs.access(this.configPath); return true; } catch { return false; }
   }
 
   async init(config: TConfig): Promise<void> {
-    await fs.mkdir(this.reqDir, { recursive: true });
-    await fs.mkdir(this.storyDir, { recursive: true });
-    await fs.mkdir(this.phaseDir, { recursive: true });
-    await fs.mkdir(this.execDir, { recursive: true });
+    await fs.mkdir(this.componentDir, { recursive: true });
+    await fs.mkdir(this.reqDir,       { recursive: true });
+    await fs.mkdir(this.storyDir,     { recursive: true });
+    await fs.mkdir(this.phaseDir,     { recursive: true });
+    await fs.mkdir(this.execDir,      { recursive: true });
     await this.writeConfig(config);
   }
 
@@ -88,6 +78,22 @@ export class Store {
   /** Resolve a possibly-relative path against the repo root. */
   resolvePath(p: string): string {
     return path.isAbsolute(p) ? p : path.resolve(this.root, p);
+  }
+
+  // --- components ---
+
+  async listComponents(): Promise<TComponent[]> {
+    return this.readAll(this.componentDir, Component);
+  }
+
+  async getComponent(id: string): Promise<TComponent | null> {
+    return this.readOne(path.join(this.componentDir, `${id}.yaml`), Component);
+  }
+
+  async writeComponent(comp: TComponent): Promise<void> {
+    await fs.mkdir(this.componentDir, { recursive: true });
+    const v = Component.parse(comp);
+    await fs.writeFile(path.join(this.componentDir, `${v.id}.yaml`), YAML.stringify(v), "utf8");
   }
 
   // --- requirements ---

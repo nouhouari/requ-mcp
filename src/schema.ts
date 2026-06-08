@@ -4,15 +4,13 @@ import { z } from "zod";
  * The requ-mcp data model.
  *
  * Traceability spine:
- *   Requirement → User Story → Acceptance Criterion → TestLink ──┐
- *                                                                 │ (resolved per phase)
- *   Phase → Execution (test result for a given run) ─────────────┘
+ *   Component ← Requirement → User Story → (acceptance criteria)
+ *                                ↑
+ *   Phase → Execution (a scenario result for a run) ─── @US-xxx tag in feature files
  *
- * A TestLink is pure intent ("this Conductor test verifies this criterion").
- * Results are Executions owned by a Phase, so coverage is computed *per phase*
- * and its evolution can be tracked across releases.
- *
- * Everything is persisted as flat YAML in `.requ/`.
+ * Component: a sub-system/module that maps to broker domain_tags.
+ * Phase.id is free-form — use the same value as the broker phase_id (e.g. "P1")
+ * so both systems share a single identifier.
  */
 
 // ---------------------------------------------------------------------------
@@ -24,6 +22,26 @@ export type Priority = z.infer<typeof Priority>;
 
 /** ISO-8601 timestamp string. */
 export const Timestamp = z.string();
+
+// ---------------------------------------------------------------------------
+// Component — sub-system/module; maps to broker domain_tags
+// ---------------------------------------------------------------------------
+
+export const ComponentStatus = z.enum(["active", "deprecated"]);
+export type ComponentStatus = z.infer<typeof ComponentStatus>;
+
+export const Component = z.object({
+  /** Unique identifier. Use the same value as broker domain_tag (e.g. 'C-auth'). */
+  id: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string().default(""),
+  /** Broker routing tags this component maps to. E.g. ["auth","security"]. */
+  domainTags: z.array(z.string()).default([]),
+  status: ComponentStatus.default("active"),
+  createdAt: Timestamp,
+  updatedAt: Timestamp,
+});
+export type Component = z.infer<typeof Component>;
 
 // ---------------------------------------------------------------------------
 // Requirement — imported source of truth ("what must be built")
@@ -39,7 +57,7 @@ export const Requirement = z.object({
   /** Provenance: where this requirement came from (doc, spec section, ticket). */
   source: z.string().default(""),
   priority: Priority.default("medium"),
-  /** Sub-systems / modules this requirement belongs to (used to slice coverage). */
+  /** Component IDs this requirement belongs to (matches Component.id). */
   components: z.array(z.string()).default([]),
   tags: z.array(z.string()).default([]),
   status: RequirementStatus.default("active"),
@@ -49,7 +67,7 @@ export const Requirement = z.object({
 export type Requirement = z.infer<typeof Requirement>;
 
 // ---------------------------------------------------------------------------
-// Conductor test identity (shared by TestLink and Execution)
+// Conductor test identity (shared by Execution)
 // ---------------------------------------------------------------------------
 
 export const TestStatus = z.enum(["pass", "fail", "pending"]);
@@ -57,12 +75,7 @@ export type TestStatus = z.infer<typeof TestStatus>;
 
 /**
  * Identity of a Conductor test = a cucumber scenario, addressed by its feature
- * name + scenario name. Maestro flows run through cucumber step definitions and
- * appear in the report as scenarios too, so this is the single unit of linkage.
- *
- * Scenario → story links are NOT stored here. They live in the feature files as
- * `@US-xxx` tags and are derived by scanning the Conductor project (see
- * conductor.ts). Executions reference scenarios by this identity.
+ * name + scenario name.
  */
 const testIdentity = {
   feature: z.string().min(1),
@@ -78,7 +91,7 @@ export function testKey(t: { feature: string; name: string }): string {
 export const STORY_TAG_RE = /^@?(US-\d+)$/;
 
 // ---------------------------------------------------------------------------
-// Acceptance Criterion — descriptive PO content (not individually tested)
+// Acceptance Criterion — descriptive PO content
 // ---------------------------------------------------------------------------
 
 export const AcceptanceCriterion = z.object({
@@ -108,14 +121,19 @@ export const UserStory = z.object({
 export type UserStory = z.infer<typeof UserStory>;
 
 // ---------------------------------------------------------------------------
-// Phase / Release — the dimension coverage evolves along
+// Phase / Release — id is free-form to align with broker phase_id (e.g. "P1")
 // ---------------------------------------------------------------------------
 
 export const PhaseStatus = z.enum(["planned", "active", "completed"]);
 export type PhaseStatus = z.infer<typeof PhaseStatus>;
 
 export const Phase = z.object({
-  id: z.string().regex(/^PHASE-\d+$/, "id must look like PHASE-001"),
+  /**
+   * Free-form identifier. Use the same value as the broker phase_id
+   * (e.g. "P1", "Sprint-3") so both systems share one identifier.
+   * Previously required PHASE-\d+ format; that format is still valid.
+   */
+  id: z.string().min(1),
   name: z.string().min(1),
   /** Sort key for evolution; lower = earlier. */
   order: z.number().int(),
@@ -144,9 +162,9 @@ export const Execution = z.object({
 });
 export type Execution = z.infer<typeof Execution>;
 
-/** Per-phase execution log file shape. */
+/** Per-phase execution log file shape (YAML mode). */
 export const ExecutionLog = z.object({
-  phase: z.string().regex(/^PHASE-\d+$/),
+  phase: z.string(),
   runs: z.array(Execution).default([]),
 });
 export type ExecutionLog = z.infer<typeof ExecutionLog>;
@@ -157,17 +175,11 @@ export type ExecutionLog = z.infer<typeof ExecutionLog>;
 
 export const Config = z.object({
   name: z.string().default("requ project"),
-  /**
-   * Path to the Conductor project root (dir containing features/ and flows/).
-   * Absolute, or relative to the .requ/ parent (the repo root).
-   */
   conductorPath: z.string().default("."),
-  /** Detected name of the Conductor project (package.json name or folder name). */
   conductorName: z.string().optional(),
-  /** Default path to Conductor's cucumber-json result file (for import). */
   conductorReportPath: z.string().optional(),
-  /** The phase new executions are recorded against by default. */
-  activePhase: z.string().regex(/^PHASE-\d+$/).optional(),
+  /** Free-form phase identifier (e.g. "P1"). */
+  activePhase: z.string().optional(),
 });
 export type Config = z.infer<typeof Config>;
 
