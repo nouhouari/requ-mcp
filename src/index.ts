@@ -6,7 +6,10 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import url from "node:url";
 import { Store } from "./storage.js";
+import { SqliteStore } from "./sqlite-store.js";
 import {
+  Component,
+  ComponentStatus,
   CoverageMode,
   Priority,
   PhaseStatus,
@@ -15,6 +18,7 @@ import {
   TestStatus,
   testKey,
   type AcceptanceCriterion,
+  type Component as TComponent,
   type Execution,
   type Phase,
   type Requirement,
@@ -49,12 +53,13 @@ function fail(message: string, extra?: Record<string, unknown>) {
 
 const server = new McpServer({ name: "requ-mcp", version: "0.2.0" });
 
+/** Singleton SqliteStore for HTTP mode (one DB connection for server lifetime). */
+let _sqliteStore: SqliteStore | null = null;
+
+type AnyStore = Store | SqliteStore;
+
 // ===========================================================================
 // Project resolution
-//
-// A user-level (global) server must figure out which project each call targets.
-// Precedence: explicit projectPath → REQU_ROOT → a workspace root (MCP roots)
-// or cwd-ancestor that already contains `.requ/` → first workspace root → cwd.
 // ===========================================================================
 
 let cachedRoots: string[] | null = null;
@@ -67,18 +72,13 @@ async function workspaceRoots(): Promise<string[]> {
       .filter((u) => u.startsWith("file://"))
       .map((u) => url.fileURLToPath(u));
   } catch {
-    cachedRoots = []; // client doesn't support roots
+    cachedRoots = [];
   }
   return cachedRoots;
 }
 
 async function hasRequ(dir: string): Promise<boolean> {
-  try {
-    await fs.access(path.join(dir, ".requ"));
-    return true;
-  } catch {
-    return false;
-  }
+  try { await fs.access(path.join(dir, ".requ")); return true; } catch { return false; }
 }
 
 async function findUp(start: string): Promise<string | null> {
@@ -95,13 +95,18 @@ async function resolveRoot(explicit?: string): Promise<string> {
   if (explicit) return path.resolve(explicit);
   if (process.env.REQU_ROOT) return path.resolve(process.env.REQU_ROOT);
   const roots = await workspaceRoots();
-  for (const r of roots) if (await hasRequ(r)) return r; // initialized workspace wins
+  for (const r of roots) if (await hasRequ(r)) return r;
   const found = await findUp(process.cwd());
   if (found) return found;
-  return roots[0] ?? process.cwd(); // not yet initialized
+  return roots[0] ?? process.cwd();
 }
 
-async function getStore(explicit?: string): Promise<Store> {
+async function getStore(explicit?: string): Promise<AnyStore> {
+  if (process.env.REQU_TRANSPORT === "http") {
+    const root = await resolveRoot(explicit);
+    if (!_sqliteStore) _sqliteStore = new SqliteStore(root);
+    return _sqliteStore;
+  }
   return new Store(await resolveRoot(explicit));
 }
 
@@ -112,7 +117,7 @@ const projectPathSchema = z
     "Absolute path to the project root (the dir containing .requ/). Omit to auto-detect: REQU_ROOT, else a workspace root or ancestor of the cwd that contains .requ/.",
   );
 
-type Handler = (args: any, store: Store) => Promise<unknown>;
+type Handler = (args: any, store: AnyStore) => Promise<unknown>;
 
 /** Register a tool that auto-injects `projectPath` and resolves the Store. */
 function tool(
@@ -131,7 +136,7 @@ function tool(
   });
 }
 
-async function ensureInit(store: Store) {
+async function ensureInit(store: AnyStore) {
   if (!(await store.isInitialized())) {
     throw new Error(
       `requ project not initialized at ${store.root}. Run \`init_project\` first (pass projectPath to target a specific directory).`,
@@ -139,7 +144,7 @@ async function ensureInit(store: Store) {
   }
 }
 
-async function loadConductorIndex(store: Store): Promise<{ root: string; index: ConductorIndex }> {
+async function loadConductorIndex(store: AnyStore): Promise<{ root: string; index: ConductorIndex }> {
   const root = await store.conductorRoot();
   return { root, index: await indexConductor(root) };
 }
@@ -169,8 +174,6 @@ tool(
     const existing = (await store.isInitialized()) ? await store.readConfig() : null;
     const conductorPath = args.conductorPath ?? existing?.conductorPath ?? ".";
 
-    // Verify the Conductor folder is present and looks like a Conductor project
-    // BEFORE writing anything, and surface its detected name.
     const conductorAbs = store.resolvePath(conductorPath);
     const conductor = await inspectConductorProject(conductorAbs);
     if (!conductor.isConductorProject && !args.force) {
@@ -193,7 +196,7 @@ tool(
     let phase: Phase | undefined;
     if (args.initialPhase) {
       phase = {
-        id: "PHASE-001",
+        id: "P1",
         name: args.initialPhase,
         order: 1,
         status: "active",
@@ -242,6 +245,99 @@ tool(
 );
 
 // ===========================================================================
+// Components
+// ===========================================================================
+
+tool(
+  "create_component",
+  {
+    title: "Create component",
+    description:
+      "Register a sub-system/component. The id should match broker domain_tags (e.g. 'C-auth' with domainTags=['auth','security']). Requirements reference component IDs in their components[] field. Coverage reports slice by component.",
+    inputSchema: {
+      id:          z.string().min(1).describe("Unique identifier, e.g. 'C-auth'. Should match broker domain_tags."),
+      name:        z.string().min(1).describe("Human-readable name, e.g. 'Authentication'."),
+      description: z.string().optional(),
+      domainTags:  z.array(z.string()).optional().describe("Broker routing tags this component maps to, e.g. ['auth','security']."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const existing = await store.listComponents();
+    if (existing.some((c) => c.id === args.id)) return fail(`Component ${args.id} already exists.`);
+    const comp: TComponent = {
+      id:          args.id,
+      name:        args.name,
+      description: args.description ?? "",
+      domainTags:  args.domainTags ?? [],
+      status:      "active",
+      createdAt:   now(),
+      updatedAt:   now(),
+    };
+    await store.writeComponent(comp);
+    return json(comp);
+  },
+);
+
+tool(
+  "list_components",
+  {
+    title: "List components",
+    description: "List all registered components, optionally filtered by status.",
+    inputSchema: { status: ComponentStatus.optional() },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    let comps = await store.listComponents();
+    if (args.status) comps = comps.filter((c) => c.status === args.status);
+    return json(comps);
+  },
+);
+
+tool(
+  "get_component",
+  {
+    title: "Get component",
+    description: "Fetch one component and the requirements that reference it.",
+    inputSchema: { id: z.string().min(1) },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const comp = await store.getComponent(args.id);
+    if (!comp) return fail(`Component ${args.id} not found.`);
+    const reqs = await store.listRequirements();
+    return json({ ...comp, linkedRequirements: reqs.filter((r) => r.components.includes(args.id)).map((r) => r.id) });
+  },
+);
+
+tool(
+  "update_component",
+  {
+    title: "Update component",
+    description: "Update a component's name, description, domainTags, or status.",
+    inputSchema: {
+      id:          z.string().min(1),
+      name:        z.string().optional(),
+      description: z.string().optional(),
+      domainTags:  z.array(z.string()).optional(),
+      status:      ComponentStatus.optional(),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const comp = await store.getComponent(args.id);
+    if (!comp) return fail(`Component ${args.id} not found.`);
+    if (args.name        !== undefined) comp.name        = args.name;
+    if (args.description !== undefined) comp.description = args.description;
+    if (args.domainTags  !== undefined) comp.domainTags  = args.domainTags;
+    if (args.status      !== undefined) comp.status      = args.status;
+    comp.updatedAt = now();
+    await store.writeComponent(comp);
+    return json(comp);
+  },
+);
+
+// ===========================================================================
 // Requirements
 // ===========================================================================
 
@@ -249,19 +345,33 @@ tool(
   "create_requirement",
   {
     title: "Create requirement",
-    description: "Register an imported requirement (the upstream 'what must be built').",
+    description: "Register an imported requirement (the upstream 'what must be built'). components[] must contain valid Component IDs if any components have been registered.",
     inputSchema: {
       title: z.string(),
       description: z.string().optional(),
       source: z.string().optional().describe("Provenance: doc, spec section, ticket id."),
       priority: Priority.optional(),
-      components: z.array(z.string()).optional().describe("Sub-systems/modules this requirement belongs to."),
+      components: z.array(z.string()).optional().describe("Component IDs this requirement belongs to (matches Component.id)."),
       tags: z.array(z.string()).optional(),
       id: z.string().regex(/^REQ-\d+$/).optional(),
     },
   },
   async (args, store) => {
     await ensureInit(store);
+
+    // Validate component IDs if components exist
+    if (args.components?.length) {
+      const existingComps = await store.listComponents();
+      if (existingComps.length > 0) {
+        const unknown = (args.components as string[]).filter((c: string) => !existingComps.some((e) => e.id === c));
+        if (unknown.length) {
+          return fail(`Unknown component(s): ${unknown.join(", ")}. Create them first with create_component.`, {
+            knownComponents: existingComps.map((c) => c.id),
+          });
+        }
+      }
+    }
+
     const existing = await store.listRequirements();
     const id = args.id ?? Store.nextId("REQ", existing.map((r) => r.id));
     if (existing.some((r) => r.id === id)) return fail(`Requirement ${id} already exists.`);
@@ -360,7 +470,7 @@ tool(
       "Author a user story. MUST link ≥1 existing requirement (validated). Acceptance criteria are descriptive; tests are linked by tagging scenarios with @<this story id> in the feature files.",
     inputSchema: {
       title: z.string(),
-      requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1),
+      requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1).describe("IDs of existing requirements this story implements."),
       description: z.string().optional(),
       acceptanceCriteria: z.array(z.string()).optional().describe("Descriptive criterion texts."),
       id: z.string().regex(/^US-\d+$/).optional(),
@@ -504,32 +614,33 @@ tool(
   {
     title: "Create phase/release",
     description:
-      "Create a phase (sprint or release) to capture coverage at a point in time. Order auto-increments. Optionally make it the active phase.",
+      "Create a phase (sprint or release). The id must be unique and MUST match the broker phase_id (e.g. 'P1', 'Sprint-3') so both systems share the same identifier. Order auto-increments if not provided. Optionally make it the active phase.",
     inputSchema: {
-      name: z.string().describe("e.g. 'v1.0', 'Sprint 3'."),
-      order: z.number().int().optional().describe("Sort key; defaults to max+1."),
+      id:          z.string().min(1).describe("Phase identifier; use the same value as broker phase_id (e.g. 'P1', 'Sprint-3')."),
+      name:        z.string().describe("e.g. 'Phase 1 MVP', 'Sprint 3'."),
+      order:       z.number().int().optional().describe("Sort key; defaults to max+1."),
       description: z.string().optional(),
-      activate: z.boolean().optional(),
+      activate:    z.boolean().optional().describe("Make this the active phase."),
     },
   },
   async (args, store) => {
     await ensureInit(store);
     const existing = await store.listPhases();
-    const id = Store.nextId("PHASE", existing.map((p) => p.id));
+    if (existing.some((p) => p.id === args.id)) return fail(`Phase ${args.id} already exists.`);
     const order = args.order ?? (existing.reduce((m, p) => Math.max(m, p.order), 0) + 1);
     const phase: Phase = {
-      id,
-      name: args.name,
+      id:          args.id,
+      name:        args.name,
       order,
-      status: args.activate ? "active" : "planned",
+      status:      args.activate ? "active" : "planned",
       description: args.description ?? "",
-      createdAt: now(),
-      updatedAt: now(),
+      createdAt:   now(),
+      updatedAt:   now(),
     };
     await store.writePhase(phase);
     if (args.activate || existing.length === 0) {
       const cfg = await store.readConfig();
-      await store.writeConfig({ ...cfg, activePhase: id });
+      await store.writeConfig({ ...cfg, activePhase: args.id });
     }
     return json(phase);
   },
@@ -551,10 +662,10 @@ tool(
     title: "Update phase",
     description: "Update a phase's name, order, status, or description.",
     inputSchema: {
-      id: z.string().regex(/^PHASE-\d+$/),
-      name: z.string().optional(),
-      order: z.number().int().optional(),
-      status: PhaseStatus.optional(),
+      id:          z.string().min(1),
+      name:        z.string().optional(),
+      order:       z.number().int().optional(),
+      status:      PhaseStatus.optional(),
       description: z.string().optional(),
     },
   },
@@ -576,7 +687,7 @@ tool(
   {
     title: "Set active phase",
     description: "Set which phase new executions are recorded against by default.",
-    inputSchema: { id: z.string().regex(/^PHASE-\d+$/) },
+    inputSchema: { id: z.string().min(1) },
   },
   async (args, store) => {
     await ensureInit(store);
@@ -588,7 +699,7 @@ tool(
 );
 
 // ===========================================================================
-// Links (derived from @US-xxx scenario tags) — discovery & validation
+// Links (derived from @US-xxx scenario tags)
 // ===========================================================================
 
 tool(
@@ -628,14 +739,14 @@ tool(
   {
     title: "Record a test execution",
     description:
-      "Record one scenario result against a phase (default: active). Validated against the Conductor project. Use for ad-hoc results or corrections; use import_execution_report for whole cucumber runs.",
+      "Record one scenario result against a phase (default: active). Validated against the Conductor project. Use for ad-hoc results or for teams running on a different machine than the requ-mcp server (no local file access needed). Use import_execution_report for whole cucumber runs on the same machine.",
     inputSchema: {
       feature: z.string().describe("Feature name (the `Feature:` line)."),
-      name: z.string().describe("Scenario name (the `Scenario:` line)."),
-      status: TestStatus,
-      phase: z.string().regex(/^PHASE-\d+$/).optional().describe("Defaults to the active phase."),
-      runId: z.string().optional(),
-      note: z.string().optional(),
+      name:    z.string().describe("Scenario name (the `Scenario:` line)."),
+      status:  TestStatus,
+      phase:   z.string().optional().describe("Phase ID (e.g. 'P1'). Defaults to the active phase."),
+      runId:   z.string().optional(),
+      note:    z.string().optional(),
     },
   },
   async (args, store) => {
@@ -651,12 +762,12 @@ tool(
 
     const exec: Execution = {
       feature: args.feature,
-      name: args.name,
-      status: args.status,
-      ranAt: now(),
-      runId: args.runId,
-      source: "manual",
-      note: args.note,
+      name:    args.name,
+      status:  args.status,
+      ranAt:   now(),
+      runId:   args.runId,
+      source:  "manual",
+      note:    args.note,
     };
     await store.appendExecutions(phaseId, [exec]);
     return json({ phase: phaseId, recorded: exec });
@@ -668,11 +779,11 @@ tool(
   {
     title: "Import Conductor cucumber-json report",
     description:
-      "Parse a Conductor cucumber-js JSON result file and record one execution per scenario into a phase (default: active). Reports how many scenarios are tagged to a story. Path defaults to config.conductorReportPath.",
+      "Parse a Conductor cucumber-js JSON result file and record one execution per scenario into a phase (default: active). Reports how many scenarios are tagged to a story. Path defaults to config.conductorReportPath. Requires the report file to be accessible on the machine running requ-mcp.",
     inputSchema: {
       filePath: z.string().optional().describe("Path to the cucumber-json file. Defaults to config.conductorReportPath."),
-      phase: z.string().regex(/^PHASE-\d+$/).optional(),
-      runId: z.string().optional().describe("Run identifier stamped on every imported execution."),
+      phase:    z.string().optional().describe("Phase ID (e.g. 'P1'). Defaults to active phase."),
+      runId:    z.string().optional().describe("Run identifier stamped on every imported execution."),
     },
   },
   async (args, store) => {
@@ -683,18 +794,12 @@ tool(
     const file = store.resolvePath(rel);
 
     let content: string;
-    try {
-      content = await fs.readFile(file, "utf8");
-    } catch {
-      return fail(`Cannot read report file: ${file}`);
-    }
+    try { content = await fs.readFile(file, "utf8"); }
+    catch { return fail(`Cannot read report file: ${file}`); }
 
     let scenarios;
-    try {
-      scenarios = parseCucumberJson(content);
-    } catch (e) {
-      return fail(`Failed to parse report: ${(e as Error).message}`);
-    }
+    try { scenarios = parseCucumberJson(content); }
+    catch (e) { return fail(`Failed to parse report: ${(e as Error).message}`); }
 
     const phaseId = await store.resolvePhaseId(args.phase);
     if (!phaseId) return fail("No phase to record against. Create one with create_phase.");
@@ -703,8 +808,8 @@ tool(
     const ranAt = now();
     const execs: Execution[] = scenarios.map((s) => ({
       feature: s.feature,
-      name: s.name,
-      status: s.status,
+      name:    s.name,
+      status:  s.status,
       ranAt,
       runId: args.runId,
       source: "cucumber-json",
@@ -715,8 +820,8 @@ tool(
     const linked = linkedScenarioKeys(index);
     const matched = execs.filter((e) => linked.has(testKey(e)));
     const counts = {
-      pass: execs.filter((e) => e.status === "pass").length,
-      fail: execs.filter((e) => e.status === "fail").length,
+      pass:    execs.filter((e) => e.status === "pass").length,
+      fail:    execs.filter((e) => e.status === "fail").length,
       pending: execs.filter((e) => e.status === "pending").length,
     };
     return json({
@@ -733,10 +838,10 @@ tool(
 );
 
 // ===========================================================================
-// Reporting (phase- and mode-aware, story-level)
+// Reporting
 // ===========================================================================
 
-async function resolveForReport(store: Store, phase?: string, mode?: CoverageMode) {
+async function resolveForReport(store: AnyStore, phase?: string, mode?: CoverageMode) {
   const [reqs, stories, phases, execByPhase, { index }] = await Promise.all([
     store.listRequirements(),
     store.listStories(),
@@ -756,10 +861,10 @@ tool(
   {
     title: "Coverage report",
     description:
-      "Story-level coverage for a phase: requirement → story → tagged scenarios, per-component breakdown, summary %. mode='cumulative' (latest result as of the phase) or 'strict' (only this phase's runs). Defaults to active phase, cumulative.",
+      "Story-level coverage for a phase: requirement → story → tagged scenarios, per-component breakdown (with component name and domainTags), summary %. mode='cumulative' (latest result as of the phase) or 'strict' (only this phase's runs). Defaults to active phase, cumulative.",
     inputSchema: {
-      phase: z.string().regex(/^PHASE-\d+$/).optional(),
-      mode: CoverageMode.optional(),
+      phase:  z.string().optional().describe("Phase ID (e.g. 'P1'). Defaults to active phase."),
+      mode:   CoverageMode.optional(),
       format: z.enum(["json", "markdown"]).optional(),
     },
   },
@@ -767,12 +872,24 @@ tool(
     await ensureInit(store);
     const { reqs, stories, byStory, status, phaseId, mode } = await resolveForReport(store, args.phase, args.mode);
     const report = buildReport(reqs, stories, byStory, status, phaseId, mode);
+
+    // Enrich byComponent with component name and domainTags
+    const components = await store.listComponents();
+    const compMap = new Map(components.map((c) => [c.id, c]));
+    const enrichedByComponent = report.byComponent.map((bc) => ({
+      ...bc,
+      componentName: compMap.get(bc.component)?.name ?? bc.component,
+      domainTags:    compMap.get(bc.component)?.domainTags ?? [],
+    }));
+
+    const enrichedReport = { ...report, byComponent: enrichedByComponent };
+
     if (args.format === "markdown") {
       const phases = await store.listPhases();
       const name = phases.find((p) => p.id === phaseId)?.name ?? "(none)";
-      return text(renderMarkdown(report, name));
+      return text(renderMarkdown(enrichedReport, name));
     }
-    return json(report);
+    return json(enrichedReport);
   },
 );
 
@@ -803,7 +920,10 @@ tool(
     title: "Find coverage gaps",
     description:
       "For a phase: active requirements with no story, stories with no tagged scenario, and stories not covered (with failing/not-run scenarios). Defaults to active phase, cumulative.",
-    inputSchema: { phase: z.string().regex(/^PHASE-\d+$/).optional(), mode: CoverageMode.optional() },
+    inputSchema: {
+      phase: z.string().optional().describe("Phase ID (e.g. 'P1'). Defaults to active phase."),
+      mode:  CoverageMode.optional(),
+    },
   },
   async (args, store) => {
     await ensureInit(store);
@@ -812,7 +932,7 @@ tool(
   },
 );
 
-function renderMarkdown(report: ReturnType<typeof buildReport>, phaseName: string): string {
+function renderMarkdown(report: ReturnType<typeof buildReport> & { byComponent: Array<{ component: string; componentName?: string; domainTags?: string[]; requirements: number; verified: number; verifiedPct: number }> }, phaseName: string): string {
   const s = report.summary;
   const lines: string[] = [];
   lines.push(`# Requirements Coverage — ${phaseName} (${report.mode})`, "");
@@ -824,8 +944,11 @@ function renderMarkdown(report: ReturnType<typeof buildReport>, phaseName: strin
   lines.push(`- Scenarios passing: **${s.scenariosPassing}/${s.scenariosLinked}**`, "");
   if (report.byComponent.length) {
     lines.push("## By component", "");
-    for (const c of report.byComponent)
-      lines.push(`- **${c.component}** — verified ${c.verified}/${c.requirements} (${c.verifiedPct}%)`);
+    for (const c of report.byComponent) {
+      const label = c.componentName && c.componentName !== c.component ? `${c.component} (${c.componentName})` : c.component;
+      const tags  = c.domainTags?.length ? ` [${c.domainTags.join(", ")}]` : "";
+      lines.push(`- **${label}**${tags} — verified ${c.verified}/${c.requirements} (${c.verifiedPct}%)`);
+    }
     lines.push("");
   }
   lines.push("## Requirements", "");
@@ -848,13 +971,79 @@ function renderMarkdown(report: ReturnType<typeof buildReport>, phaseName: strin
 }
 
 // ===========================================================================
+// HTTP server (REQU_TRANSPORT=http)
+// ===========================================================================
+
+function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
+
+async function startHttpServer(): Promise<void> {
+  const { createServer } = await import("node:http");
+  const { randomUUID }   = await import("node:crypto");
+  const { StreamableHTTPServerTransport } =
+    await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
+
+  const port = parseInt(process.env.REQU_PORT ?? "8788", 10);
+  const host = process.env.REQU_HOST ?? "0.0.0.0";
+
+  const sessions = new Map<string, InstanceType<typeof StreamableHTTPServerTransport>>();
+
+  const httpServer = createServer(async (req, res) => {
+    if (!req.url?.includes("/mcp")) {
+      res.writeHead(404).end("Not Found");
+      return;
+    }
+    try {
+      const bodyStr = req.method === "POST" ? await readBody(req) : "{}";
+      const body    = bodyStr.trim() ? JSON.parse(bodyStr) : undefined;
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+      let transport: InstanceType<typeof StreamableHTTPServerTransport>;
+
+      if (sessionId && sessions.has(sessionId)) {
+        transport = sessions.get(sessionId)!;
+      } else {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (id: string) => sessions.set(id, transport),
+        });
+        (transport as any).onclose = () => {
+          const sid = (transport as any).sessionId as string | undefined;
+          if (sid) sessions.delete(sid);
+        };
+        await server.connect(transport);
+      }
+
+      await transport.handleRequest(req, res, body);
+    } catch (err) {
+      if (!res.headersSent) res.writeHead(500).end(String(err));
+    }
+  });
+
+  httpServer.listen(port, host, () => {
+    const dbPath = process.env.REQU_DB ?? `${process.env.REQU_ROOT ?? process.cwd()}/.requ/requ.db`;
+    console.error(`requ-mcp HTTP → http://${host}:${port}/mcp  db=${dbPath}`);
+  });
+}
+
+// ===========================================================================
 // Boot
 // ===========================================================================
 
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("requ-mcp running (per-call project resolution).");
+  if (process.env.REQU_TRANSPORT === "http") {
+    await startHttpServer();
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("requ-mcp running (stdio, YAML storage, per-call project resolution).");
+  }
 }
 
 main().catch((err) => {
