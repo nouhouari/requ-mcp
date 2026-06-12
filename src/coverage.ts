@@ -6,6 +6,7 @@ import {
   type Requirement,
   type TestStatus,
   type UserStory,
+  type VcsRef,
 } from "./schema.js";
 import type { ConductorScenario } from "./conductor.js";
 
@@ -74,6 +75,28 @@ export interface StoryCoverage {
   tested: boolean;
   /** Covered = tested AND every tagged scenario passes. */
   covered: boolean;
+  /**
+   * Merged-MR is a SEPARATE dimension from `covered` (it does not affect it):
+   * the merge-request VcsRef (kind="mr") referencing this story, preferring a
+   * state="merged" ref. Optional / backward-compatible.
+   */
+  mergedMr?: { ref: string; state: string; url: string };
+}
+
+/** Build a story-id → best MR reference map (prefers a merged MR). */
+function mergedMrByStory(vcsRefs: VcsRef[]): Map<string, { ref: string; state: string; url: string }> {
+  const out = new Map<string, { ref: string; state: string; url: string }>();
+  const mrs = vcsRefs.filter((r) => r.kind === "mr");
+  for (const mr of mrs) {
+    for (const storyId of mr.storyIds) {
+      const current = out.get(storyId);
+      // Prefer a merged ref; otherwise keep the first seen.
+      if (!current || (current.state !== "merged" && mr.state === "merged")) {
+        out.set(storyId, { ref: mr.ref, state: mr.state, url: mr.url });
+      }
+    }
+  }
+  return out;
 }
 
 export interface RequirementCoverage {
@@ -126,6 +149,7 @@ export function computeStoryCoverage(
   story: UserStory,
   scenariosByStory: ScenariosByStory,
   status: StatusMap,
+  mergedMr?: { ref: string; state: string; url: string },
 ): StoryCoverage {
   const scs = scenariosByStory.get(story.id) ?? [];
   let passing = 0;
@@ -149,6 +173,7 @@ export function computeStoryCoverage(
     pending,
     tested: scs.length > 0,
     covered: scs.length > 0 && passing === scs.length,
+    ...(mergedMr ? { mergedMr } : {}),
   };
 }
 
@@ -159,8 +184,10 @@ export function buildReport(
   status: StatusMap,
   phaseId: string | null,
   mode: CoverageMode,
+  vcsRefs: VcsRef[] = [],
 ): CoverageReport {
-  const storyCov = stories.map((s) => computeStoryCoverage(s, scenariosByStory, status));
+  const mrByStory = mergedMrByStory(vcsRefs);
+  const storyCov = stories.map((s) => computeStoryCoverage(s, scenariosByStory, status, mrByStory.get(s.id)));
   const storyById = new Map(storyCov.map((s) => [s.id, s]));
 
   const storiesByReq = new Map<string, string[]>();

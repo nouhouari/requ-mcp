@@ -13,12 +13,13 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
     "dev": "tsx src/index.ts",
     "start:http": "REQU_TRANSPORT=http tsx src/index.ts",
     "smoke": "tsx scripts/smoke.ts",
-    "prepare": "tsc",
-    "prepublishOnly": "tsc"
+    "smoke:vcs": "tsx scripts/smoke-vcs.ts",
+    "prepare": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
+    "prepublishOnly": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\""
   },
   "keywords": [
     "mcp",
@@ -45,7 +46,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.1.0",
-    "better-sqlite3": "^9.0.0",
+    "better-sqlite3": "^12.10.0",
     "yaml": "^2.5.0",
     "zod": "^3.23.0"
   },

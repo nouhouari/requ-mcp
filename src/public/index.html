@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>requ — Requirements Traceability</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'] }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="/public/style.css">
+</head>
+<body class="bg-slate-50 font-sans text-slate-800" x-data="requApp" x-init="init()" x-cloak>
+
+  <!-- Skip navigation — accessibility -->
+  <a href="#main-content" class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-[100] focus:bg-white focus:text-indigo-700 focus:px-4 focus:py-2 focus:rounded focus:shadow-lg focus:font-medium focus:text-sm">Skip to main content</a>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       HEADER
+  ═══════════════════════════════════════════════════════════════ -->
+  <header class="fixed top-0 left-0 right-0 z-50 bg-slate-900 text-white shadow-lg" style="height:56px;">
+    <div class="flex items-center justify-between h-full px-5 max-w-screen-2xl mx-auto">
+      <!-- Logo + project name / switcher -->
+      <div class="flex items-center gap-3 shrink-0">
+        <span class="text-indigo-400 font-bold text-xl select-none" aria-hidden="true">◈</span>
+        <h1 class="font-semibold text-white tracking-tight text-base">requ<span class="sr-only"> — Requirements dashboard</span></h1>
+        <!-- Static name when single project; dropdown when multiple -->
+        <template x-if="projects.length <= 1">
+          <span class="text-slate-500 text-xs hidden sm:inline" x-text="config?.name ? '/ ' + config.name : ''"></span>
+        </template>
+        <template x-if="projects.length > 1">
+          <select
+            class="filter-select filter-select--dark text-xs bg-slate-800 border-slate-700 focus:border-indigo-400"
+            style="width:140px;"
+            :value="activeProject ? activeProject.slug : ''"
+            @change="switchProject($event.target.value)"
+            aria-label="Switch project">
+            <template x-for="p in projects" :key="p.slug">
+              <option :value="p.slug"
+                :selected="activeProject && activeProject.slug === p.slug"
+                x-text="p.slug"></option>
+            </template>
+          </select>
+        </template>
+      </div>
+
+      <!-- Right side: phase + stats + live -->
+      <div class="flex items-center gap-4 shrink-0">
+        <!-- Active phase badge -->
+        <div x-show="summary?.activePhase" class="flex items-center gap-2 bg-slate-800 rounded-full px-3 py-1">
+          <span class="pulse-dot"></span>
+          <span class="text-xs font-medium text-slate-200" x-text="activePhaseLabel() || summary?.activePhase"></span>
+        </div>
+        <!-- Mini stats (hidden on mobile) -->
+        <div class="hidden sm:flex items-center gap-4 text-xs text-slate-400">
+          <span>
+            <span class="text-white font-semibold" x-text="summaryVal('requirements')"></span> reqs
+          </span>
+          <span>
+            <span class="text-white font-semibold" x-text="summaryVal('stories')"></span> stories
+          </span>
+          <span class="text-indigo-400 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '% verified'"></span>
+        </div>
+        <!-- Export / Import buttons -->
+        <button
+          @click="exportProject()"
+          class="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200 transition-colors"
+          title="Export project data as JSON"
+          aria-label="Export project data as JSON">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 2v9M4 7l4 4 4-4M2 13h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="hidden md:inline">Export</span>
+        </button>
+        <button
+          @click="importDialogOpen = true"
+          class="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200 transition-colors"
+          title="Import project data from JSON"
+          aria-label="Import project data from JSON">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 14V5M4 9l4-4 4 4M2 3h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="hidden md:inline">Import</span>
+        </button>
+        <!-- SSE live dot -->
+        <div class="flex items-center gap-1.5 text-xs text-slate-500" title="Live updates">
+          <span class="w-2 h-2 rounded-full bg-green-500 opacity-80" style="animation: pulse-ring 2.5s ease-out infinite;" aria-hidden="true"></span>
+          <span class="hidden sm:inline" aria-hidden="true">live</span>
+          <span class="sr-only">Live updates active</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       TAB NAV
+  ═══════════════════════════════════════════════════════════════ -->
+  <nav aria-label="Tab navigation" class="fixed left-0 right-0 z-40 bg-white border-b border-slate-200 shadow-sm tab-scroll" style="top:56px;">
+    <div role="tablist" class="tab-list flex px-4 max-w-screen-2xl mx-auto" style="height:44px;">
+      <template x-if="projects.length > 1">
+          <button
+            id="tab-global"
+            role="tab"
+            aria-controls="panel-global"
+            :aria-selected="tab === 'global'"
+            :tabindex="tab === 'global' ? 0 : -1"
+            @click="navTo('global')"
+            @keydown.arrow-right.prevent="shiftFocus(1)"
+            @keydown.arrow-left.prevent="shiftFocus(-1)"
+            @keydown.home.prevent="shiftFocus(-999)"
+            @keydown.end.prevent="shiftFocus(999)"
+            class="px-4 h-full text-sm font-medium border-b-2 transition-colors whitespace-nowrap"
+            :class="tab === 'global'
+              ? 'border-indigo-600 text-indigo-700'
+              : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'">
+            All Projects
+          </button>
+        </template>
+      <template x-for="t in [
+        {id:'overview',     label:'Overview'},
+        {id:'requirements', label:'Requirements'},
+        {id:'stories',      label:'Stories'},
+        {id:'coverage',     label:'Coverage'},
+        {id:'components',   label:'Components'},
+        {id:'vcs',          label:'VCS'},
+      ]" :key="t.id">
+        <button
+          :id="'tab-' + t.id"
+          role="tab"
+          :aria-controls="'panel-' + t.id"
+          :aria-selected="tab === t.id"
+          :tabindex="tab === t.id ? 0 : -1"
+          @click="navTo(t.id)"
+          @keydown.arrow-right.prevent="shiftFocus(1)"
+          @keydown.arrow-left.prevent="shiftFocus(-1)"
+          @keydown.home.prevent="shiftFocus(-999)"
+          @keydown.end.prevent="shiftFocus(999)"
+          class="px-4 h-full text-sm font-medium border-b-2 transition-colors whitespace-nowrap"
+          :class="tab === t.id
+            ? 'border-indigo-600 text-indigo-700'
+            : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'"
+          x-text="t.label"
+        ></button>
+      </template>
+    </div>
+  </nav>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       MAIN CONTENT
+  ═══════════════════════════════════════════════════════════════ -->
+  <main id="main-content" class="pt-28 pb-16 min-h-screen">
+    <div class="max-w-screen-2xl mx-auto px-4 sm:px-6">
+
+      <!-- Not initialized banner -->
+      <div x-show="notInitialized" class="init-banner mb-5">
+        <span style="font-size:1.15rem;">⚠</span>
+        <span>
+          <strong>Project not initialized.</strong>
+          Run <code class="bg-amber-100 text-amber-900 px-1.5 py-0.5 rounded font-mono text-xs">init_project</code>
+          first, then reload this page.
+        </span>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: ALL PROJECTS (global dashboard)
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-global" role="tabpanel" aria-labelledby="tab-global" tabindex="0" x-show="tab === 'global'" class="tab-panel space-y-6">
+
+        <!-- Aggregate KPI strip -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div class="kpi-card">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Total Requirements</div>
+            <div class="text-3xl font-bold text-slate-900" x-text="globalTotalReqs()"></div>
+            <div class="text-xs text-slate-500 mt-1">across all projects</div>
+          </div>
+          <div class="kpi-card">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Total Stories</div>
+            <div class="text-3xl font-bold text-slate-900" x-text="globalTotalStories()"></div>
+            <div class="text-xs text-slate-500 mt-1">across all projects</div>
+          </div>
+          <div class="kpi-card">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Verified</div>
+            <div class="text-3xl font-bold text-green-600"
+              x-text="pct(globalWeightedPct('verifiedPct')) + '%'"></div>
+            <div class="text-xs text-slate-500 mt-1">weighted average</div>
+            <div class="progress-mini mt-2">
+              <div class="progress-mini-fill bg-green-500"
+                :style="'width:' + globalWeightedPct('verifiedPct') + '%'"></div>
+            </div>
+          </div>
+          <div class="kpi-card border-indigo-100 bg-gradient-to-br from-indigo-50 to-white">
+            <div class="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-1">Story Coverage</div>
+            <div class="text-4xl font-bold text-indigo-600"
+              x-text="pct(globalWeightedPct('storyCoveragePct')) + '%'"></div>
+            <div class="text-xs text-slate-500 mt-1">weighted average</div>
+            <div class="progress-mini mt-2">
+              <div class="progress-mini-fill bg-indigo-500"
+                :style="'width:' + globalWeightedPct('storyCoveragePct') + '%'"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Per-project table -->
+        <div class="section-card">
+          <div class="section-card-header">
+            Projects
+            <span class="text-xs font-normal text-slate-500 hidden sm:inline">click a row to open that project</span>
+          </div>
+
+          <template x-if="loading.global && globalSummary.length === 0">
+            <div class="p-6 space-y-3">
+              <template x-for="i in [1,2,3]" :key="i">
+                <div class="skeleton skeleton-md"></div>
+              </template>
+            </div>
+          </template>
+
+          <template x-if="!loading.global && globalSummary.length === 0">
+            <div class="empty-state">
+              <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+                <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+              </svg>
+              <h3>No initialized projects</h3>
+            </div>
+          </template>
+
+          <template x-if="globalSummary.length > 0">
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead><tr>
+                  <th scope="col">Project</th>
+                  <th scope="col" style="width:110px">Active Phase</th>
+                  <th scope="col" class="text-center" style="width:90px">Reqs</th>
+                  <th scope="col" class="text-center" style="width:90px">Stories</th>
+                  <th scope="col" style="width:170px">Verified %</th>
+                  <th scope="col" style="width:170px">Story Coverage</th>
+                </tr></thead>
+                <tbody>
+                  <template x-for="proj in globalSummary" :key="proj.slug">
+                    <tr @click="switchProject(proj.slug); navTo('overview')">
+                      <td>
+                        <div class="font-semibold text-slate-800" x-text="proj.name"></div>
+                        <code class="chip chip-indigo mt-0.5 inline-block" x-text="proj.slug"></code>
+                      </td>
+                      <td>
+                        <span x-show="proj.activePhase"  class="badge badge-green"  x-text="proj.activePhase"></span>
+                        <span x-show="!proj.activePhase" class="text-slate-400 text-xs">—</span>
+                      </td>
+                      <td class="text-center font-semibold text-slate-700" x-text="proj.requirements"></td>
+                      <td class="text-center font-semibold text-slate-700" x-text="proj.stories"></td>
+                      <td>
+                        <div class="flex items-center gap-2">
+                          <div class="progress-track flex-1">
+                            <div class="progress-fill progress-fill--green"
+                              :style="'width:' + (proj.verifiedPct || 0) + '%'"></div>
+                          </div>
+                          <span class="text-xs font-semibold text-slate-600 w-10 text-right"
+                            x-text="pct(proj.verifiedPct) + '%'"></span>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="flex items-center gap-2">
+                          <div class="progress-track flex-1">
+                            <div class="progress-fill progress-fill--indigo"
+                              :style="'width:' + (proj.storyCoveragePct || 0) + '%'"></div>
+                          </div>
+                          <span class="text-xs font-semibold text-slate-600 w-10 text-right"
+                            x-text="pct(proj.storyCoveragePct) + '%'"></span>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: OVERVIEW
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="0" x-show="tab === 'overview'" class="tab-panel space-y-6">
+
+        <!-- KPI Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+
+          <div class="kpi-card">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Requirements</div>
+            <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('requirements')"></div>
+            <div class="text-xs text-slate-500 mt-1">
+              <span class="text-green-600 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '%'"></span> verified
+            </div>
+            <div class="progress-mini mt-2">
+              <div class="progress-mini-fill bg-green-500" :style="'width:' + summaryVal('verifiedPct') + '%'"></div>
+            </div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Stories</div>
+            <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('stories')"></div>
+            <div class="text-xs text-slate-500 mt-1">
+              <span class="text-indigo-600 font-semibold" x-text="pct(summaryVal('storyCoveragePct')) + '%'"></span> linked
+            </div>
+            <div class="progress-mini mt-2">
+              <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('storyCoveragePct') + '%'"></div>
+            </div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Scenarios</div>
+            <div class="text-3xl font-bold text-slate-900">
+              <span x-text="summaryVal('scenariosPassing')"></span>
+              <span class="text-slate-300 text-xl">/</span>
+              <span class="text-xl text-slate-400" x-text="summaryVal('scenariosLinked')"></span>
+            </div>
+            <div class="text-xs text-slate-500 mt-1">passing / linked</div>
+            <div class="progress-mini mt-2">
+              <div class="progress-mini-fill bg-emerald-500"
+                :style="'width:' + (summaryVal('scenariosLinked') > 0 ? (summaryVal('scenariosPassing') / summaryVal('scenariosLinked') * 100).toFixed(1) : 0) + '%'">
+              </div>
+            </div>
+          </div>
+
+          <div class="kpi-card border-indigo-100 bg-gradient-to-br from-indigo-50 to-white">
+            <div class="text-xs font-semibold text-indigo-500 uppercase tracking-wide mb-1">Verified</div>
+            <div class="text-4xl font-bold text-indigo-600" x-text="pct(summaryVal('verifiedPct')) + '%'"></div>
+            <div class="text-xs text-slate-500 mt-1">of all requirements</div>
+            <div class="progress-mini mt-2">
+              <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('verifiedPct') + '%'"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Charts row -->
+        <div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
+
+          <!-- Coverage Trend -->
+          <div class="section-card xl:col-span-2">
+            <div class="section-card-header">
+              Coverage Trend
+              <span class="text-xs font-normal text-slate-400">by phase</span>
+            </div>
+            <div class="p-4">
+              <template x-if="loading.trend">
+                <div class="chart-container flex items-center justify-center">
+                  <div class="spinner"></div>
+                </div>
+              </template>
+              <template x-if="!loading.trend && (!trend || trend.length === 0)">
+                <div class="empty-state chart-container">
+                  <svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                  <h3>No trend data yet</h3>
+                  <p>Complete phases to see coverage over time.</p>
+                </div>
+              </template>
+              <template x-if="!loading.trend && trend && trend.length > 0">
+                <div class="chart-container">
+                  <canvas x-ref="trendCanvas" x-init="$nextTick(() => initTrendChart($refs.trendCanvas))"></canvas>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- Donut by component -->
+          <div class="section-card">
+            <div class="section-card-header">
+              By Component
+              <span class="text-xs font-normal text-slate-400">verified %</span>
+            </div>
+            <div class="p-4">
+              <template x-if="loading.coverage">
+                <div class="chart-container-sm flex items-center justify-center">
+                  <div class="spinner"></div>
+                </div>
+              </template>
+              <template x-if="!loading.coverage && coverage && (coverage.byComponent || []).length > 0">
+                <div class="chart-container-sm">
+                  <canvas x-ref="donutCanvas" x-init="$nextTick(() => initDonutChart($refs.donutCanvas))"></canvas>
+                </div>
+              </template>
+              <template x-if="!loading.coverage && (!coverage || (coverage.byComponent || []).length === 0)">
+                <div class="empty-state" style="height:200px;">
+                  <h3>No component data</h3>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- Gaps summary -->
+        <div class="section-card">
+          <div class="section-card-header">
+            Coverage Gaps
+            <button @click="navTo('coverage')" class="text-xs text-indigo-600 hover:text-indigo-800 font-medium">See full report →</button>
+          </div>
+          <div class="p-4">
+            <template x-if="loading.gaps">
+              <div class="grid grid-cols-3 gap-3">
+                <div class="skeleton skeleton-lg"></div>
+                <div class="skeleton skeleton-lg"></div>
+                <div class="skeleton skeleton-lg"></div>
+              </div>
+            </template>
+            <template x-if="!loading.gaps">
+              <div>
+                <div x-show="gaps && (gaps.requirementsWithoutStory || []).length === 0 && (gaps.storiesWithoutScenario || []).length === 0 && (gaps.storiesNotCovered || []).length === 0"
+                     class="flex items-center gap-2 text-green-700 text-sm font-medium bg-green-50 border border-green-200 rounded-lg px-4 py-3">
+                  <span>✓</span> No gaps — all requirements have stories and all stories are covered.
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4"
+                     x-show="!gaps || (gaps.requirementsWithoutStory || []).length > 0 || (gaps.storiesWithoutScenario || []).length > 0 || (gaps.storiesNotCovered || []).length > 0">
+                  <button @click="navTo('coverage')" class="gap-panel-red text-left hover:opacity-90 transition-opacity">
+                    <div class="text-2xl font-bold text-red-700" x-text="(gaps?.requirementsWithoutStory || []).length"></div>
+                    <div class="text-sm font-semibold text-red-800 mt-0.5">Requirements without stories</div>
+                    <div class="text-xs text-red-600 mt-1">need user story coverage</div>
+                  </button>
+                  <button @click="navTo('coverage')" class="gap-panel-amber text-left hover:opacity-90 transition-opacity">
+                    <div class="text-2xl font-bold text-amber-700" x-text="(gaps?.storiesWithoutScenario || []).length"></div>
+                    <div class="text-sm font-semibold text-amber-800 mt-0.5">Stories without scenarios</div>
+                    <div class="text-xs text-amber-600 mt-1">need test scenarios</div>
+                  </button>
+                  <button @click="navTo('coverage')" class="gap-panel-slate text-left hover:opacity-90 transition-opacity">
+                    <div class="text-2xl font-bold text-slate-700" x-text="(gaps?.storiesNotCovered || []).length"></div>
+                    <div class="text-sm font-semibold text-slate-700 mt-0.5">Stories not covered</div>
+                    <div class="text-xs text-slate-500 mt-1">failing or pending scenarios</div>
+                  </button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- Phases strip -->
+        <div x-show="phases.length > 0" class="section-card">
+          <div class="section-card-header">Phases</div>
+          <div class="p-4 flex flex-wrap gap-3">
+            <template x-for="phase in [...phases].sort((a,b) => a.order - b.order)" :key="phase.id">
+              <div class="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-4 py-2.5">
+                <template x-if="phase.status === 'active'"><span class="pulse-dot"></span></template>
+                <template x-if="phase.status === 'completed'">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </template>
+                <template x-if="phase.status === 'planned'"><span class="w-2 h-2 rounded-full bg-slate-300"></span></template>
+                <span class="text-sm font-medium text-slate-700" x-text="phase.name || phase.id"></span>
+                <span class="badge" :class="phaseBadge(phase.status)" x-text="phase.status"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: REQUIREMENTS
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-requirements" role="tabpanel" aria-labelledby="tab-requirements" tabindex="0" x-show="tab === 'requirements'" class="tab-panel space-y-4">
+
+        <!-- Filters -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+          <!-- Search -->
+          <div class="relative">
+            <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input type="text" class="search-input" placeholder="Search ID, title, tag…" x-model="reqSearch" aria-label="Search requirements">
+          </div>
+          <!-- Status pills -->
+          <div class="flex gap-1 flex-wrap">
+            <template x-for="opt in [{v:'all',l:'All'},{v:'active',l:'Active'},{v:'deprecated',l:'Deprecated'}]" :key="opt.v">
+              <button class="filter-pill" :class="reqStatusFilter === opt.v ? 'active' : ''"
+                @click="reqStatusFilter = opt.v" x-text="opt.l"></button>
+            </template>
+          </div>
+          <div class="h-4 w-px bg-slate-200 hidden sm:block"></div>
+          <!-- Priority pills -->
+          <div class="flex gap-1 flex-wrap">
+            <template x-for="opt in [{v:'all',l:'All'},{v:'critical',l:'Critical'},{v:'high',l:'High'},{v:'medium',l:'Medium'},{v:'low',l:'Low'}]" :key="opt.v">
+              <button class="filter-pill text-xs" :class="reqPriorityFilter === opt.v ? 'active' : ''"
+                @click="reqPriorityFilter = opt.v" x-text="opt.l"></button>
+            </template>
+          </div>
+          <!-- Component -->
+          <select class="filter-select" x-model="reqComponentFilter" aria-label="Filter by component">
+            <option value="all">All Components</option>
+            <template x-for="c in reqComponentOptions()" :key="c">
+              <option :value="c" x-text="componentName(c)"></option>
+            </template>
+          </select>
+          <!-- Sort -->
+          <div class="ml-auto flex items-center gap-1 text-xs">
+            <span class="text-slate-400 mr-1">Sort:</span>
+            <template x-for="opt in [{v:'id',l:'ID'},{v:'priority',l:'Priority'},{v:'status',l:'Status'}]" :key="opt.v">
+              <button class="filter-pill text-xs" :class="reqSortBy === opt.v ? 'active' : ''"
+                @click="sortReqBy(opt.v)" x-text="opt.l"></button>
+            </template>
+          </div>
+        </div>
+
+        <!-- Count -->
+        <div class="text-sm text-slate-500 px-1">
+          Showing <span class="font-semibold text-slate-700" x-text="filteredRequirements().length"></span>
+          of <span x-text="requirements.length"></span> requirements
+        </div>
+
+        <!-- Table -->
+        <div class="section-card">
+          <template x-if="loading.requirements">
+            <div class="p-6 space-y-3">
+              <template x-for="i in [1,2,3,4,5]" :key="i">
+                <div class="skeleton skeleton-md"></div>
+              </template>
+            </div>
+          </template>
+
+          <template x-if="!loading.requirements && filteredRequirements().length === 0">
+            <div class="empty-state">
+              <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+              <h3>No requirements found</h3>
+              <p>Try adjusting your filters, or add requirements via the MCP tool.</p>
+            </div>
+          </template>
+
+          <template x-if="!loading.requirements && filteredRequirements().length > 0">
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width:100px;" @click="sortReqBy('status')">Status</th>
+                    <th style="width:110px;" @click="sortReqBy('id')">ID</th>
+                    <th>Title</th>
+                    <th style="width:100px;" @click="sortReqBy('priority')">Priority</th>
+                    <th style="width:170px;">Components</th>
+                    <th style="width:120px;">Tags</th>
+                    <th style="width:65px;" class="text-center">Stories</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="req in filteredRequirements()" :key="req.id">
+                    <tr @click="toggleReq(req.id)" :class="reqExpanded === req.id ? 'expanded' : ''">
+                      <td>
+                        <span class="badge" :class="reqStatusBadge(req).cls">
+                          <span x-text="reqStatusBadge(req).icon"></span>
+                          <span x-text="reqStatusBadge(req).label"></span>
+                        </span>
+                      </td>
+                      <td><code class="chip chip-indigo" x-text="req.id"></code></td>
+                      <td class="font-medium text-slate-800" x-text="req.title"></td>
+                      <td><span class="badge" :class="priorityBadge(req.priority)" x-text="req.priority"></span></td>
+                      <td>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="c in (req.components || []).slice(0,3)" :key="c">
+                            <span class="chip" x-text="componentName(c)"></span>
+                          </template>
+                          <template x-if="(req.components || []).length > 3">
+                            <span class="chip text-slate-400">+<span x-text="req.components.length - 3"></span></span>
+                          </template>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="tag in (req.tags || []).slice(0,2)" :key="tag">
+                            <span class="chip" x-text="tag"></span>
+                          </template>
+                          <template x-if="(req.tags || []).length > 2">
+                            <span class="chip text-slate-400">+<span x-text="req.tags.length - 2"></span></span>
+                          </template>
+                        </div>
+                      </td>
+                      <td class="text-center text-sm text-slate-500" x-text="reqCoverage(req)?.storyIds?.length ?? '—'"></td>
+                    </tr>
+                    <!-- Expanded detail -->
+                    <template x-if="reqExpanded === req.id">
+                      <tr class="detail-row">
+                        <td colspan="7">
+                          <div class="detail-content">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                              <div>
+                                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Description</div>
+                                <p class="text-sm text-slate-700 leading-relaxed" x-text="req.description || 'No description provided.'"></p>
+                                <div class="mt-3 flex gap-4 text-xs text-slate-500">
+                                  <span>Source: <span class="text-slate-700 font-medium" x-text="req.source || '—'"></span></span>
+                                  <span>Status: <span class="text-slate-700 font-medium" x-text="req.status"></span></span>
+                                </div>
+                                <div class="mt-2 flex flex-wrap gap-1">
+                                  <template x-for="tag in (req.tags || [])" :key="tag">
+                                    <span class="chip" x-text="tag"></span>
+                                  </template>
+                                </div>
+                              </div>
+                              <div>
+                                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Linked Stories</div>
+                                <template x-if="(reqCoverage(req)?.storyIds || []).length === 0">
+                                  <p class="text-sm text-slate-400 italic">No stories linked yet.</p>
+                                </template>
+                                <div class="flex flex-wrap gap-2">
+                                  <template x-for="sid in (reqCoverage(req)?.storyIds || [])" :key="sid">
+                                    <button class="chip chip-indigo hover:bg-indigo-100 transition-colors"
+                                      @click.stop="navTo('stories'); storySearch = sid"
+                                      x-text="sid"></button>
+                                  </template>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: STORIES
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-stories" role="tabpanel" aria-labelledby="tab-stories" tabindex="0" x-show="tab === 'stories'" class="tab-panel space-y-4">
+
+        <!-- Filters -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+          <div class="relative">
+            <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input type="text" class="search-input" placeholder="Search ID or title…" x-model="storySearch" aria-label="Search stories">
+          </div>
+          <div class="flex gap-1 flex-wrap">
+            <template x-for="opt in [{v:'all',l:'All'},{v:'draft',l:'Draft'},{v:'ready',l:'Ready'},{v:'in_progress',l:'In Progress'},{v:'done',l:'Done'}]" :key="opt.v">
+              <button class="filter-pill text-xs" :class="storyStatusFilter === opt.v ? 'active' : ''"
+                @click="storyStatusFilter = opt.v" x-text="opt.l"></button>
+            </template>
+          </div>
+          <div class="ml-auto text-sm text-slate-500">
+            <span class="font-semibold text-slate-700" x-text="filteredStories().length"></span> of <span x-text="stories.length"></span>
+          </div>
+        </div>
+
+        <!-- Table -->
+        <div class="section-card">
+          <template x-if="loading.stories">
+            <div class="p-6 space-y-3">
+              <template x-for="i in [1,2,3,4]" :key="i"><div class="skeleton skeleton-md"></div></template>
+            </div>
+          </template>
+
+          <template x-if="!loading.stories && filteredStories().length === 0">
+            <div class="empty-state">
+              <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+              <h3>No stories found</h3>
+              <p>Adjust filters or add user stories via the MCP tool.</p>
+            </div>
+          </template>
+
+          <template x-if="!loading.stories && filteredStories().length > 0">
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width:120px;">ID</th>
+                    <th>Title</th>
+                    <th style="width:110px;">Status</th>
+                    <th style="width:55px;" class="text-center">ACs</th>
+                    <th style="width:190px;">Requirements</th>
+                    <th style="width:110px;">Coverage</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="story in filteredStories()" :key="story.id">
+                    <tr @click="toggleStory(story.id)" :class="storyExpanded === story.id ? 'expanded' : ''">
+                      <td><code class="chip chip-indigo" x-text="story.id"></code></td>
+                      <td class="font-medium text-slate-800" x-text="story.title"></td>
+                      <td>
+                        <span class="badge" :class="storyStatusBadge(story.status)"
+                          x-text="story.status ? story.status.replace('_', ' ') : '—'"></span>
+                      </td>
+                      <td class="text-center text-slate-500 text-sm" x-text="(story.acceptanceCriteria || []).length"></td>
+                      <td>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="rid in (story.requirements || []).slice(0,3)" :key="rid">
+                            <span class="chip chip-indigo text-xs" x-text="rid"></span>
+                          </template>
+                          <template x-if="(story.requirements || []).length > 3">
+                            <span class="chip text-slate-400">+<span x-text="story.requirements.length - 3"></span></span>
+                          </template>
+                        </div>
+                      </td>
+                      <td>
+                        <span class="badge" :class="coverageBadge(storyCoverage(story))"
+                          x-text="coverageLabel(storyCoverage(story))"></span>
+                      </td>
+                    </tr>
+                    <!-- Expanded detail -->
+                    <template x-if="storyExpanded === story.id">
+                      <tr class="detail-row">
+                        <td colspan="6">
+                          <div class="detail-content">
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+                              <div>
+                                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Description</div>
+                                <p class="text-sm text-slate-700 leading-relaxed" x-text="story.description || 'No description.'"></p>
+                              </div>
+                              <div>
+                                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+                                  Acceptance Criteria (<span x-text="(story.acceptanceCriteria || []).length"></span>)
+                                </div>
+                                <template x-if="(story.acceptanceCriteria || []).length === 0">
+                                  <p class="text-sm text-slate-400 italic">None defined.</p>
+                                </template>
+                                <ul class="space-y-1.5">
+                                  <template x-for="ac in (story.acceptanceCriteria || [])" :key="ac.id">
+                                    <li class="flex gap-2 text-sm text-slate-700">
+                                      <span class="text-green-500 shrink-0 mt-0.5">✓</span>
+                                      <span x-text="ac.text"></span>
+                                    </li>
+                                  </template>
+                                </ul>
+                              </div>
+                              <div>
+                                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Scenarios</div>
+                                <template x-if="!storyCoverage(story) || (storyCoverage(story)?.scenarios || []).length === 0">
+                                  <p class="text-sm text-slate-400 italic">No scenarios linked.</p>
+                                </template>
+                                <ul class="space-y-1.5">
+                                  <template x-for="sc in (storyCoverage(story)?.scenarios || [])" :key="sc.name">
+                                    <li class="text-xs text-slate-700 flex items-center gap-2">
+                                      <span :class="sc.status==='pass'?'text-green-600':sc.status==='fail'?'text-red-500':'text-amber-500'"
+                                        x-text="sc.status==='pass'?'✓':sc.status==='fail'?'✗':'○'"></span>
+                                      <span x-text="sc.name"></span>
+                                    </li>
+                                  </template>
+                                </ul>
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: COVERAGE
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-coverage" role="tabpanel" aria-labelledby="tab-coverage" tabindex="0" x-show="tab === 'coverage'" class="tab-panel space-y-5">
+
+        <!-- Controls -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-4">
+          <div class="flex items-center gap-2">
+            <label for="coverage-phase" class="text-sm font-medium text-slate-600">Phase:</label>
+            <select id="coverage-phase" class="filter-select" x-model="coveragePhase" aria-label="Select phase for coverage">
+              <option value="">All phases</option>
+              <template x-for="ph in [...phases].sort((a,b) => a.order - b.order)" :key="ph.id">
+                <option :value="ph.id" x-text="ph.name || ph.id"></option>
+              </template>
+            </select>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-slate-600" aria-hidden="true">Mode:</span>
+            <div class="toggle-group" role="group" aria-label="Coverage mode">
+              <button class="toggle-btn" :class="coverageMode === 'cumulative' ? 'active' : ''"
+                :aria-pressed="coverageMode === 'cumulative'"
+                @click="coverageMode = 'cumulative'">Cumulative</button>
+              <button class="toggle-btn" :class="coverageMode === 'strict' ? 'active' : ''"
+                :aria-pressed="coverageMode === 'strict'"
+                @click="coverageMode = 'strict'">Strict</button>
+            </div>
+          </div>
+          <button class="btn-primary" @click="refreshCoverage()" :disabled="loading.coverage || loading.gaps">
+            <template x-if="loading.coverage || loading.gaps">
+              <span class="spinner" style="width:13px;height:13px;border-width:2px;"></span>
+            </template>
+            <template x-if="!loading.coverage && !loading.gaps">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+            </template>
+            Refresh
+          </button>
+        </div>
+
+        <!-- Summary stats -->
+        <template x-if="coverage?.summary">
+          <div class="section-card">
+            <div class="section-card-header">Summary</div>
+            <div class="grid grid-cols-2 sm:grid-cols-4 divide-x divide-slate-100">
+              <div class="cov-stat">
+                <div class="value text-green-700" x-text="pct(coverage.summary.verifiedPct) + '%'"></div>
+                <div class="label">Verified</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value text-indigo-700" x-text="pct(coverage.summary.storyCoveragePct) + '%'"></div>
+                <div class="label">Story Coverage</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value text-slate-700"
+                  x-text="(coverage.summary.requirementsWithStory ?? 0) + ' / ' + (coverage.summary.requirementsTotal ?? 0)"></div>
+                <div class="label">Reqs with Story</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value text-emerald-700"
+                  x-text="(coverage.summary.scenariosPassing ?? 0) + ' / ' + (coverage.summary.scenariosLinked ?? 0)"></div>
+                <div class="label">Passing Scenarios</div>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <!-- Component breakdown -->
+        <template x-if="coverage && (coverage.byComponent || []).length > 0">
+          <div class="section-card">
+            <div class="section-card-header">By Component</div>
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Component</th>
+                    <th class="text-center" style="width:100px;">Total Reqs</th>
+                    <th class="text-center" style="width:100px;">With Story</th>
+                    <th class="text-center" style="width:100px;">Verified</th>
+                    <th style="width:200px;">Verified %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="row in (coverage.byComponent || [])" :key="row.component">
+                    <tr class="cursor-default">
+                      <td>
+                        <span class="font-medium text-slate-700" x-text="componentName(row.component)"></span>
+                        <code class="chip chip-indigo ml-1" x-text="row.component"></code>
+                      </td>
+                      <td class="text-center text-slate-600" x-text="row.requirements"></td>
+                      <td class="text-center text-slate-600" x-text="row.withStory"></td>
+                      <td class="text-center text-slate-600" x-text="row.verified"></td>
+                      <td>
+                        <div class="flex items-center gap-2">
+                          <div class="progress-track flex-1">
+                            <div class="progress-fill progress-fill--green"
+                              :style="'width:' + (row.verifiedPct ?? 0) + '%'"></div>
+                          </div>
+                          <span class="text-xs font-semibold text-slate-600 w-12 text-right"
+                            x-text="pct(row.verifiedPct) + '%'"></span>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </template>
+
+        <!-- Gaps panels -->
+        <template x-if="gaps">
+          <div class="space-y-4">
+            <h3 class="text-sm font-semibold text-slate-500 uppercase tracking-wide">Coverage Gaps</h3>
+
+            <!-- All clear -->
+            <div x-show="(gaps.requirementsWithoutStory || []).length === 0 && (gaps.storiesWithoutScenario || []).length === 0 && (gaps.storiesNotCovered || []).length === 0"
+                 class="bg-green-50 border border-green-200 rounded-xl p-4 text-green-700 text-sm font-medium flex items-center gap-2">
+              <span>✓</span> No gaps — great coverage!
+            </div>
+
+            <!-- Reqs without stories -->
+            <div class="gap-panel-red">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="text-sm font-semibold text-red-800">
+                  Requirements without stories (<span x-text="(gaps.requirementsWithoutStory || []).length"></span>)
+                </span>
+              </div>
+              <template x-if="(gaps.requirementsWithoutStory || []).length === 0">
+                <p class="text-sm text-green-700 font-medium">All requirements have at least one story.</p>
+              </template>
+              <div class="flex flex-wrap gap-2">
+                <template x-for="r in (gaps.requirementsWithoutStory || [])" :key="r.id">
+                  <div class="bg-white border border-red-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-red-400 transition-colors"
+                    @click="navTo('requirements'); reqSearch = r.id">
+                    <div class="font-semibold text-red-700" x-text="r.id"></div>
+                    <div class="text-slate-600 mt-0.5 truncate max-w-xs" x-text="r.title"></div>
+                    <span class="badge badge-red mt-1" x-text="r.priority"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- Stories without scenarios -->
+            <div class="gap-panel-amber">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="text-sm font-semibold text-amber-800">
+                  Stories without scenarios (<span x-text="(gaps.storiesWithoutScenario || []).length"></span>)
+                </span>
+              </div>
+              <template x-if="(gaps.storiesWithoutScenario || []).length === 0">
+                <p class="text-sm text-green-700 font-medium">All stories have test scenarios.</p>
+              </template>
+              <div class="flex flex-wrap gap-2">
+                <template x-for="s in (gaps.storiesWithoutScenario || [])" :key="s.id">
+                  <div class="bg-white border border-amber-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-amber-400 transition-colors"
+                    @click="navTo('stories'); storySearch = s.id">
+                    <div class="font-semibold text-amber-700" x-text="s.id"></div>
+                    <div class="text-slate-600 mt-0.5 truncate max-w-xs" x-text="s.title"></div>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- Stories not covered -->
+            <div class="gap-panel-slate">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="text-sm font-semibold text-slate-700">
+                  Stories not covered (<span x-text="(gaps.storiesNotCovered || []).length"></span>)
+                </span>
+              </div>
+              <template x-if="(gaps.storiesNotCovered || []).length === 0">
+                <p class="text-sm text-green-700 font-medium">All stories are covered.</p>
+              </template>
+              <div class="flex flex-wrap gap-2">
+                <template x-for="s in (gaps.storiesNotCovered || [])" :key="s.id">
+                  <div class="bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-400 transition-colors"
+                    @click="navTo('stories'); storySearch = s.id">
+                    <div class="font-semibold text-slate-700" x-text="s.id"></div>
+                    <div class="text-slate-600 mt-0.5 truncate max-w-xs" x-text="s.title"></div>
+                    <div class="flex gap-2 mt-1">
+                      <template x-if="(s.failing || []).length > 0">
+                        <span class="badge badge-red"><span x-text="s.failing.length"></span> failing</span>
+                      </template>
+                      <template x-if="(s.pending || []).length > 0">
+                        <span class="badge badge-amber"><span x-text="s.pending.length"></span> pending</span>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <!-- Story detail toggle -->
+        <template x-if="coverage && (coverage.stories || []).length > 0">
+          <div class="section-card">
+            <div class="section-card-header">
+              Story Coverage Detail
+              <button class="btn-secondary text-xs" @click="showStoriesDetail = !showStoriesDetail"
+                x-text="showStoriesDetail ? 'Hide' : 'Show all stories'"></button>
+            </div>
+            <template x-if="showStoriesDetail">
+              <div class="data-table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th style="width:120px;">ID</th>
+                      <th>Title</th>
+                      <th style="width:110px;">Status</th>
+                      <th style="width:80px;" class="text-center">Passing</th>
+                      <th style="width:80px;" class="text-center">Failing</th>
+                      <th style="width:80px;" class="text-center">Pending</th>
+                      <th style="width:110px;">Coverage</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="sc in (coverage.stories || [])" :key="sc.id">
+                      <tr class="cursor-default">
+                        <td><code class="chip chip-indigo" x-text="sc.id"></code></td>
+                        <td class="font-medium text-slate-700 text-sm" x-text="sc.title"></td>
+                        <td><span class="badge" :class="storyStatusBadge(sc.status)"
+                          x-text="sc.status ? sc.status.replace('_',' ') : '—'"></span></td>
+                        <td class="text-center text-green-600 font-semibold text-sm" x-text="sc.passing ?? 0"></td>
+                        <td class="text-center text-red-500 font-semibold text-sm" x-text="sc.failing ?? 0"></td>
+                        <td class="text-center text-amber-500 font-semibold text-sm" x-text="sc.pending ?? 0"></td>
+                        <td><span class="badge" :class="coverageBadge(sc)" x-text="coverageLabel(sc)"></span></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </template>
+          </div>
+        </template>
+
+        <!-- Loading -->
+        <template x-if="loading.coverage || loading.gaps">
+          <div class="flex items-center justify-center py-16">
+            <div class="spinner"></div>
+          </div>
+        </template>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: COMPONENTS
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-components" role="tabpanel" aria-labelledby="tab-components" tabindex="0" x-show="tab === 'components'" class="tab-panel">
+
+        <template x-if="loading.components">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            <template x-for="i in [1,2,3,4,5,6,7,8]" :key="i">
+              <div class="component-card space-y-3">
+                <div class="skeleton skeleton-lg w-3/4"></div>
+                <div class="skeleton skeleton-md"></div>
+                <div class="skeleton skeleton-sm w-1/2"></div>
+              </div>
+            </template>
+          </div>
+        </template>
+
+        <template x-if="!loading.components && components.length === 0">
+          <div class="empty-state mt-20">
+            <svg width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+            <h3>No components defined</h3>
+            <p>Add components via the MCP tool to organize requirements by domain.</p>
+          </div>
+        </template>
+
+        <template x-if="!loading.components && components.length > 0">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            <template x-for="comp in components" :key="comp.id">
+              <div class="component-card">
+                <div class="flex items-start justify-between mb-3">
+                  <div>
+                    <div class="font-semibold text-slate-900 text-base" x-text="comp.name"></div>
+                    <code class="chip chip-indigo mt-1 inline-block" x-text="comp.id"></code>
+                  </div>
+                  <span class="badge" :class="comp.status === 'active' ? 'badge-green' : 'badge-slate'"
+                    x-text="comp.status"></span>
+                </div>
+                <p class="text-sm text-slate-500 leading-relaxed mb-3 line-clamp-3" x-text="comp.description || 'No description.'"></p>
+                <div x-show="(comp.domainTags || []).length > 0" class="flex flex-wrap gap-1 mb-3">
+                  <template x-for="tag in (comp.domainTags || [])" :key="tag">
+                    <span class="chip chip-amber" x-text="tag"></span>
+                  </template>
+                </div>
+                <!-- Stats -->
+                <div class="pt-3 border-t border-slate-100 flex items-center gap-2">
+                  <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" class="text-slate-400"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+                  <span class="text-xs text-slate-500">
+                    <span class="font-semibold text-slate-700" x-text="reqCountForComponent(comp.id)"></span> requirements
+                  </span>
+                  <!-- Coverage % from byComponent -->
+                  <template x-if="coverage">
+                    <span class="ml-auto text-xs">
+                      <template x-for="bc in (coverage.byComponent || []).filter(b => b.component === comp.id)" :key="bc.component">
+                        <span class="font-semibold"
+                          :class="bc.verifiedPct >= 80 ? 'text-green-600' : bc.verifiedPct >= 40 ? 'text-amber-600' : 'text-red-500'"
+                          x-text="pct(bc.verifiedPct) + '% verified'"></span>
+                      </template>
+                    </span>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: VCS
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-vcs" role="tabpanel" aria-labelledby="tab-vcs" tabindex="0" x-show="tab === 'vcs'" class="tab-panel space-y-4">
+
+        <!-- Filters -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+          <div class="flex gap-1">
+            <template x-for="opt in [{v:'all',l:'All'},{v:'branch',l:'Branches'},{v:'mr',l:'MRs'}]" :key="opt.v">
+              <button class="filter-pill text-xs" :class="vcsKindFilter === opt.v ? 'active' : ''"
+                @click="vcsKindFilter = opt.v" x-text="opt.l"></button>
+            </template>
+          </div>
+          <div class="h-4 w-px bg-slate-200 hidden sm:block"></div>
+          <div class="flex gap-1">
+            <template x-for="opt in [{v:'all',l:'All'},{v:'opened',l:'Opened'},{v:'merged',l:'Merged'},{v:'closed',l:'Closed'}]" :key="opt.v">
+              <button class="filter-pill text-xs" :class="vcsStateFilter === opt.v ? 'active' : ''"
+                @click="vcsStateFilter = opt.v" x-text="opt.l"></button>
+            </template>
+          </div>
+          <div class="ml-auto text-sm text-slate-500">
+            <span class="font-semibold text-slate-700" x-text="filteredVcs().length"></span> of <span x-text="vcsRefs.length"></span>
+          </div>
+        </div>
+
+        <!-- Table -->
+        <div class="section-card">
+          <template x-if="loading.vcs">
+            <div class="p-6 space-y-3">
+              <template x-for="i in [1,2,3]" :key="i"><div class="skeleton skeleton-md"></div></template>
+            </div>
+          </template>
+
+          <template x-if="!loading.vcs && filteredVcs().length === 0">
+            <div class="empty-state">
+              <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 009 9"/></svg>
+              <h3>No VCS references recorded yet</h3>
+              <p>Use <code class="bg-slate-100 px-1 rounded font-mono text-xs">add_vcs_ref</code> to link branches and MRs to stories and requirements.</p>
+            </div>
+          </template>
+
+          <template x-if="!loading.vcs && filteredVcs().length > 0">
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width:75px;">Kind</th>
+                    <th>Ref</th>
+                    <th style="width:130px;">Branch</th>
+                    <th style="width:85px;">State</th>
+                    <th style="width:130px;">Component</th>
+                    <th style="width:150px;">Stories</th>
+                    <th style="width:150px;">Reqs</th>
+                    <th style="width:55px;">Link</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="ref in filteredVcs()" :key="ref.id">
+                    <tr class="cursor-default">
+                      <td>
+                        <span class="badge" :class="ref.kind === 'mr' ? 'badge-indigo' : 'badge-slate'"
+                          x-text="ref.kind.toUpperCase()"></span>
+                      </td>
+                      <td class="font-mono text-xs text-slate-700 max-w-xs truncate" x-text="ref.ref"></td>
+                      <td class="font-mono text-xs text-slate-500 truncate" x-text="ref.branch || '—'"></td>
+                      <td><span class="badge" :class="vcsBadge(ref.state)" x-text="ref.state"></span></td>
+                      <td class="text-sm text-slate-600" x-text="ref.component ? componentName(ref.component) : '—'"></td>
+                      <td>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="sid in (ref.storyIds || []).slice(0,2)" :key="sid">
+                            <span class="chip chip-indigo text-xs cursor-pointer"
+                              @click="navTo('stories'); storySearch = sid" x-text="sid"></span>
+                          </template>
+                          <template x-if="(ref.storyIds || []).length > 2">
+                            <span class="chip text-slate-400">+<span x-text="ref.storyIds.length - 2"></span></span>
+                          </template>
+                          <span x-show="(ref.storyIds || []).length === 0" class="text-slate-400 text-xs">—</span>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="rid in (ref.requirementIds || []).slice(0,2)" :key="rid">
+                            <span class="chip chip-indigo text-xs cursor-pointer"
+                              @click="navTo('requirements'); reqSearch = rid" x-text="rid"></span>
+                          </template>
+                          <template x-if="(ref.requirementIds || []).length > 2">
+                            <span class="chip text-slate-400">+<span x-text="ref.requirementIds.length - 2"></span></span>
+                          </template>
+                          <span x-show="(ref.requirementIds || []).length === 0" class="text-slate-400 text-xs">—</span>
+                        </div>
+                      </td>
+                      <td>
+                        <a x-show="ref.url" :href="ref.url" target="_blank" rel="noopener"
+                           class="text-indigo-600 hover:text-indigo-800 flex items-center gap-1 text-xs font-medium">
+                          Open
+                          <svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                        </a>
+                        <span x-show="!ref.url" class="text-slate-300 text-xs">—</span>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+      </div>
+
+    </div><!-- /container -->
+  </main>
+
+  <!--
+    Script load order — DO NOT REORDER:
+    1. chart.js  (sync)  — must be defined before initTrendChart/initDonutChart fire
+    2. app.js    (sync)  — registers the alpine:init listener BEFORE Alpine boots;
+                           if placed AFTER the Alpine <script defer>, the listener
+                           never fires and the entire app is silently dead
+    3. alpinejs  (defer) — fires alpine:init after DOMContentLoaded; app.js has
+                           already registered the requApp data component by then
+  -->
+  <!-- ═══════════════════════════════════════════════════════════
+       IMPORT MODAL
+  ════════════════════════════════════════════════════════════ -->
+  <div
+    x-show="importDialogOpen"
+    x-cloak
+    class="fixed inset-0 z-50 flex items-center justify-center p-4"
+    @keydown.escape.window="importDialogOpen = false; importResult = null"
+    x-effect="if (importDialogOpen) $nextTick(() => $refs.importClose && $refs.importClose.focus())">
+    <!-- Backdrop -->
+    <div class="absolute inset-0 bg-black/50" @click="importDialogOpen = false; importResult = null"></div>
+    <!-- Panel -->
+    <div class="relative bg-white rounded-xl shadow-2xl w-full max-w-md p-6 z-10"
+      role="dialog" aria-modal="true" aria-labelledby="import-dialog-title">
+      <div class="flex items-center justify-between mb-4">
+        <h2 id="import-dialog-title" class="font-semibold text-slate-800 text-base">Import project data</h2>
+        <button x-ref="importClose" @click="importDialogOpen = false" class="p-2 text-slate-400 hover:text-slate-600 transition-colors" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Instructions -->
+      <p class="text-sm text-slate-500 mb-4">Select a <code class="bg-slate-100 px-1 rounded text-xs">.json</code> file exported from another requ instance. Existing records (same ID) are skipped.</p>
+
+      <!-- File drop-zone.
+           Cross-browser approach: the input is an opacity-0 overlay that covers the
+           entire zone. The user clicks directly on the input itself — no label
+           forwarding and no programmatic .click() are involved, so this works in
+           Chrome, Firefox, and Safari (WebKit blocks both of those alternatives). -->
+      <div class="relative w-full h-28" :class="importing ? 'opacity-50' : ''">
+        <!-- Visual layer (pointer-events:none so clicks fall through to the input) -->
+        <div class="flex flex-col items-center justify-center w-full h-full border-2 border-dashed rounded-lg transition-colors pointer-events-none"
+          :class="importing ? 'border-slate-200' : 'border-slate-300 group-hover:border-indigo-400'">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" class="text-slate-400 mb-2" aria-hidden="true">
+            <path d="M12 16V8M8 12l4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span class="text-sm text-slate-500" x-text="importing ? 'Importing…' : 'Click to select a file'"></span>
+        </div>
+        <!-- Transparent input overlay — the actual click target.
+             opacity:0 hides it visually; width/height:100% make it cover the zone.
+             No clip, no visibility:hidden, no display:none — all of those can prevent
+             Safari from opening the file picker. -->
+        <input type="file" accept=".json"
+          aria-label="Select a .json file to import"
+          style="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;"
+          @change="importFile($event)" :disabled="importing">
+      </div>
+
+      <!-- Result -->
+      <div x-show="importResult" class="mt-4">
+        <div
+          :class="importResult && importResult.errors && importResult.errors.length ? 'bg-red-50 border-red-200 text-red-700' : 'bg-green-50 border-green-200 text-green-700'"
+          class="border rounded-lg px-3 py-2 text-sm"
+          x-text="importResultSummary()">
+        </div>
+      </div>
+
+      <!-- Close button -->
+      <div class="mt-5 flex justify-end">
+        <button
+          @click="importDialogOpen = false; importResult = null"
+          class="btn-secondary text-xs">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="/public/app.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+</body>
+</html>

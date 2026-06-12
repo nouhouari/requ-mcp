@@ -9,12 +9,14 @@ import {
   Phase,
   Requirement,
   UserStory,
+  VcsRef,
   type Component as TComponent,
   type Config as TConfig,
   type Execution as TExecution,
   type Phase as TPhase,
   type Requirement as TRequirement,
   type UserStory as TUserStory,
+  type VcsRef as TVcsRef,
 } from "./schema.js";
 
 /**
@@ -41,6 +43,7 @@ export class Store {
   private get storyDir()     { return path.join(this.baseDir, "stories"); }
   private get phaseDir()     { return path.join(this.baseDir, "phases"); }
   private get execDir()      { return path.join(this.baseDir, "executions"); }
+  private get vcsDir()       { return path.join(this.baseDir, "vcs"); }
   private get configPath()   { return path.join(this.baseDir, "config.yaml"); }
 
   async isInitialized(): Promise<boolean> {
@@ -53,6 +56,7 @@ export class Store {
     await fs.mkdir(this.storyDir,     { recursive: true });
     await fs.mkdir(this.phaseDir,     { recursive: true });
     await fs.mkdir(this.execDir,      { recursive: true });
+    await fs.mkdir(this.vcsDir,       { recursive: true });
     await this.writeConfig(config);
   }
 
@@ -174,6 +178,34 @@ export class Store {
     const out = new Map<string, TExecution[]>();
     for (const p of phases) out.set(p.id, await this.readExecutionLog(p.id));
     return out;
+  }
+
+  // --- vcs refs ---
+
+  /** Build the on-disk path for a vcs ref id, asserting it stays within vcsDir. */
+  private vcsRefPath(id: string): string {
+    const p = path.join(this.vcsDir, `${id}.yaml`);
+    if (path.relative(this.vcsDir, p).startsWith("..")) throw new Error("invalid vcs ref id");
+    return p;
+  }
+
+  async listVcsRefs(): Promise<TVcsRef[]> {
+    return this.readAll(this.vcsDir, VcsRef);
+  }
+  async getVcsRef(id: string): Promise<TVcsRef | null> {
+    return this.readOne(this.vcsRefPath(id), VcsRef);
+  }
+  async writeVcsRef(ref: TVcsRef): Promise<void> {
+    await fs.mkdir(this.vcsDir, { recursive: true });
+    const v = VcsRef.parse(ref);
+    await fs.writeFile(this.vcsRefPath(v.id), YAML.stringify(v), "utf8");
+  }
+  async updateVcsRef(id: string, patch: Partial<TVcsRef>): Promise<TVcsRef | null> {
+    const existing = await this.getVcsRef(id);
+    if (!existing) return null;
+    const merged = VcsRef.parse({ ...existing, ...patch, id: existing.id });
+    await this.writeVcsRef(merged);
+    return merged;
   }
 
   // --- helpers ---

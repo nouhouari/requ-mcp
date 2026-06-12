@@ -8,12 +8,14 @@ import {
   Phase,
   Requirement,
   UserStory,
+  VcsRef,
   type Component as TComponent,
   type Config as TConfig,
   type Execution as TExecution,
   type Phase as TPhase,
   type Requirement as TRequirement,
   type UserStory as TUserStory,
+  type VcsRef as TVcsRef,
 } from "./schema.js";
 import { Store } from "./storage.js";
 
@@ -51,6 +53,10 @@ const SCHEMA_SQL = `
     note     TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_exec_phase ON executions(phase_id);
+  CREATE TABLE IF NOT EXISTS vcs_refs (
+    id   TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  );
 `;
 
 /**
@@ -63,10 +69,10 @@ export class SqliteStore {
   readonly baseDir: string;
   private db: Database.Database;
 
-  constructor(root: string) {
+  constructor(root: string, dbPathOverride?: string) {
     this.root = path.resolve(root);
     this.baseDir = path.join(this.root, ".requ");
-    const dbPath = process.env.REQU_DB ?? path.join(this.baseDir, "requ.db");
+    const dbPath = dbPathOverride ?? path.join(this.baseDir, "requ.db");
     mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
@@ -229,6 +235,29 @@ export class SqliteStore {
     const out = new Map<string, TExecution[]>();
     for (const p of phases) out.set(p.id, await this.readExecutionLog(p.id));
     return out;
+  }
+
+  // --- vcs refs ---
+
+  async listVcsRefs(): Promise<TVcsRef[]> {
+    return this.all("SELECT data FROM vcs_refs ORDER BY id", VcsRef);
+  }
+
+  async getVcsRef(id: string): Promise<TVcsRef | null> {
+    return this.get("SELECT data FROM vcs_refs WHERE id = ?", [id], VcsRef);
+  }
+
+  async writeVcsRef(ref: TVcsRef): Promise<void> {
+    const v = VcsRef.parse(ref);
+    this.put("vcs_refs", v.id, v);
+  }
+
+  async updateVcsRef(id: string, patch: Partial<TVcsRef>): Promise<TVcsRef | null> {
+    const existing = await this.getVcsRef(id);
+    if (!existing) return null;
+    const merged = VcsRef.parse({ ...existing, ...patch, id: existing.id });
+    await this.writeVcsRef(merged);
+    return merged;
   }
 
   // Reuse static helper from Store

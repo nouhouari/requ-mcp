@@ -20,7 +20,8 @@ Phase (v1.0, v1.1, …) → Execution (a scenario result for a run)
 At the end of a working session — or for any release — you ask the server one
 question — *"what's our coverage?"* — and get a precise, always-current answer
 instead of a stale spreadsheet, plus the **trend** of how coverage changed
-release over release.
+release over release. The server also ships a **web dashboard** (in HTTP mode)
+that visualizes coverage and requirements in 6 interactive tabs.
 
 ## Quickstart
 
@@ -72,7 +73,50 @@ npm run smoke      # optional: end-to-end self-test
 ```
 </details>
 
-Then a typical flow, all driven through the agent:
+## Web Dashboard
+
+The server ships an optional **HTTP transport mode** that serves a professional web dashboard alongside the MCP endpoint. Launch with the `REQU_TRANSPORT=http` environment variable:
+
+```bash
+REQU_TRANSPORT=http npx requ-mcp
+# → Dashboard: http://localhost:8788/
+# → MCP endpoint: http://localhost:8788/mcp
+```
+
+Or in your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "requ": {
+      "command": "npx",
+      "args": ["-y", "requ-mcp"],
+      "env": { "REQU_TRANSPORT": "http" }
+    }
+  }
+}
+```
+
+**Default port:** `8788`. Override it with `REQU_PORT=9000 REQU_TRANSPORT=http npx requ-mcp`.
+
+### Dashboard tabs
+
+| Tab | Content |
+|-----|---------|
+| **Overview** | KPI cards (requirements, stories, scenario pass rate, verified %) + coverage trend chart + component breakdown + gaps summary + phases strip |
+| **Requirements** | Sortable/filterable table of all requirements with inline expansion showing linked story IDs and tags |
+| **Stories** | User stories with status, acceptance criteria count, and coverage badge; expand to see acceptance criteria and linked scenarios with pass/fail/pending icons |
+| **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
+| **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
+| **VCS** | Table of VCS refs (branches and MRs) linked to stories and requirements, with state badges and external links |
+
+**Live updates:** The dashboard polls for KPI count changes every 5 seconds via Server-Sent Events (SSE) — no page refresh needed.
+
+**Before init:** If the project hasn't been initialized with `init_project` yet, all API endpoints and the dashboard show a "Project not initialized" message rather than crashing.
+
+## Usage
+
+A typical flow, all driven through the agent:
 
 0. `check_conductor` *(optional)* — confirm the Conductor folder exists and see its detected name before initializing.
 1. `init_project` — points at your Conductor project (`conductorPath`); it **verifies the folder exists and is a real Conductor project** (has `features/` or a cucumber config) and reports its name before creating `.requ/`. Pass `force:true` to override.
@@ -182,7 +226,8 @@ doesn't exist.
 npm install
 npm run build      # tsc -> dist/
 npm run smoke      # end-to-end test against the built server over stdio
-npm run dev        # run from source with tsx
+npm run dev        # run from source with tsx (stdio mode)
+npm run start:http # run from source in HTTP mode with dashboard
 ```
 
 ## How it finds the project

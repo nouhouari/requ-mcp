@@ -180,9 +180,70 @@ export const Config = z.object({
   conductorReportPath: z.string().optional(),
   /** Free-form phase identifier (e.g. "P1"). */
   activePhase: z.string().optional(),
+  /** VCS repository reference (requ-mcp never calls VCS; it only records references). */
+  repoUrl: z.string().optional(),
+  /** Default branch name; treated as "main" when unset. */
+  defaultBranch: z.string().optional(),
+  vcsType: z.enum(["gitlab"]).optional(),
 });
 export type Config = z.infer<typeof Config>;
+
+// ---------------------------------------------------------------------------
+// VcsRef — a recorded reference to a VCS branch or merge request.
+// requ-mcp holds NO token and never calls the VCS provider; it only stores
+// references that nodes report, for traceability.
+// ---------------------------------------------------------------------------
+
+export const VcsRefKind = z.enum(["branch", "mr"]);
+export type VcsRefKind = z.infer<typeof VcsRefKind>;
+
+export const VcsRefState = z.enum(["opened", "merged", "closed"]);
+export type VcsRefState = z.infer<typeof VcsRefState>;
+
+export const VcsRef = z.object({
+  /** Auto-id, e.g. "MR-5" / "BR-1". */
+  id: z.string().min(1),
+  kind: VcsRefKind,
+  /** MR iid as string, or branch name. */
+  ref: z.string().min(1),
+  url: z.string().default(""),
+  branch: z.string().default(""),
+  targetBranch: z.string().optional(),
+  component: z.string().optional(),
+  storyIds: z.array(z.string()).default([]),
+  requirementIds: z.array(z.string()).default([]),
+  state: VcsRefState.default("opened"),
+  mergeCommit: z.string().optional(),
+  createdAt: Timestamp,
+  updatedAt: Timestamp,
+});
+export type VcsRef = z.infer<typeof VcsRef>;
 
 /** Coverage resolution mode across phases. */
 export const CoverageMode = z.enum(["cumulative", "strict"]);
 export type CoverageMode = z.infer<typeof CoverageMode>;
+
+// ---------------------------------------------------------------------------
+// Export / Import
+// ---------------------------------------------------------------------------
+
+export const ExportPayload = z.object({
+  version: z.literal("1"),
+  exportedAt: z.string(),
+  source: z.object({ name: z.string() }).optional(),
+  data: z.object({
+    components:   z.array(Component).default([]),
+    requirements: z.array(Requirement).default([]),
+    stories:      z.array(UserStory).default([]),
+    phases:       z.array(Phase).default([]),
+    executions:   z.record(z.array(Execution)).default({}),
+    vcsRefs:      z.array(VcsRef).default([]),
+  }),
+});
+export type ExportPayload = z.infer<typeof ExportPayload>;
+
+export type ImportReport = {
+  imported: Record<string, number>;
+  skipped:  Record<string, string[]>;
+  errors:   string[];
+};

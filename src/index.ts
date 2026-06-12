@@ -11,18 +11,22 @@ import {
   Component,
   ComponentStatus,
   CoverageMode,
+  ExportPayload,
   Priority,
   PhaseStatus,
   RequirementStatus,
   StoryStatus,
   TestStatus,
   testKey,
+  VcsRefKind,
+  VcsRefState,
   type AcceptanceCriterion,
   type Component as TComponent,
   type Execution,
   type Phase,
   type Requirement,
   type UserStory,
+  type VcsRef,
 } from "./schema.js";
 import {
   danglingStoryTags,
@@ -35,6 +39,7 @@ import {
 } from "./conductor.js";
 import { buildReport, buildTrend, findGaps, resolveStatuses, type ScenariosByStory } from "./coverage.js";
 import { parseCucumberJson } from "./ingest.js";
+import { buildExport, applyImport } from "./export-import.js";
 
 const now = () => new Date().toISOString();
 
@@ -51,10 +56,43 @@ function fail(message: string, extra?: Record<string, unknown>) {
   };
 }
 
-const server = new McpServer({ name: "requ-mcp", version: "0.2.0" });
+/** SqliteStore instances for HTTP mode, keyed by URL-safe slug. */
+const _stores: Map<string, SqliteStore> = new Map();
 
-/** Singleton SqliteStore for HTTP mode (one DB connection for server lifetime). */
-let _sqliteStore: SqliteStore | null = null;
+/** Derive a URL-safe slug from a project root path. Deduplicates against `_stores`. */
+function slugify(root: string): string {
+  const base = path.basename(root).toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  if (!_stores.has(base)) return base;
+  let i = 2;
+  while (_stores.has(`${base}-${i}`)) i++;
+  return `${base}-${i}`;
+}
+
+/**
+ * Pre-load projects from env vars at HTTP server startup.
+ * REQU_PROJECTS: comma-separated absolute paths.
+ * Falls back to REQU_ROOT if REQU_PROJECTS is not set.
+ */
+function loadProjectsFromEnv(): void {
+  const raw = process.env.REQU_PROJECTS ?? process.env.REQU_ROOT;
+  if (!raw) return;
+  // Deduplicate by resolved root — duplicate paths would share one .db file.
+  const roots = [...new Set(
+    raw.split(",").map((s) => s.trim()).filter(Boolean).map((p) => path.resolve(p)),
+  )];
+  // Scope REQU_DB to single-project mode only — multiple projects must each use their own DB.
+  const dbOverride = roots.length === 1 ? (process.env.REQU_DB ?? undefined) : undefined;
+  for (const root of roots) {
+    try {
+      const slug = slugify(root);
+      _stores.set(slug, new SqliteStore(root, dbOverride));
+    } catch (err) {
+      throw new Error(
+        `Failed to open store for project ${root}: ${(err as Error).message}`,
+      );
+    }
+  }
+}
 
 type AnyStore = Store | SqliteStore;
 
@@ -63,7 +101,7 @@ type AnyStore = Store | SqliteStore;
 // ===========================================================================
 
 let cachedRoots: string[] | null = null;
-async function workspaceRoots(): Promise<string[]> {
+async function workspaceRoots(server: McpServer): Promise<string[]> {
   if (cachedRoots) return cachedRoots;
   try {
     const res = await server.server.listRoots();
@@ -91,23 +129,29 @@ async function findUp(start: string): Promise<string | null> {
   }
 }
 
-async function resolveRoot(explicit?: string): Promise<string> {
+async function resolveRoot(server: McpServer, explicit?: string): Promise<string> {
   if (explicit) return path.resolve(explicit);
   if (process.env.REQU_ROOT) return path.resolve(process.env.REQU_ROOT);
-  const roots = await workspaceRoots();
+  const roots = await workspaceRoots(server);
   for (const r of roots) if (await hasRequ(r)) return r;
   const found = await findUp(process.cwd());
   if (found) return found;
   return roots[0] ?? process.cwd();
 }
 
-async function getStore(explicit?: string): Promise<AnyStore> {
+async function getStore(server: McpServer, explicit?: string): Promise<AnyStore> {
   if (process.env.REQU_TRANSPORT === "http") {
-    const root = await resolveRoot(explicit);
-    if (!_sqliteStore) _sqliteStore = new SqliteStore(root);
-    return _sqliteStore;
+    const root = await resolveRoot(server, explicit);
+    // Find an existing store for this root, or create a new one.
+    for (const store of _stores.values()) {
+      if (store.root === root) return store;
+    }
+    const slug = slugify(root);
+    const store = new SqliteStore(root);
+    _stores.set(slug, store);
+    return store;
   }
-  return new Store(await resolveRoot(explicit));
+  return new Store(await resolveRoot(server, explicit));
 }
 
 const projectPathSchema = z
@@ -119,21 +163,47 @@ const projectPathSchema = z
 
 type Handler = (args: any, store: AnyStore) => Promise<unknown>;
 
-/** Register a tool that auto-injects `projectPath` and resolves the Store. */
+type ToolDef = {
+  name: string;
+  config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> };
+  handler: Handler;
+};
+
+/**
+ * All tool definitions, collected once at module load. They are registered onto a
+ * fresh `McpServer` by `createServer()` — one server instance per stdio process or
+ * per HTTP session — so a single server is never connected to two transports.
+ */
+const toolDefs: ToolDef[] = [];
+
+/** Collect a tool definition that auto-injects `projectPath` and resolves the Store. */
 function tool(
   name: string,
   config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> },
   handler: Handler,
 ) {
-  const inputSchema = { ...(config.inputSchema ?? {}), projectPath: projectPathSchema };
-  server.registerTool(name, { title: config.title, description: config.description, inputSchema }, async (args: any) => {
-    try {
-      const store = await getStore(args.projectPath);
-      return (await handler(args, store)) as ReturnType<typeof json>;
-    } catch (e) {
-      return fail((e as Error).message);
-    }
-  });
+  toolDefs.push({ name, config, handler });
+}
+
+/** Build a fresh McpServer with every collected tool registered on it. */
+function createServer(): McpServer {
+  const server = new McpServer({ name: "requ-mcp", version: "0.2.0" });
+  for (const { name, config, handler } of toolDefs) {
+    const inputSchema = { ...(config.inputSchema ?? {}), projectPath: projectPathSchema };
+    server.registerTool(
+      name,
+      { title: config.title, description: config.description, inputSchema },
+      async (args: any) => {
+        try {
+          const store = await getStore(server, args.projectPath);
+          return (await handler(args, store)) as ReturnType<typeof json>;
+        } catch (e) {
+          return fail((e as Error).message);
+        }
+      },
+    );
+  }
+  return server;
 }
 
 async function ensureInit(store: AnyStore) {
@@ -842,18 +912,19 @@ tool(
 // ===========================================================================
 
 async function resolveForReport(store: AnyStore, phase?: string, mode?: CoverageMode) {
-  const [reqs, stories, phases, execByPhase, { index }] = await Promise.all([
+  const [reqs, stories, phases, execByPhase, { index }, vcsRefs] = await Promise.all([
     store.listRequirements(),
     store.listStories(),
     store.listPhases(),
     store.readAllExecutions(),
     loadConductorIndex(store),
+    store.listVcsRefs(),
   ]);
   const phaseId = await store.resolvePhaseId(phase);
   const m = mode ?? "cumulative";
   const status = resolveStatuses(execByPhase, phases, phaseId, m);
   const byStory: ScenariosByStory = scenariosByStory(index);
-  return { reqs, stories, phases, byStory, status, phaseId, mode: m };
+  return { reqs, stories, phases, byStory, status, phaseId, mode: m, vcsRefs };
 }
 
 tool(
@@ -870,8 +941,8 @@ tool(
   },
   async (args, store) => {
     await ensureInit(store);
-    const { reqs, stories, byStory, status, phaseId, mode } = await resolveForReport(store, args.phase, args.mode);
-    const report = buildReport(reqs, stories, byStory, status, phaseId, mode);
+    const { reqs, stories, byStory, status, phaseId, mode, vcsRefs } = await resolveForReport(store, args.phase, args.mode);
+    const report = buildReport(reqs, stories, byStory, status, phaseId, mode, vcsRefs);
 
     // Enrich byComponent with component name and domainTags
     const components = await store.listComponents();
@@ -932,6 +1003,248 @@ tool(
   },
 );
 
+// ===========================================================================
+// VCS references (GitLab branches / merge requests)
+//
+// requ-mcp NEVER calls the VCS provider and holds NO token. These tools only
+// record references that nodes report, for traceability.
+// ===========================================================================
+
+tool(
+  "set_repo",
+  {
+    title: "Set VCS repository reference",
+    description:
+      "Record the project's VCS repository reference (repoUrl, defaultBranch, vcsType) in config. requ-mcp never calls the VCS provider — it only stores these references for traceability.",
+    inputSchema: {
+      repoUrl:       z.string().describe("Repository URL, e.g. 'https://gitlab.com/group/project'."),
+      defaultBranch: z.string().optional().describe("Default branch name. Defaults to 'main'."),
+      vcsType:       z.enum(["gitlab"]).optional().describe("VCS provider type."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const cfg = await store.readConfig();
+    const next = {
+      ...cfg,
+      repoUrl: args.repoUrl,
+      defaultBranch: args.defaultBranch ?? cfg.defaultBranch ?? "main",
+      vcsType: args.vcsType ?? cfg.vcsType,
+    };
+    await store.writeConfig(next);
+    return json({ repoUrl: next.repoUrl, defaultBranch: next.defaultBranch, vcsType: next.vcsType ?? null });
+  },
+);
+
+tool(
+  "get_repo",
+  {
+    title: "Get VCS repository reference",
+    description: "Return the recorded VCS repository config: repoUrl, defaultBranch, vcsType.",
+    inputSchema: {},
+  },
+  async (_args, store) => {
+    await ensureInit(store);
+    const cfg = await store.readConfig();
+    return json({ repoUrl: cfg.repoUrl ?? null, defaultBranch: cfg.defaultBranch ?? "main", vcsType: cfg.vcsType ?? null });
+  },
+);
+
+/** Validate story/requirement ids referenced by a VcsRef; fail on unknown ids. */
+async function validateVcsLinks(store: AnyStore, storyIds: string[], requirementIds: string[]) {
+  const missingStories: string[] = [];
+  for (const id of storyIds) if (!(await store.getStory(id))) missingStories.push(id);
+  if (missingStories.length) return fail(`Unknown story id(s): ${missingStories.join(", ")}`);
+  const missingReqs: string[] = [];
+  for (const id of requirementIds) if (!(await store.getRequirement(id))) missingReqs.push(id);
+  if (missingReqs.length) return fail(`Unknown requirement id(s): ${missingReqs.join(", ")}`);
+  return null;
+}
+
+tool(
+  "link_branch",
+  {
+    title: "Link a VCS branch reference",
+    description:
+      "Record a reference to a VCS branch (kind='branch', state='opened'), auto-id 'BR-n'. Referenced storyIds/requirementIds must exist (fails if unknown). requ-mcp does not create the branch — it only records the reference.",
+    inputSchema: {
+      branch:         z.string().min(1).describe("Branch name."),
+      component:      z.string().optional().describe("Component id this branch relates to."),
+      storyIds:       z.array(z.string().regex(/^US-\d+$/)).optional().describe("User story ids (US-…) this branch implements."),
+      requirementIds: z.array(z.string().regex(/^REQ-\d+$/)).optional().describe("Requirement ids (REQ-…) this branch relates to."),
+      url:            z.string().optional().describe("URL of the branch (optional)."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const storyIds: string[] = args.storyIds ?? [];
+    const requirementIds: string[] = args.requirementIds ?? [];
+    const bad = await validateVcsLinks(store, storyIds, requirementIds);
+    if (bad) return bad;
+
+    const existing = await store.listVcsRefs();
+    const dup = existing.find((r) => r.kind === "branch" && r.ref === args.branch);
+    const id = dup?.id ?? Store.nextId("BR", existing.map((r) => r.id));
+    const ts = now();
+    const ref: VcsRef = {
+      id,
+      kind: "branch",
+      ref: args.branch,
+      url: args.url ?? "",
+      branch: args.branch,
+      component: args.component,
+      storyIds,
+      requirementIds,
+      state: "opened",
+      createdAt: dup?.createdAt ?? ts,
+      updatedAt: ts,
+    };
+    await store.writeVcsRef(ref);
+    return json(ref);
+  },
+);
+
+tool(
+  "link_merge_request",
+  {
+    title: "Link a VCS merge request reference",
+    description:
+      "Record (or upsert) a reference to a merge request (kind='mr'), keyed by `ref` (the MR iid), id 'MR-<ref>'. Referenced storyIds/requirementIds must exist (fails if unknown). requ-mcp does not call GitLab — it only records the reference.",
+    inputSchema: {
+      ref:            z.string().regex(/^\d+$/).describe("MR iid (numeric string)."),
+      url:            z.string().min(1).describe("MR URL."),
+      branch:         z.string().min(1).describe("Source branch of the MR."),
+      storyIds:       z.array(z.string().regex(/^US-\d+$/)).optional().describe("User story ids (US-…) this MR implements."),
+      requirementIds: z.array(z.string().regex(/^REQ-\d+$/)).optional().describe("Requirement ids (REQ-…) this MR relates to."),
+      targetBranch:   z.string().optional().describe("Target branch of the MR."),
+      state:          VcsRefState.optional().describe("MR state. Defaults to 'opened'."),
+      component:      z.string().optional().describe("Component id this MR relates to."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const storyIds: string[] = args.storyIds ?? [];
+    const requirementIds: string[] = args.requirementIds ?? [];
+    const bad = await validateVcsLinks(store, storyIds, requirementIds);
+    if (bad) return bad;
+
+    const id = `MR-${args.ref}`;
+    const existing = await store.getVcsRef(id);
+    const ts = now();
+    const ref: VcsRef = {
+      id,
+      kind: "mr",
+      ref: args.ref,
+      url: args.url,
+      branch: args.branch,
+      targetBranch: args.targetBranch,
+      component: args.component,
+      storyIds,
+      requirementIds,
+      state: args.state ?? "opened",
+      mergeCommit: existing?.mergeCommit,
+      createdAt: existing?.createdAt ?? ts,
+      updatedAt: ts,
+    };
+    await store.writeVcsRef(ref);
+    return json(ref);
+  },
+);
+
+tool(
+  "update_merge_request",
+  {
+    title: "Update a merge request reference state",
+    description:
+      "Update the state (and optional mergeCommit) of a recorded MR reference, found by its `ref` (MR iid). Bumps updatedAt. Fails if no MR reference with that ref exists.",
+    inputSchema: {
+      ref:         z.string().regex(/^\d+$/).describe("MR iid (numeric string)."),
+      state:       VcsRefState.describe("New MR state."),
+      mergeCommit: z.string().optional().describe("Merge commit SHA (when merged)."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const refs = await store.listVcsRefs();
+    const target = refs.find((r) => r.kind === "mr" && r.ref === args.ref);
+    if (!target) return fail(`No merge request reference found for ref '${args.ref}'.`);
+    const patch: Partial<VcsRef> = { state: args.state, updatedAt: now() };
+    if (args.mergeCommit !== undefined) patch.mergeCommit = args.mergeCommit;
+    const updated = await store.updateVcsRef(target.id, patch);
+    if (!updated) return fail(`Merge request reference ${target.id} not found.`);
+    return json(updated);
+  },
+);
+
+tool(
+  "list_vcs_refs",
+  {
+    title: "List VCS references",
+    description: "List recorded VCS references (branches and MRs), optionally filtered by kind, component, state, or linked storyId.",
+    inputSchema: {
+      kind:      VcsRefKind.optional(),
+      component: z.string().optional(),
+      state:     z.string().optional(),
+      storyId:   z.string().optional(),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    let refs = await store.listVcsRefs();
+    if (args.kind)      refs = refs.filter((r) => r.kind === args.kind);
+    if (args.component) refs = refs.filter((r) => r.component === args.component);
+    if (args.state)     refs = refs.filter((r) => r.state === args.state);
+    if (args.storyId)   refs = refs.filter((r) => r.storyIds.includes(args.storyId));
+    return json(refs);
+  },
+);
+
+// ===========================================================================
+// Export / Import
+// ===========================================================================
+
+tool(
+  "export_project",
+  {
+    title: "Export project",
+    description:
+      "Export all project data (requirements, stories, phases, executions, components, VCS refs) as a JSON string. Pass the result to import_project on another instance to migrate or copy data.",
+    inputSchema: {},
+  },
+  async (_args, store) => {
+    await ensureInit(store);
+    const payload = await buildExport(store);
+    return json(JSON.stringify(payload, null, 2));
+  },
+);
+
+tool(
+  "import_project",
+  {
+    title: "Import project",
+    description:
+      "Import project data from a JSON string produced by export_project. Existing records (same ID) are skipped and reported. Returns a summary of what was imported and what was skipped.",
+    inputSchema: {
+      data: z.string().describe("JSON string produced by export_project"),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    let payload: unknown;
+    try {
+      payload = JSON.parse(args.data);
+    } catch {
+      return fail("data is not valid JSON");
+    }
+    const parsed = ExportPayload.safeParse(payload);
+    if (!parsed.success) {
+      return fail(`Invalid export format: ${parsed.error.message}`);
+    }
+    const report = await applyImport(store, parsed.data);
+    return json(report);
+  },
+);
+
 function renderMarkdown(report: ReturnType<typeof buildReport> & { byComponent: Array<{ component: string; componentName?: string; domainTags?: string[]; requirements: number; verified: number; verifiedPct: number }> }, phaseName: string): string {
   const s = report.summary;
   const lines: string[] = [];
@@ -960,7 +1273,12 @@ function renderMarkdown(report: ReturnType<typeof buildReport> & { byComponent: 
   lines.push("", "## Stories", "");
   for (const st of report.stories) {
     const mark = st.covered ? "✅" : !st.tested ? "❌" : "🟡";
-    lines.push(`- ${mark} **${st.id}** ${st.title} — ${st.passing}/${st.scenarios.length} scenarios pass (${st.status})`);
+    const mr = st.mergedMr
+      ? st.mergedMr.state === "merged"
+        ? ` — verified + merged (MR ${st.mergedMr.ref})`
+        : ` — MR ${st.mergedMr.ref} (${st.mergedMr.state})`
+      : "";
+    lines.push(`- ${mark} **${st.id}** ${st.title} — ${st.passing}/${st.scenarios.length} scenarios pass (${st.status})${mr}`);
     for (const sc of st.scenarios) {
       const cm = sc.status === "pass" ? "✓" : sc.status === "fail" ? "✗" : "·";
       lines.push(`  - ${cm} ${sc.feature} :: ${sc.name} — ${sc.status}`);
@@ -984,17 +1302,22 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
 }
 
 async function startHttpServer(): Promise<void> {
-  const { createServer } = await import("node:http");
+  const { createServer: createHttpServer } = await import("node:http");
   const { randomUUID }   = await import("node:crypto");
   const { StreamableHTTPServerTransport } =
     await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
+  const { handleWebRequest } = await import("./web-api.js");
 
   const port = parseInt(process.env.REQU_PORT ?? "8788", 10);
   const host = process.env.REQU_HOST ?? "0.0.0.0";
 
   const sessions = new Map<string, InstanceType<typeof StreamableHTTPServerTransport>>();
+  loadProjectsFromEnv();
 
-  const httpServer = createServer(async (req, res) => {
+  const httpServer = createHttpServer(async (req, res) => {
+    // Web dashboard routes (REST API + static files)
+    if (await handleWebRequest(req, res, _stores)) return;
+
     if (!req.url?.includes("/mcp")) {
       res.writeHead(404).end("Not Found");
       return;
@@ -1011,13 +1334,15 @@ async function startHttpServer(): Promise<void> {
       } else {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (id: string) => sessions.set(id, transport),
+          onsessioninitialized: (id: string) => { sessions.set(id, transport); },
         });
         (transport as any).onclose = () => {
           const sid = (transport as any).sessionId as string | undefined;
           if (sid) sessions.delete(sid);
         };
-        await server.connect(transport);
+        // Fresh McpServer per session — an McpServer cannot be connected to two transports.
+        const sessionServer = createServer();
+        await sessionServer.connect(transport);
       }
 
       await transport.handleRequest(req, res, body);
@@ -1027,8 +1352,11 @@ async function startHttpServer(): Promise<void> {
   });
 
   httpServer.listen(port, host, () => {
-    const dbPath = process.env.REQU_DB ?? `${process.env.REQU_ROOT ?? process.cwd()}/.requ/requ.db`;
-    console.error(`requ-mcp HTTP → http://${host}:${port}/mcp  db=${dbPath}`);
+    const loadedCount = _stores.size;
+    const dbInfo = loadedCount > 0
+      ? `projects=${loadedCount}`
+      : `db=${process.env.REQU_ROOT ?? process.cwd()}/.requ/requ.db`;
+    console.error(`requ-mcp HTTP → http://${host}:${port}/mcp  ${dbInfo}`);
   });
 }
 
@@ -1040,6 +1368,7 @@ async function main() {
   if (process.env.REQU_TRANSPORT === "http") {
     await startHttpServer();
   } else {
+    const server = createServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("requ-mcp running (stdio, YAML storage, per-call project resolution).");
