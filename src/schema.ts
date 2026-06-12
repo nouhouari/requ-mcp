@@ -175,6 +175,8 @@ export type ExecutionLog = z.infer<typeof ExecutionLog>;
 
 export const Config = z.object({
   name: z.string().default("requ project"),
+  key:   z.string().optional(),
+  brief: z.string().optional(),
   conductorPath: z.string().default("."),
   conductorName: z.string().optional(),
   conductorReportPath: z.string().optional(),

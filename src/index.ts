@@ -154,6 +154,25 @@ async function getStore(server: McpServer, explicit?: string): Promise<AnyStore>
   return new Store(await resolveRoot(server, explicit));
 }
 
+async function getStoreByKey(key: string, server: McpServer): Promise<AnyStore | null> {
+  // HTTP mode: search loaded stores.
+  for (const store of _stores.values()) {
+    try {
+      const cfg = await store.readConfig();
+      if (cfg.key === key) return store;
+    } catch { /* skip uninitialized */ }
+  }
+  // stdio fallback: check the single auto-resolved store.
+  if (_stores.size === 0) {
+    try {
+      const store = await getStore(server, undefined);
+      const cfg = await store.readConfig();
+      if (cfg.key === key) return store;
+    } catch { /* no match */ }
+  }
+  return null;
+}
+
 const projectPathSchema = z
   .string()
   .optional()
@@ -203,6 +222,36 @@ function createServer(): McpServer {
       },
     );
   }
+
+  // get_project_brief is registered directly so it can use the server closure for key-based lookup.
+  server.registerTool(
+    "get_project_brief",
+    {
+      title: "Get Project Brief",
+      description: "Retrieve a project's name, key, and Markdown brief by its project key. Useful when you know the project key but not its filesystem path.",
+      inputSchema: {
+        key: z.string().describe("The project key to look up (e.g. 'AUTH')."),
+      },
+    },
+    async (args: { key: string }) => {
+      try {
+        const store = await getStoreByKey(args.key, server);
+        if (!store) {
+          return json({ error: `No project found with key '${args.key}'.` });
+        }
+        const cfg = await store.readConfig();
+        return json({
+          key:   cfg.key   ?? null,
+          name:  cfg.name,
+          brief: cfg.brief ?? "",
+          root:  (store as any).root ?? "",
+        });
+      } catch (e) {
+        return fail((e as Error).message);
+      }
+    },
+  );
+
   return server;
 }
 
@@ -231,6 +280,8 @@ tool(
       "Create the `.requ/` directory at the resolved project root, record the Conductor project path and optional cucumber-json report path, and optionally create an initial phase. Before writing, it verifies the Conductor folder exists and is a real Conductor project (has features/ or a cucumber config), and reports its detected name. Refuses if the folder is missing/invalid unless force=true. Idempotent.",
     inputSchema: {
       name: z.string().optional(),
+      key: z.string().optional().describe("Short unique project identifier (e.g. 'AUTH'). Uppercase letters, digits, hyphens, underscores. 2–20 chars. Must be unique across projects."),
+      brief: z.string().optional().describe("Markdown-formatted description of what this project is about."),
       conductorPath: z.string().optional().describe("Path to the Conductor project root (has features/). Default '.'."),
       conductorReportPath: z
         .string()
@@ -257,6 +308,8 @@ tool(
 
     const config = {
       name: args.name ?? existing?.name ?? path.basename(store.root),
+      key:   args.key   ?? existing?.key,
+      brief: args.brief ?? existing?.brief,
       conductorPath,
       conductorName: conductor.isConductorProject ? conductor.name : existing?.conductorName,
       conductorReportPath: args.conductorReportPath ?? existing?.conductorReportPath,

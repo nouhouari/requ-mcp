@@ -71,6 +71,20 @@ document.addEventListener('alpine:init', function () {
       importResult: null,
       importing: false,
 
+      // ── Setup form ─────────────────────────────────────────────────────────────
+      setupName: '',
+      setupKey: '',
+      setupBrief: '',
+      setupPhase: '',
+      setupSubmitting: false,
+      setupError: null,
+
+      // ── Brief inline edit ──────────────────────────────────────────────────────
+      briefEditing: false,
+      briefDraft: '',
+      briefSaving: false,
+      briefError: null,
+
       // =========================================================================
       // Lifecycle
       // =========================================================================
@@ -773,6 +787,98 @@ document.addEventListener('alpine:init', function () {
         if (skipTotal > 0) parts.push(skipTotal + ' skipped (already exist)');
         if (r.errors && r.errors.length > 0) parts.push(r.errors.length + ' error' + (r.errors.length !== 1 ? 's' : '') + ': ' + r.errors[0]);
         return parts.length ? parts.join('. ') + '.' : 'Nothing to import.';
+      },
+
+      // =========================================================================
+      // Init from web UI
+      // =========================================================================
+
+      submitInit: function() {
+        var self = this;
+        if (self.setupSubmitting) return;
+        self.setupSubmitting = true;
+        self.setupError = null;
+        var body = {};
+        if (self.setupName) body.name = self.setupName;
+        if (self.setupKey) body.key = self.setupKey;
+        if (self.setupBrief) body.brief = self.setupBrief;
+        if (self.setupPhase) body.initialPhase = self.setupPhase;
+        fetch(self.apiUrl('/api/init'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        .then(function(res) {
+          return res.json().then(function(data) {
+            if (!res.ok) {
+              return Promise.reject(data.error || ('Initialization failed (HTTP ' + res.status + ')'));
+            }
+            return data;
+          });
+        })
+        .then(function() {
+          self.setupSubmitting = false;
+          return Promise.all([
+            self.loadConfig(),
+            self.loadSummary(),
+            self.loadRequirements(),
+            self.loadStories(),
+            self.loadComponents(),
+            self.loadPhases(),
+            self.loadVcsRefs(),
+            self.loadCoverage(),
+            self.loadTrend(),
+            self.loadGaps(),
+          ]);
+        })
+        .catch(function(err) {
+          self.setupSubmitting = false;
+          self.setupError = String(err);
+        });
+      },
+
+      // =========================================================================
+      // Brief inline edit
+      // =========================================================================
+
+      saveBrief: function() {
+        var self = this;
+        if (self.briefSaving) return;
+        self.briefSaving = true;
+        self.briefError = null;
+        fetch(self.apiUrl('/api/config'), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ brief: self.briefDraft }),
+        })
+        .then(function(res) {
+          return res.json().then(function(data) {
+            if (!res.ok) return Promise.reject(data.error || ('Save failed (HTTP ' + res.status + ')'));
+            return data;
+          });
+        })
+        .then(function(data) {
+          self.briefSaving = false;
+          self.briefEditing = false;
+          self.config = data;
+        })
+        .catch(function(err) {
+          self.briefSaving = false;
+          self.briefError = String(err);
+        });
+      },
+
+      renderMarkdown: function(text) {
+        if (!text) return '';
+        if (window.marked) {
+          return window.marked.parse(text);
+        }
+        // safe plain-text fallback
+        return text
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/\n/g, '<br>');
       },
 
     }; // end return

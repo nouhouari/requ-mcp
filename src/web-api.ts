@@ -33,7 +33,7 @@ const MIME: Record<string, string> = {
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
@@ -375,11 +375,102 @@ export async function handleWebRequest(
       return true;
     }
 
+    // --- POST /api/init --- (must work before project is initialized)
+    if (matchRoute(pathname, method, "/api/init", "POST") !== null) {
+      try {
+        // Store resolution without handleStoreResult — project may not be initialized yet.
+        let store: SqliteStore;
+        if (stores.size === 0) {
+          jsonError(res, 503, "No project root configured on this server");
+          return true;
+        } else if (stores.size > 1) {
+          const slug = searchParams.get("project");
+          if (!slug) {
+            jsonError(res, 400, "Multiple projects loaded — pass ?project=<slug>");
+            return true;
+          }
+          const found = stores.get(slug);
+          if (!found) {
+            jsonError(res, 404, `Unknown project: ${slug}`);
+            return true;
+          }
+          store = found;
+        } else {
+          store = [...stores.values()][0];
+        }
+
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(await collectBody(req));
+        } catch {
+          jsonError(res, 400, "Request body is not valid JSON");
+          return true;
+        }
+
+        // Derive / validate key.
+        let key: string;
+        if (typeof body.key === "string" && body.key.trim()) {
+          if (!/^[A-Z0-9][A-Z0-9_-]{0,19}$/.test(body.key)) {
+            jsonError(res, 400, "key must be 1–20 uppercase alphanumeric/hyphen/underscore characters starting with a letter or digit");
+            return true;
+          }
+          key = body.key;
+        } else {
+          key = (
+            (typeof body.name === "string" ? body.name : path.basename(store.root))
+              .replace(/[^A-Z0-9]/gi, "")
+              .toUpperCase()
+              .slice(0, 10)
+          ) || "PROJECT";
+        }
+
+        // Uniqueness check across all stores.
+        for (const s of stores.values()) {
+          try {
+            const cfg = await s.readConfig();
+            if (cfg.key === key && s !== store) {
+              jsonError(res, 409, `Project key '${key}' is already used by another project`);
+              return true;
+            }
+          } catch { /* skip uninitialized stores */ }
+        }
+
+        const config = {
+          name: typeof body.name === "string" && body.name.trim() ? body.name.trim() : path.basename(store.root),
+          key,
+          brief: typeof body.brief === "string" ? body.brief : undefined,
+          conductorPath: ".",
+        };
+
+        await store.init(config);
+
+        if (typeof body.initialPhase === "string" && body.initialPhase.trim()) {
+          const phase = {
+            id: "P1",
+            name: body.initialPhase,
+            order: 1,
+            status: "active" as const,
+            description: "",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+          await store.writePhase(phase);
+          await store.writeConfig({ ...config, activePhase: "P1" });
+        }
+
+        jsonOk(res, { initialized: true, config: await store.readConfig() });
+      } catch (err) {
+        jsonError(res, 500, (err as Error).message);
+      }
+      return true;
+    }
+
     // --- GET /api/summary ---
     if (matchRoute(pathname, method, "/api/summary", "GET") !== null) {
       const r = resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
+        if (!await r.store.isInitialized()) return notInitialized(res);
         const summary = await computeSummary(r.store);
         jsonOk(res, summary);
       } catch (err) {
@@ -518,6 +609,31 @@ export async function handleWebRequest(
       const r = resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
+        if (!await r.store.isInitialized()) return notInitialized(res);
+        jsonOk(res, await r.store.readConfig());
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- PATCH /api/config ---
+    if (matchRoute(pathname, method, "/api/config", "PATCH") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(await collectBody(req));
+        } catch {
+          jsonError(res, 400, "Request body is not valid JSON");
+          return true;
+        }
+        const cfg = await r.store.readConfig();
+        const updated = { ...cfg };
+        if (typeof body.name === "string" && body.name.trim()) updated.name = body.name.trim();
+        if (typeof body.brief === "string") updated.brief = body.brief;
+        await r.store.writeConfig(updated);
         jsonOk(res, await r.store.readConfig());
       } catch (err) {
         jsonError(res, 500, String(err));
