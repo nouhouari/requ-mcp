@@ -1,6 +1,6 @@
 {
   "name": "requ-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server to track requirements coverage and its evolution across phases/releases. Pairs with Conductor for e2e tests; links scenarios to user stories via @US-xxx tags.",
   "type": "module",
   "bin": {
