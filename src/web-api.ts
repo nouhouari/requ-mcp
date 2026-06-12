@@ -180,6 +180,7 @@ async function computeSummary(store: SqliteStore): Promise<Record<string, unknow
     stories: stories.length,
     components: components.length,
     phases: phases.length,
+    vcsRefs: vcsRefs.length,
     scenariosPassing: summary.scenariosPassing,
     scenariosLinked: summary.scenariosLinked,
     verifiedPct: summary.verifiedPct,

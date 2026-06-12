@@ -262,9 +262,21 @@ document.addEventListener('alpine:init', function () {
             try {
               var d = JSON.parse(e.data);
               if (d && typeof d === 'object') {
+                var prev = self.summary;
                 self.summary = d;
                 self.notInitialized = false;
                 if (self.tab === 'global') { self.loadGlobalSummary(); }
+                if (!prev || d.requirements !== prev.requirements) self.loadRequirements();
+                if (!prev || d.stories !== prev.stories) self.loadStories();
+                if (!prev || d.components !== prev.components) self.loadComponents();
+                if (!prev || d.phases !== prev.phases) self.loadPhases();
+                if (!prev || d.vcsRefs !== prev.vcsRefs) self.loadVcsRefs();
+                var coverageChanged = !prev ||
+                  d.verifiedPct !== prev.verifiedPct ||
+                  d.storyCoveragePct !== prev.storyCoveragePct ||
+                  d.stories !== prev.stories ||
+                  d.requirements !== prev.requirements;
+                if (coverageChanged) { self.loadCoverage(); self.loadTrend(); self.loadGaps(); }
               }
             } catch (_) {}
           };
