@@ -84,6 +84,8 @@ document.addEventListener('alpine:init', function () {
       briefDraft: '',
       briefSaving: false,
       briefError: null,
+      briefExpanded: false,
+      briefOverflows: false,
 
       // ── Server version ─────────────────────────────────────────────────────────
       appVersion: '',
@@ -865,6 +867,8 @@ document.addEventListener('alpine:init', function () {
         .then(function(data) {
           self.briefSaving = false;
           self.briefEditing = false;
+          self.briefExpanded = false;
+          self.briefOverflows = false;
           self.config = data;
         })
         .catch(function(err) {

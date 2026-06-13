@@ -359,7 +359,29 @@
 
             <!-- View mode -->
             <div class="flex-1 min-w-0" x-show="!briefEditing">
-              <div x-show="config && config.brief" class="brief-content text-sm" x-html="renderMarkdown((config && config.brief) || '')"></div>
+
+              <!-- Project key badge -->
+              <div x-show="config && config.key" class="mb-3">
+                <span class="inline-flex items-center font-mono text-xs font-semibold tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-100 rounded px-2 py-0.5 select-all"
+                      :title="'Project key: ' + (config && config.key || '')"
+                      x-text="config && config.key"></span>
+              </div>
+
+              <!-- Brief content with expand/collapse -->
+              <div x-show="config && config.brief">
+                <div class="brief-content text-sm brief-collapse"
+                     :class="briefExpanded ? 'brief-expanded' : ''"
+                     x-html="renderMarkdown((config && config.brief) || '')"
+                     x-ref="briefContent"
+                     x-effect="config && config.brief && $nextTick(() => { briefOverflows = $refs.briefContent ? $refs.briefContent.scrollHeight > $refs.briefContent.clientHeight + 4 : false; })">
+                </div>
+                <button x-show="briefOverflows || briefExpanded"
+                        class="mt-2 text-xs text-indigo-500 hover:text-indigo-700 transition-colors flex items-center gap-1 font-medium"
+                        @click="briefExpanded = !briefExpanded"
+                        x-text="briefExpanded ? '↑ Show less' : '↓ Show more'">
+                </button>
+              </div>
+
               <p x-show="!config || !config.brief" class="text-sm text-slate-400 italic">No description yet. Click the pencil to add one.</p>
             </div>
 

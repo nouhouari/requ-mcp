@@ -446,3 +446,13 @@ body {
 .brief-content > p:last-child,
 .brief-content > ul:last-child,
 .brief-content > ol:last-child { margin-bottom: 0; }
+
+/* ── Brief expand/collapse ─────────────────────────────── */
+.brief-collapse {
+  max-height: 7.5rem;   /* ≈ 5 lines at 1.5rem line-height */
+  overflow: hidden;
+  transition: max-height 0.25s ease;
+}
+.brief-collapse.brief-expanded {
+  max-height: 2000px;   /* large enough; animates via max-height trick */
+}
