@@ -223,6 +223,44 @@ function createServer(): McpServer {
     );
   }
 
+  // list_projects — enumerate all active projects on this server instance.
+  server.registerTool(
+    "list_projects",
+    {
+      title: "List Projects",
+      description:
+        "List all requ projects currently loaded on this server instance. " +
+        "Returns each project's key, name, and root path. " +
+        "Use this to discover which projects are available before calling other tools.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        // HTTP mode: _stores has one entry per loaded project root.
+        if (_stores.size > 0) {
+          const projects: Array<{ key: string | null; name: string; root: string }> = [];
+          for (const store of _stores.values()) {
+            try {
+              const cfg = await store.readConfig();
+              projects.push({ key: cfg.key ?? null, name: cfg.name, root: (store as any).root ?? "" });
+            } catch { /* skip uninitialized */ }
+          }
+          return json(projects);
+        }
+        // Stdio / single-store mode: resolve the default store and report it.
+        try {
+          const store = await getStore(server, undefined);
+          const cfg = await store.readConfig();
+          return json([{ key: cfg.key ?? null, name: cfg.name, root: (store as any).root ?? "" }]);
+        } catch {
+          return json([]);
+        }
+      } catch (e) {
+        return fail((e as Error).message);
+      }
+    },
+  );
+
   // get_project_brief is registered directly so it can use the server closure for key-based lookup.
   server.registerTool(
     "get_project_brief",
