@@ -85,11 +85,16 @@ document.addEventListener('alpine:init', function () {
       briefSaving: false,
       briefError: null,
 
+      // ── Server version ─────────────────────────────────────────────────────────
+      appVersion: '',
+
       // =========================================================================
       // Lifecycle
       // =========================================================================
 
       async init() {
+        var vd = await this._fetch('/api/version');
+        if (vd && vd.version) this.appVersion = vd.version;
         await this.loadProjects();
         if (this.projects.length > 1) { this.tab = 'global'; }
         await this.loadConfig();

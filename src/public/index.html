@@ -33,6 +33,7 @@
       <div class="flex items-center gap-3 shrink-0">
         <span class="text-indigo-400 font-bold text-xl select-none" aria-hidden="true">◈</span>
         <h1 class="font-semibold text-white tracking-tight text-base">requ<span class="sr-only"> — Requirements dashboard</span></h1>
+        <span class="text-slate-500 text-xs font-mono" x-show="appVersion" x-text="'v' + appVersion" aria-label="version"></span>
         <!-- Static name when single project; dropdown when multiple -->
         <template x-if="projects.length <= 1">
           <span class="text-slate-500 text-xs hidden sm:inline" x-text="config?.name ? '/ ' + config.name : ''"></span>

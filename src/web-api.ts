@@ -7,7 +7,7 @@
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { promises as fsp } from "node:fs";
+import { promises as fsp, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { SqliteStore } from "./sqlite-store.js";
 import { indexConductor, scenariosByStory } from "./conductor.js";
@@ -21,6 +21,10 @@ import { buildExport, applyImport } from "./export-import.js";
 // ---------------------------------------------------------------------------
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
+
+const SERVER_VERSION: string = (JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf-8")
+) as { version: string }).version;
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -127,7 +131,7 @@ async function serveStatic(res: ServerResponse, filePath: string): Promise<void>
     res.writeHead(200, {
       ...CORS_HEADERS,
       "Content-Type": mime,
-      "Cache-Control": isHtml ? "no-cache" : "public, max-age=3600",
+      "Cache-Control": "no-cache",
       "Content-Length": content.length,
     });
     res.end(content);
@@ -143,7 +147,23 @@ async function serveStatic(res: ServerResponse, filePath: string): Promise<void>
 }
 
 async function serveIndexHtml(res: ServerResponse): Promise<void> {
-  await serveStatic(res, path.join(PUBLIC_DIR, "index.html"));
+  // Inject the version as a cache-busting query string on static asset references,
+  // so browsers always load the correct JS/CSS when the server version changes.
+  const filePath = path.join(PUBLIC_DIR, "index.html");
+  try {
+    let html = await fsp.readFile(filePath, "utf-8");
+    html = html.replace(/(\/public\/(?:app|style)\.[a-z]+)"/g, `$1?v=${SERVER_VERSION}"`);
+    const buf = Buffer.from(html, "utf-8");
+    res.writeHead(200, {
+      ...CORS_HEADERS,
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+      "Content-Length": buf.length,
+    });
+    res.end(buf);
+  } catch {
+    jsonError(res, 500, "Internal server error");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +387,12 @@ export async function handleWebRequest(
     // Extract pathname once; all matchRoute calls below receive a clean path.
     const pathname = rawUrl.split("?")[0];
     const searchParams = new URL(rawUrl, "http://localhost").searchParams;
+
+    // --- GET /api/version --- (no store needed)
+    if (matchRoute(pathname, method, "/api/version", "GET") !== null) {
+      jsonOk(res, { version: SERVER_VERSION });
+      return true;
+    }
 
     // --- GET /api/projects --- (no store needed)
     if (matchRoute(pathname, method, "/api/projects", "GET") !== null) {
