@@ -618,6 +618,14 @@
               <option :value="c" x-text="componentName(c)"></option>
             </template>
           </select>
+          <!-- Phase -->
+          <select class="filter-select" x-model="reqPhaseFilter" aria-label="Filter by phase">
+            <option value="all">All Phases</option>
+            <option value="(none)">Unassigned</option>
+            <template x-for="ph in [...phases].sort((a,b) => a.order - b.order)" :key="ph.id">
+              <option :value="ph.id" x-text="ph.name || ph.id"></option>
+            </template>
+          </select>
           <!-- Sort -->
           <div class="ml-auto flex items-center gap-1 text-xs">
             <span class="text-slate-400 mr-1">Sort:</span>
@@ -662,6 +670,7 @@
                     <th>Title</th>
                     <th style="width:100px;" @click="sortReqBy('priority')">Priority</th>
                     <th style="width:170px;">Components</th>
+                    <th style="width:110px;">Phase</th>
                     <th style="width:120px;">Tags</th>
                     <th style="width:65px;" class="text-center">Stories</th>
                   </tr>
@@ -689,6 +698,14 @@
                         </div>
                       </td>
                       <td>
+                        <template x-if="req.phase">
+                          <span class="chip chip-indigo" x-text="phaseName(req.phase)"></span>
+                        </template>
+                        <template x-if="!req.phase">
+                          <span class="text-slate-300">—</span>
+                        </template>
+                      </td>
+                      <td>
                         <div class="flex flex-wrap gap-1">
                           <template x-for="tag in (req.tags || []).slice(0,2)" :key="tag">
                             <span class="chip" x-text="tag"></span>
@@ -703,7 +720,7 @@
                     <!-- Expanded detail -->
                     <template x-if="reqExpanded === req.id">
                       <tr class="detail-row">
-                        <td colspan="7">
+                        <td colspan="8">
                           <div class="detail-content">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div>
@@ -762,6 +779,14 @@
                 @click="storyStatusFilter = opt.v" x-text="opt.l"></button>
             </template>
           </div>
+          <!-- Phase -->
+          <select class="filter-select" x-model="storyPhaseFilter" aria-label="Filter by phase">
+            <option value="all">All Phases</option>
+            <option value="(none)">Unassigned</option>
+            <template x-for="ph in [...phases].sort((a,b) => a.order - b.order)" :key="ph.id">
+              <option :value="ph.id" x-text="ph.name || ph.id"></option>
+            </template>
+          </select>
           <div class="ml-auto text-sm text-slate-500">
             <span class="font-semibold text-slate-700" x-text="filteredStories().length"></span> of <span x-text="stories.length"></span>
           </div>
@@ -791,6 +816,7 @@
                     <th style="width:120px;">ID</th>
                     <th>Title</th>
                     <th style="width:110px;">Status</th>
+                    <th style="width:110px;">Phase</th>
                     <th style="width:55px;" class="text-center">ACs</th>
                     <th style="width:190px;">Requirements</th>
                     <th style="width:110px;">Coverage</th>
@@ -804,6 +830,14 @@
                       <td>
                         <span class="badge" :class="storyStatusBadge(story.status)"
                           x-text="story.status ? story.status.replace('_', ' ') : '—'"></span>
+                      </td>
+                      <td>
+                        <template x-if="story.phase">
+                          <span class="chip chip-indigo" x-text="phaseName(story.phase)"></span>
+                        </template>
+                        <template x-if="!story.phase">
+                          <span class="text-slate-300">—</span>
+                        </template>
                       </td>
                       <td class="text-center text-slate-500 text-sm" x-text="(story.acceptanceCriteria || []).length"></td>
                       <td>
@@ -824,7 +858,7 @@
                     <!-- Expanded detail -->
                     <template x-if="storyExpanded === story.id">
                       <tr class="detail-row">
-                        <td colspan="6">
+                        <td colspan="7">
                           <div class="detail-content">
                             <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
                               <div>
