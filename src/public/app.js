@@ -37,12 +37,14 @@ document.addEventListener('alpine:init', function () {
       reqStatusFilter: 'all',
       reqPriorityFilter: 'all',
       reqComponentFilter: 'all',
+      reqPhaseFilter: 'all',
       reqExpanded: null,
       reqSortBy: 'id',
 
       // ── Story filters ────────────────────────────────────────────────────────
       storySearch: '',
       storyStatusFilter: 'all',
+      storyPhaseFilter: 'all',
       storyExpanded: null,
 
       // ── VCS filters ──────────────────────────────────────────────────────────
@@ -375,6 +377,11 @@ document.addEventListener('alpine:init', function () {
             return (r.components || []).indexOf(self.reqComponentFilter) !== -1;
           });
         }
+        if (this.reqPhaseFilter !== 'all') {
+          list = list.filter(function (r) {
+            return self.reqPhaseFilter === '(none)' ? !r.phase : r.phase === self.reqPhaseFilter;
+          });
+        }
 
         // Sort
         var priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
@@ -397,6 +404,9 @@ document.addEventListener('alpine:init', function () {
         var self = this;
         return this.stories.filter(function (s) {
           if (self.storyStatusFilter !== 'all' && s.status !== self.storyStatusFilter) return false;
+          if (self.storyPhaseFilter !== 'all') {
+            if (self.storyPhaseFilter === '(none)' ? !!s.phase : s.phase !== self.storyPhaseFilter) return false;
+          }
           if (self.storySearch) {
             var q = self.storySearch.toLowerCase();
             return (
@@ -549,6 +559,15 @@ document.addEventListener('alpine:init', function () {
       componentName(id) {
         for (var i = 0; i < this.components.length; i++) {
           if (this.components[i].id === id) return this.components[i].name || id;
+        }
+        return id;
+      },
+
+      /** Human label for a phase id (its name, falling back to the id). */
+      phaseName(id) {
+        if (!id) return '';
+        for (var i = 0; i < this.phases.length; i++) {
+          if (this.phases[i].id === id) return this.phases[i].name || id;
         }
         return id;
       },
