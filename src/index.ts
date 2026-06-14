@@ -301,6 +301,31 @@ async function ensureInit(store: AnyStore) {
   }
 }
 
+/** A `fail()` result if `id` is not an existing phase, else null. */
+async function phaseError(store: AnyStore, id: string) {
+  if (await store.getPhase(id)) return null;
+  const phases = await store.listPhases();
+  return fail(`Unknown phase ${id}.`, { knownPhases: phases.map((p) => p.id) });
+}
+
+/**
+ * Resolve the target phase for a newly created requirement/story:
+ *   undefined → default to the active phase (may be unassigned),
+ *   ""        → explicitly unassigned,
+ *   "P1"      → validated against existing phases.
+ * Returns `{ value }` (value may be undefined = unassigned) or `{ error }`.
+ */
+async function resolveAssignedPhase(store: AnyStore, input: string | undefined) {
+  let id: string | null | undefined;
+  if (input === undefined) id = await store.resolvePhaseId();
+  else if (input === "") id = undefined;
+  else id = input;
+  if (!id) return { value: undefined as string | undefined };
+  const error = await phaseError(store, id);
+  if (error) return { error };
+  return { value: id as string | undefined };
+}
+
 async function loadConductorIndex(store: AnyStore): Promise<{ root: string; index: ConductorIndex }> {
   const root = await store.conductorRoot();
   return { root, index: await indexConductor(root) };
@@ -514,11 +539,16 @@ tool(
       priority: Priority.optional(),
       components: z.array(z.string()).optional().describe("Component IDs this requirement belongs to (matches Component.id)."),
       tags: z.array(z.string()).optional(),
+      phase: z.string().optional().describe("Target phase this requirement is planned for (e.g. 'P1'). Defaults to the active phase; pass '' to leave unassigned."),
       id: z.string().regex(/^REQ-\d+$/).optional(),
     },
   },
   async (args, store) => {
     await ensureInit(store);
+
+    // Resolve & validate target phase (default to active phase; "" = unassigned).
+    const phase = await resolveAssignedPhase(store, args.phase);
+    if (phase.error) return phase.error;
 
     // Validate component IDs if components exist
     if (args.components?.length) {
@@ -545,6 +575,7 @@ tool(
       components: args.components ?? [],
       tags: args.tags ?? [],
       status: "active",
+      ...(phase.value ? { phase: phase.value } : {}),
       createdAt: now(),
       updatedAt: now(),
     };
@@ -562,6 +593,7 @@ tool(
       status: RequirementStatus.optional(),
       component: z.string().optional(),
       tag: z.string().optional(),
+      phase: z.string().optional().describe("Filter by assigned target phase (exact match)."),
     },
   },
   async (args, store) => {
@@ -570,6 +602,7 @@ tool(
     if (args.status) reqs = reqs.filter((r) => r.status === args.status);
     if (args.component) reqs = reqs.filter((r) => r.components.includes(args.component));
     if (args.tag) reqs = reqs.filter((r) => r.tags.includes(args.tag));
+    if (args.phase) reqs = reqs.filter((r) => r.phase === args.phase);
     return json(reqs);
   },
 );
@@ -603,6 +636,7 @@ tool(
       priority: Priority.optional(),
       components: z.array(z.string()).optional(),
       tags: z.array(z.string()).optional(),
+      phase: z.string().optional().describe("Target phase (e.g. 'P1'). Pass '' to clear the assignment."),
       status: RequirementStatus.optional(),
     },
   },
@@ -610,6 +644,14 @@ tool(
     await ensureInit(store);
     const req = await store.getRequirement(args.id);
     if (!req) return fail(`Requirement ${args.id} not found.`);
+    if (args.phase !== undefined) {
+      if (args.phase === "") req.phase = undefined;
+      else {
+        const error = await phaseError(store, args.phase);
+        if (error) return error;
+        req.phase = args.phase;
+      }
+    }
     for (const k of ["title", "description", "source", "priority", "components", "tags", "status"] as const) {
       if (args[k] !== undefined) (req as Record<string, unknown>)[k] = args[k];
     }
@@ -634,6 +676,7 @@ tool(
       requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1).describe("IDs of existing requirements this story implements."),
       description: z.string().optional(),
       acceptanceCriteria: z.array(z.string()).optional().describe("Descriptive criterion texts."),
+      phase: z.string().optional().describe("Target phase this story is planned for (e.g. 'P1'). Defaults to the active phase; pass '' to leave unassigned."),
       id: z.string().regex(/^US-\d+$/).optional(),
     },
   },
@@ -642,6 +685,9 @@ tool(
     const missing: string[] = [];
     for (const reqId of args.requirements) if (!(await store.getRequirement(reqId))) missing.push(reqId);
     if (missing.length) return fail(`Unknown requirement(s): ${missing.join(", ")}`);
+
+    const phase = await resolveAssignedPhase(store, args.phase);
+    if (phase.error) return phase.error;
 
     const existing = await store.listStories();
     const id = args.id ?? Store.nextId("US", existing.map((s) => s.id));
@@ -658,6 +704,7 @@ tool(
       requirements: args.requirements,
       acceptanceCriteria,
       status: "draft",
+      ...(phase.value ? { phase: phase.value } : {}),
       createdAt: now(),
       updatedAt: now(),
     };
@@ -671,13 +718,18 @@ tool(
   {
     title: "List user stories",
     description: "List user stories, optionally filtered by status or linked requirement.",
-    inputSchema: { status: StoryStatus.optional(), requirement: z.string().regex(/^REQ-\d+$/).optional() },
+    inputSchema: {
+      status: StoryStatus.optional(),
+      requirement: z.string().regex(/^REQ-\d+$/).optional(),
+      phase: z.string().optional().describe("Filter by assigned target phase (exact match)."),
+    },
   },
   async (args, store) => {
     await ensureInit(store);
     let stories = await store.listStories();
     if (args.status) stories = stories.filter((s) => s.status === args.status);
     if (args.requirement) stories = stories.filter((s) => s.requirements.includes(args.requirement));
+    if (args.phase) stories = stories.filter((s) => s.phase === args.phase);
     return json(stories);
   },
 );
@@ -701,7 +753,7 @@ tool(
     const status = resolveStatuses(execByPhase, phases, phaseId, "cumulative");
     return json({
       ...story,
-      phase: phaseId,
+      statusPhase: phaseId,
       linkedScenarios: scs.map((sc) => ({
         feature: sc.feature,
         name: sc.name,
@@ -722,6 +774,7 @@ tool(
       description: z.string().optional(),
       status: StoryStatus.optional(),
       requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1).optional(),
+      phase: z.string().optional().describe("Target phase (e.g. 'P1'). Pass '' to clear the assignment."),
     },
   },
   async (args, store) => {
@@ -733,6 +786,14 @@ tool(
       for (const reqId of args.requirements) if (!(await store.getRequirement(reqId))) missing.push(reqId);
       if (missing.length) return fail(`Unknown requirement(s): ${missing.join(", ")}`);
       story.requirements = args.requirements;
+    }
+    if (args.phase !== undefined) {
+      if (args.phase === "") story.phase = undefined;
+      else {
+        const error = await phaseError(store, args.phase);
+        if (error) return error;
+        story.phase = args.phase;
+      }
     }
     if (args.title !== undefined) story.title = args.title;
     if (args.description !== undefined) story.description = args.description;
@@ -1032,8 +1093,8 @@ tool(
   },
   async (args, store) => {
     await ensureInit(store);
-    const { reqs, stories, byStory, status, phaseId, mode, vcsRefs } = await resolveForReport(store, args.phase, args.mode);
-    const report = buildReport(reqs, stories, byStory, status, phaseId, mode, vcsRefs);
+    const { reqs, stories, byStory, status, phaseId, mode, vcsRefs, phases } = await resolveForReport(store, args.phase, args.mode);
+    const report = buildReport(reqs, stories, byStory, status, phaseId, mode, vcsRefs, phases);
 
     // Enrich byComponent with component name and domainTags
     const components = await store.listComponents();
@@ -1089,8 +1150,8 @@ tool(
   },
   async (args, store) => {
     await ensureInit(store);
-    const { reqs, stories, byStory, status, phaseId, mode } = await resolveForReport(store, args.phase, args.mode);
-    return json(findGaps(reqs, stories, byStory, status, phaseId, mode));
+    const { reqs, stories, byStory, status, phaseId, mode, phases } = await resolveForReport(store, args.phase, args.mode);
+    return json(findGaps(reqs, stories, byStory, status, phaseId, mode, phases));
   },
 );
 

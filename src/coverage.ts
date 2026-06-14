@@ -31,6 +31,30 @@ import type { ConductorScenario } from "./conductor.js";
 export type StatusMap = Map<string, TestStatus>;
 export type ScenariosByStory = Map<string, ConductorScenario[]>;
 
+/**
+ * Whether a requirement/story is in scope for a phase report.
+ *
+ * Mirrors the execution cumulative/strict model:
+ *   - unassigned (no phase) → always in scope (backward-compatible),
+ *   - strict     → only items assigned to the target phase,
+ *   - cumulative → items assigned to the target phase or any earlier phase.
+ * An item whose phase id is unknown (not in `phases`) is treated as unassigned.
+ */
+export function inScope(
+  itemPhase: string | undefined,
+  targetPhaseId: string | null,
+  phases: Phase[],
+  mode: CoverageMode,
+): boolean {
+  if (!itemPhase) return true;
+  if (!targetPhaseId) return true;
+  if (mode === "strict") return itemPhase === targetPhaseId;
+  const itemOrder = phases.find((p) => p.id === itemPhase)?.order;
+  const targetOrder = phases.find((p) => p.id === targetPhaseId)?.order;
+  if (itemOrder === undefined || targetOrder === undefined) return true;
+  return itemOrder <= targetOrder;
+}
+
 export function resolveStatuses(
   executionsByPhase: Map<string, Execution[]>,
   phases: Phase[],
@@ -185,7 +209,12 @@ export function buildReport(
   phaseId: string | null,
   mode: CoverageMode,
   vcsRefs: VcsRef[] = [],
+  phases: Phase[] = [],
 ): CoverageReport {
+  // Scope to the items planned for this phase (unassigned items always count).
+  requirements = requirements.filter((r) => inScope(r.phase, phaseId, phases, mode));
+  stories = stories.filter((s) => inScope(s.phase, phaseId, phases, mode));
+
   const mrByStory = mergedMrByStory(vcsRefs);
   const storyCov = stories.map((s) => computeStoryCoverage(s, scenariosByStory, status, mrByStory.get(s.id)));
   const storyById = new Map(storyCov.map((s) => [s.id, s]));
@@ -284,7 +313,7 @@ export function buildTrend(
     .sort((a, b) => a.order - b.order)
     .map((p) => {
       const status = resolveStatuses(executionsByPhase, phases, p.id, mode);
-      const report = buildReport(requirements, stories, scenariosByStory, status, p.id, mode);
+      const report = buildReport(requirements, stories, scenariosByStory, status, p.id, mode, [], phases);
       return { phase: p.id, phaseName: p.name, order: p.order, summary: report.summary };
     });
 }
@@ -309,8 +338,9 @@ export function findGaps(
   status: StatusMap,
   phaseId: string | null,
   mode: CoverageMode,
+  phases: Phase[] = [],
 ): Gaps {
-  const report = buildReport(requirements, stories, scenariosByStory, status, phaseId, mode);
+  const report = buildReport(requirements, stories, scenariosByStory, status, phaseId, mode, [], phases);
 
   const requirementsWithoutStory = report.requirements
     .filter((r) => r.status === "active" && !r.hasStory)

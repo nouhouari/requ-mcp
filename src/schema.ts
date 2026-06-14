@@ -61,6 +61,9 @@ export const Requirement = z.object({
   components: z.array(z.string()).default([]),
   tags: z.array(z.string()).default([]),
   status: RequirementStatus.default("active"),
+  /** Target phase this requirement is planned for (matches Phase.id). Optional;
+   *  unassigned requirements are always in scope for every phase report. */
+  phase: z.string().optional(),
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -115,6 +118,10 @@ export const UserStory = z.object({
   requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1),
   acceptanceCriteria: z.array(AcceptanceCriterion).default([]),
   status: StoryStatus.default("draft"),
+  /** Target phase this story is planned for (matches Phase.id). Optional and
+   *  independent of the story's requirements; unassigned stories are always in
+   *  scope for every phase report. */
+  phase: z.string().optional(),
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });

@@ -192,7 +192,7 @@ async function computeSummary(store: SqliteStore): Promise<Record<string, unknow
 
   const vcsRefs = await store.listVcsRefs();
   const status = resolveStatuses(executionsByPhase, phases, activePhase, "cumulative");
-  const report = buildReport(requirements, stories, storyMap, status, activePhase, "cumulative", vcsRefs);
+  const report = buildReport(requirements, stories, storyMap, status, activePhase, "cumulative", vcsRefs, phases);
   const { summary } = report;
 
   return {
@@ -706,7 +706,7 @@ export async function handleWebRequest(
         const phaseParam = searchParams.get("phase");
         const phaseId = phaseParam ?? (await r.store.resolvePhaseId());
         const status = resolveStatuses(executionsByPhase, phases, phaseId, mode);
-        const gaps = findGaps(requirements, stories, storyMap, status, phaseId, mode);
+        const gaps = findGaps(requirements, stories, storyMap, status, phaseId, mode, phases);
         jsonOk(res, gaps);
       } catch (err) {
         jsonError(res, 500, String(err));
@@ -725,7 +725,7 @@ export async function handleWebRequest(
         const phaseParam = searchParams.get("phase");
         const phaseId = phaseParam ?? (await r.store.resolvePhaseId());
         const status = resolveStatuses(executionsByPhase, phases, phaseId, mode);
-        const report = buildReport(requirements, stories, storyMap, status, phaseId, mode, vcsRefs);
+        const report = buildReport(requirements, stories, storyMap, status, phaseId, mode, vcsRefs, phases);
         jsonOk(res, report);
       } catch (err) {
         jsonError(res, 500, String(err));
