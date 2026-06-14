@@ -150,6 +150,22 @@ two modes:
 
 `coverage_trend` returns the summary at each phase in order — the evolution view.
 
+### Phase planning & scope
+
+Requirements and user stories can be **assigned a target phase** — the release
+they're planned for — via the optional `phase` field on `create_requirement` /
+`create_user_story` (defaults to the active phase; pass `phase: ""` to leave
+unassigned) and `update_requirement` / `update_user_story`. This is *planning*
+("what's in scope for v1.1?"), distinct from *execution* ("what was tested").
+
+Phase reports are then scoped to the items planned for that phase, mirroring the
+coverage modes:
+
+- **cumulative** — items assigned to the target phase **or any earlier phase**.
+- **strict** — only items assigned to **that** phase.
+- items with **no** phase assigned are **always in scope** (so existing,
+  un-phased data behaves exactly as before until you start assigning phases).
+
 ### Components
 
 Requirements carry a `components` array, so coverage can be sliced per

@@ -107,12 +107,12 @@ async function main() {
     check("init refuses a missing Conductor folder", bad.isError === true, bad.data);
 
     const init = await call("init_project", { name: "Smoke", conductorPath: ".", initialPhase: "v1.0" });
-    check("init creates active phase v1.0", init.data.phase?.id === "PHASE-001", init.data);
+    check("init creates active phase v1.0", init.data.phase?.id === "P1", init.data);
     check("init reports the Conductor name + feature count", init.data.conductor?.featureFiles === 2 && typeof init.data.conductor?.name === "string", init.data.conductor);
 
     // Explicit projectPath argument resolves the same project.
     const viaPath = await call("list_phases", { projectPath: tmp });
-    check("explicit projectPath resolves project", viaPath.data.activePhase === "PHASE-001", viaPath.data);
+    check("explicit projectPath resolves project", viaPath.data.activePhase === "P1", viaPath.data);
 
     // Requirements with components.
     await call("create_requirement", { title: "User can log in", components: ["auth"], priority: "high" });
@@ -142,53 +142,84 @@ async function main() {
     check("import parses 2 login scenarios", imp.data.scenariosParsed === 2, imp.data);
     check("both imported scenarios are tagged to a story", imp.data.taggedToAStory === 2, imp.data);
     const rec = await call("record_execution", { feature: "Checkout", name: "Checkout completes on mobile", status: "pass" });
-    check("manual execution recorded into active phase", rec.data.phase === "PHASE-001", rec.data);
+    check("manual execution recorded into active phase", rec.data.phase === "P1", rec.data);
 
     // --- v1.0 coverage ---
-    rep = await call("coverage_report", { phase: "PHASE-001", mode: "cumulative" });
+    rep = await call("coverage_report", { phase: "P1", mode: "cumulative" });
     check("v1.0: REQ-001 & REQ-002 verified (2/3)", rep.data.summary.requirementsVerified === 2 && rep.data.summary.requirementsTotal === 3, rep.data.summary);
     check("v1.0: stories covered 2/3", rep.data.summary.storiesCovered === 2, rep.data.summary);
     check("v1.0: scenarios passing 3/3", rep.data.summary.scenariosPassing === 3 && rep.data.summary.scenariosLinked === 3, rep.data.summary);
     check("v1.0: auth component 100% verified", rep.data.byComponent.some((c: any) => c.component === "auth" && c.verifiedPct === 100), rep.data.byComponent);
 
     // --- new phase v1.1 ---
-    await call("create_phase", { name: "v1.1", activate: true });
-    let strict = await call("coverage_report", { phase: "PHASE-002", mode: "strict" });
+    await call("create_phase", { id: "P2", name: "v1.1", activate: true });
+    let strict = await call("coverage_report", { phase: "P2", mode: "strict" });
     check("strict v1.1: 0 covered before its own runs", strict.data.summary.storiesCovered === 0, strict.data.summary);
-    let cum = await call("coverage_report", { phase: "PHASE-002", mode: "cumulative" });
+    let cum = await call("coverage_report", { phase: "P2", mode: "cumulative" });
     check("cumulative v1.1: carries forward 2 covered", cum.data.summary.storiesCovered === 2, cum.data.summary);
 
     // --- regression: valid-login fails in v1.1 ---
     await fs.writeFile(path.join(tmp, "reports", "v11.json"), loginReport("failed", "passed"));
     await call("import_execution_report", { filePath: "reports/v11.json", runId: "ci-110" });
 
-    cum = await call("coverage_report", { phase: "PHASE-002", mode: "cumulative" });
+    cum = await call("coverage_report", { phase: "P2", mode: "cumulative" });
     check("v1.1 regression: only 1 requirement verified", cum.data.summary.requirementsVerified === 1, cum.data.summary);
     check("v1.1: US-001 no longer covered", cum.data.stories.find((s: any) => s.id === "US-001")?.covered === false, cum.data.stories);
     check("v1.1: scenarios passing 2/3", cum.data.summary.scenariosPassing === 2, cum.data.summary);
 
     // --- gaps ---
-    const gaps = await call("find_gaps", { phase: "PHASE-002", mode: "cumulative" });
+    const gaps = await call("find_gaps", { phase: "P2", mode: "cumulative" });
     check("gap: US-003 has no tagged scenario", gaps.data.storiesWithoutScenario.some((s: any) => s.id === "US-003"), gaps.data);
     check("gap: US-001 not covered, failing scenario listed", gaps.data.storiesNotCovered.some((g: any) => g.id === "US-001" && g.failing.includes("Successful login with valid credentials")), gaps.data.storiesNotCovered);
 
     // --- evolution ---
     const trend = await call("coverage_trend", { mode: "cumulative" });
-    const v10 = trend.data.points.find((p: any) => p.phase === "PHASE-001");
-    const v11 = trend.data.points.find((p: any) => p.phase === "PHASE-002");
+    const v10 = trend.data.points.find((p: any) => p.phase === "P1");
+    const v11 = trend.data.points.find((p: any) => p.phase === "P2");
     check("trend shows verified 2 -> 1", v10.summary.requirementsVerified === 2 && v11.summary.requirementsVerified === 1, { v10: v10?.summary.requirementsVerified, v11: v11?.summary.requirementsVerified });
 
     // --- story view shows derived scenarios + status ---
     const story = await call("get_user_story", { id: "US-001" });
     check("get_user_story lists 2 linked scenarios", story.data.linkedScenarios?.length === 2, story.data.linkedScenarios);
 
-    const md = await call("coverage_report", { phase: "PHASE-002", mode: "cumulative", format: "markdown" });
+    const md = await call("coverage_report", { phase: "P2", mode: "cumulative", format: "markdown" });
     check("markdown renders", md.raw.includes("Requirements Coverage — v1.1"));
     console.log("\n--- v1.1 cumulative report ---\n" + md.raw + "\n");
 
     console.log("--- trend ---");
     for (const p of trend.data.points)
       console.log(`  ${p.phaseName}: verified ${p.summary.requirementsVerified}/${p.summary.requirementsTotal}, stories covered ${p.summary.storiesCovered}/${p.summary.storiesTotal}`);
+
+    // --- phase assignment & scoping ---
+    // Items created earlier defaulted to the active phase at creation time (P1).
+    const reqByPhase = await call("list_requirements", { phase: "P1" });
+    check("create defaults requirement to active phase", reqByPhase.data.length === 3 && reqByPhase.data.every((r: any) => r.phase === "P1"), reqByPhase.data);
+    const storyByPhase = await call("list_user_stories", { phase: "P1" });
+    check("create defaults story to active phase", storyByPhase.data.length === 3 && storyByPhase.data.every((s: any) => s.phase === "P1"), storyByPhase.data);
+
+    // A requirement explicitly planned for v1.1 (P2), plus an unassigned one.
+    await call("create_requirement", { title: "v1.1 only feature", phase: "P2" }); // REQ-004
+    await call("create_requirement", { title: "Unscoped feature", phase: "" });           // REQ-005
+
+    const filt = await call("list_requirements", { phase: "P2" });
+    check("list filter by phase returns only REQ-004", filt.data.length === 1 && filt.data[0].id === "REQ-004", filt.data);
+
+    const badPhase = await call("create_requirement", { title: "bad", phase: "NOPE" });
+    check("create rejects an unknown phase", badPhase.isError === true, badPhase.data);
+
+    // strict P1: REQ-004 (v1.1) excluded; unassigned REQ-005 included; 3 P1 reqs included => 4 total.
+    const strictP1 = await call("coverage_report", { phase: "P1", mode: "strict" });
+    check("strict P1 excludes v1.1 req, includes unassigned (4 total)", strictP1.data.summary.requirementsTotal === 4, strictP1.data.summary);
+    check("strict P1 does not list REQ-004", !strictP1.data.requirements.some((r: any) => r.id === "REQ-004"), strictP1.data.requirements.map((r: any) => r.id));
+
+    // cumulative P2: P1 carries forward + P2 + unassigned => 5 total.
+    const cumP2 = await call("coverage_report", { phase: "P2", mode: "cumulative" });
+    check("cumulative P2 includes earlier + this phase + unassigned (5 total)", cumP2.data.summary.requirementsTotal === 5, cumP2.data.summary);
+
+    // Clearing a phase returns an item to always-in-scope.
+    await call("update_requirement", { id: "REQ-004", phase: "" });
+    const strictP1b = await call("coverage_report", { phase: "P1", mode: "strict" });
+    check("clearing a phase makes the req always in scope (5 total)", strictP1b.data.summary.requirementsTotal === 5, strictP1b.data.summary);
   } finally {
     await client.close();
     await fs.rm(tmp, { recursive: true, force: true });
