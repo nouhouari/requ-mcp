@@ -206,7 +206,7 @@ function tool(
 
 /** Build a fresh McpServer with every collected tool registered on it. */
 function createServer(): McpServer {
-  const server = new McpServer({ name: "requ-mcp", version: "0.2.0" });
+  const server = new McpServer({ name: "requ-mcp", version: "0.5.0" });
   for (const { name, config, handler } of toolDefs) {
     const inputSchema = { ...(config.inputSchema ?? {}), projectPath: projectPathSchema };
     server.registerTool(
