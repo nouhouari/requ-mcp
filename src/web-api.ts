@@ -10,6 +10,9 @@ import path from "node:path";
 import { promises as fsp, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { SqliteStore } from "./sqlite-store.js";
+import type { PostgresStore } from "./postgres-store.js";
+
+type AnyHttpStore = SqliteStore | PostgresStore;
 import { indexConductor, scenariosByStory } from "./conductor.js";
 import { buildReport, buildTrend, findGaps, resolveStatuses } from "./coverage.js";
 import type { CoverageMode } from "./schema.js";
@@ -170,7 +173,7 @@ async function serveIndexHtml(res: ServerResponse): Promise<void> {
 // Summary helper (shared by GET /api/summary and SSE)
 // ---------------------------------------------------------------------------
 
-async function computeSummary(store: SqliteStore): Promise<Record<string, unknown>> {
+async function computeSummary(store: AnyHttpStore): Promise<Record<string, unknown>> {
   const [requirements, stories, components, phases] = await Promise.all([
     store.listRequirements(),
     store.listStories(),
@@ -213,7 +216,7 @@ async function computeSummary(store: SqliteStore): Promise<Record<string, unknow
 // Coverage helper (builds index + story map, catches ENOENT)
 // ---------------------------------------------------------------------------
 
-async function buildCoverageData(store: SqliteStore): Promise<{
+async function buildCoverageData(store: AnyHttpStore): Promise<{
   requirements: import("./schema.js").Requirement[];
   stories: import("./schema.js").UserStory[];
   phases: import("./schema.js").Phase[];
@@ -273,13 +276,13 @@ function parseCoverageMode(
 // ---------------------------------------------------------------------------
 
 type StoreResult =
-  | { status: "ok"; store: SqliteStore }
+  | { status: "ok"; store: AnyHttpStore }
   | { status: "not_initialized" }
   | { status: "ambiguous"; available: string[] }
   | { status: "unknown_project"; slug: string };
 
 function resolveStore(
-  stores: Map<string, SqliteStore>,
+  stores: Map<string, AnyHttpStore>,
   searchParams: URLSearchParams,
 ): StoreResult {
   if (stores.size === 0) return { status: "not_initialized" };
@@ -294,7 +297,7 @@ function resolveStore(
 function handleStoreResult(
   res: ServerResponse,
   result: StoreResult,
-): result is { status: "ok"; store: SqliteStore } {
+): result is { status: "ok"; store: AnyHttpStore } {
   if (result.status === "ok") return true;
   if (result.status === "not_initialized") {
     notInitialized(res);
@@ -318,7 +321,7 @@ function handleStoreResult(
 export async function handleWebRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  stores: Map<string, SqliteStore>,
+  stores: Map<string, AnyHttpStore>,
 ): Promise<boolean> {
   const rawUrl = req.url ?? "/";
   const method = req.method ?? "GET";
@@ -405,7 +408,7 @@ export async function handleWebRequest(
     if (matchRoute(pathname, method, "/api/init", "POST") !== null) {
       try {
         // Store resolution without handleStoreResult — project may not be initialized yet.
-        let store: SqliteStore;
+        let store: AnyHttpStore;
         if (stores.size === 0) {
           jsonError(res, 503, "No project root configured on this server");
           return true;
