@@ -194,9 +194,12 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
   }
 
   const vcsRefs = await store.listVcsRefs();
-  const status = resolveStatuses(executionsByPhase, phases, activePhase, "strict");
-  const report = buildReport(requirements, stories, storyMap, status, activePhase, "strict", vcsRefs, phases);
-  const { summary } = report;
+
+  const statusStrict = resolveStatuses(executionsByPhase, phases, activePhase, "strict");
+  const reportStrict = buildReport(requirements, stories, storyMap, statusStrict, activePhase, "strict", vcsRefs, phases);
+
+  const statusCumulative = resolveStatuses(executionsByPhase, phases, activePhase, "cumulative");
+  const reportCumulative = buildReport(requirements, stories, storyMap, statusCumulative, activePhase, "cumulative", vcsRefs, phases);
 
   return {
     requirements: requirements.length,
@@ -204,10 +207,12 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     components: components.length,
     phases: phases.length,
     vcsRefs: vcsRefs.length,
-    scenariosPassing: summary.scenariosPassing,
-    scenariosLinked: summary.scenariosLinked,
-    verifiedPct: summary.verifiedPct,
-    storyCoveragePct: summary.storyCoveragePct,
+    scenariosPassing: reportStrict.summary.scenariosPassing,
+    scenariosLinked:  reportStrict.summary.scenariosLinked,
+    verifiedPct:                reportStrict.summary.verifiedPct,
+    storyCoveragePct:           reportStrict.summary.storyCoveragePct,
+    verifiedPctCumulative:      reportCumulative.summary.verifiedPct,
+    storyCoveragePctCumulative: reportCumulative.summary.storyCoveragePct,
     activePhase,
   };
 }
