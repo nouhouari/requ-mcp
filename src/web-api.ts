@@ -194,8 +194,8 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
   }
 
   const vcsRefs = await store.listVcsRefs();
-  const status = resolveStatuses(executionsByPhase, phases, activePhase, "cumulative");
-  const report = buildReport(requirements, stories, storyMap, status, activePhase, "cumulative", vcsRefs, phases);
+  const status = resolveStatuses(executionsByPhase, phases, activePhase, "strict");
+  const report = buildReport(requirements, stories, storyMap, status, activePhase, "strict", vcsRefs, phases);
   const { summary } = report;
 
   return {
@@ -268,7 +268,7 @@ function parseCoverageMode(
     jsonError(res, 400, `Invalid mode "${raw}". Accepted values: "cumulative", "strict".`);
     return null;
   }
-  return (raw ?? "cumulative") as CoverageMode;
+  return (raw ?? "strict") as CoverageMode;
 }
 
 // ---------------------------------------------------------------------------
