@@ -18,6 +18,7 @@
     "start:http": "REQU_TRANSPORT=http tsx src/index.ts",
     "smoke": "tsx scripts/smoke.ts",
     "smoke:vcs": "tsx scripts/smoke-vcs.ts",
+    "smoke:pg": "tsx scripts/smoke-pg.ts",
     "prepare": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
     "prepublishOnly": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\""
   },
