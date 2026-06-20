@@ -18,6 +18,7 @@
     "start:http": "REQU_TRANSPORT=http tsx src/index.ts",
     "smoke": "tsx scripts/smoke.ts",
     "smoke:vcs": "tsx scripts/smoke-vcs.ts",
+    "smoke:pg": "tsx scripts/smoke-pg.ts",
     "prepare": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
     "prepublishOnly": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\""
   },
@@ -47,12 +48,14 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.1.0",
     "better-sqlite3": "^12.10.0",
+    "pg": "^8.13.0",
     "yaml": "^2.5.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }

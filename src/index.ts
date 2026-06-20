@@ -7,6 +7,7 @@ import path from "node:path";
 import url from "node:url";
 import { Store } from "./storage.js";
 import { SqliteStore } from "./sqlite-store.js";
+import { PostgresStore, initPgPool } from "./postgres-store.js";
 import {
   Component,
   ComponentStatus,
@@ -56,8 +57,8 @@ function fail(message: string, extra?: Record<string, unknown>) {
   };
 }
 
-/** SqliteStore instances for HTTP mode, keyed by URL-safe slug. */
-const _stores: Map<string, SqliteStore> = new Map();
+/** Store instances for HTTP mode, keyed by URL-safe slug. */
+const _stores: Map<string, SqliteStore | PostgresStore> = new Map();
 
 /** Derive a URL-safe slug from a project root path. Deduplicates against `_stores`. */
 function slugify(root: string): string {
@@ -72,6 +73,7 @@ function slugify(root: string): string {
  * Pre-load projects from env vars at HTTP server startup.
  * REQU_PROJECTS: comma-separated absolute paths.
  * Falls back to REQU_ROOT if REQU_PROJECTS is not set.
+ * When REQU_PG_URL is set, uses PostgresStore; otherwise uses SqliteStore.
  */
 function loadProjectsFromEnv(): void {
   const raw = process.env.REQU_PROJECTS ?? process.env.REQU_ROOT;
@@ -80,12 +82,13 @@ function loadProjectsFromEnv(): void {
   const roots = [...new Set(
     raw.split(",").map((s) => s.trim()).filter(Boolean).map((p) => path.resolve(p)),
   )];
-  // Scope REQU_DB to single-project mode only — multiple projects must each use their own DB.
-  const dbOverride = roots.length === 1 ? (process.env.REQU_DB ?? undefined) : undefined;
+  const usePg = !!process.env.REQU_PG_URL;
+  // Scope REQU_DB to single-project SQLite mode only.
+  const dbOverride = !usePg && roots.length === 1 ? (process.env.REQU_DB ?? undefined) : undefined;
   for (const root of roots) {
     try {
       const slug = slugify(root);
-      _stores.set(slug, new SqliteStore(root, dbOverride));
+      _stores.set(slug, usePg ? new PostgresStore(root, slug) : new SqliteStore(root, dbOverride));
     } catch (err) {
       throw new Error(
         `Failed to open store for project ${root}: ${(err as Error).message}`,
@@ -94,7 +97,7 @@ function loadProjectsFromEnv(): void {
   }
 }
 
-type AnyStore = Store | SqliteStore;
+type AnyStore = Store | SqliteStore | PostgresStore;
 
 // ===========================================================================
 // Project resolution
@@ -147,7 +150,9 @@ async function getStore(server: McpServer, explicit?: string): Promise<AnyStore>
       if (store.root === root) return store;
     }
     const slug = slugify(root);
-    const store = new SqliteStore(root);
+    const store = process.env.REQU_PG_URL
+      ? new PostgresStore(root, slug)
+      : new SqliteStore(root);
     _stores.set(slug, store);
     return store;
   }
@@ -1464,6 +1469,7 @@ async function startHttpServer(): Promise<void> {
   const host = process.env.REQU_HOST ?? "0.0.0.0";
 
   const sessions = new Map<string, InstanceType<typeof StreamableHTTPServerTransport>>();
+  if (process.env.REQU_PG_URL) initPgPool(process.env.REQU_PG_URL);
   loadProjectsFromEnv();
 
   const httpServer = createHttpServer(async (req, res) => {
@@ -1505,9 +1511,12 @@ async function startHttpServer(): Promise<void> {
 
   httpServer.listen(port, host, () => {
     const loadedCount = _stores.size;
-    const dbInfo = loadedCount > 0
-      ? `projects=${loadedCount}`
-      : `db=${process.env.REQU_ROOT ?? process.cwd()}/.requ/requ.db`;
+    const pgUrl = process.env.REQU_PG_URL;
+    const dbInfo = pgUrl
+      ? `postgres=yes  projects=${loadedCount}`
+      : loadedCount > 0
+        ? `projects=${loadedCount}`
+        : `db=${process.env.REQU_ROOT ?? process.cwd()}/.requ/requ.db`;
     console.error(`requ-mcp HTTP → http://${host}:${port}/mcp  ${dbInfo}`);
   });
 }
