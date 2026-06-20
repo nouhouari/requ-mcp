@@ -69,7 +69,7 @@ const SCHEMA_SQL = `
     source     TEXT    NOT NULL DEFAULT 'manual',
     note       TEXT
   );
-  CREATE INDEX IF NOT EXISTS idx_exec_project_phase ON executions(project_id, phase_id);
+  CREATE INDEX IF NOT EXISTS idx_exec_project_phase ON executions(project_id, phase_id, ran_at);
   CREATE TABLE IF NOT EXISTS vcs_refs (
     project_id TEXT  NOT NULL,
     id         TEXT  NOT NULL,
@@ -85,7 +85,15 @@ const SCHEMA_SQL = `
 export function initPgPool(connectionString: string): void {
   if (_pool) return;
   _pool = new Pool({ connectionString });
-  _schemaReady = _pool.query(SCHEMA_SQL).then(() => undefined);
+  _schemaReady = _pool
+    .query(SCHEMA_SQL)
+    .then(() =>
+      _pool!.query(`
+        DROP INDEX IF EXISTS idx_exec_project_phase;
+        CREATE INDEX IF NOT EXISTS idx_exec_project_phase ON executions(project_id, phase_id, ran_at);
+      `)
+    )
+    .then(() => undefined);
 }
 
 // ---------------------------------------------------------------------------
