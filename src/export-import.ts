@@ -3,9 +3,10 @@
  */
 import type { Store } from "./storage.js";
 import type { SqliteStore } from "./sqlite-store.js";
+import type { PostgresStore } from "./postgres-store.js";
 import type { Execution, ExportPayload, ImportReport } from "./schema.js";
 
-type AnyStore = Store | SqliteStore;
+type AnyStore = Store | SqliteStore | PostgresStore;
 
 export async function buildExport(store: AnyStore): Promise<ExportPayload> {
   const [config, components, requirements, stories, phases, vcsRefs, executionsByPhase] =

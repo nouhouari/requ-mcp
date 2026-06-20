@@ -69,7 +69,9 @@
           <span>
             <span class="text-white font-semibold" x-text="summaryVal('stories')"></span> stories
           </span>
-          <span class="text-indigo-400 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '% verified'"></span>
+          <span class="text-indigo-400 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '% phase'"></span>
+          <span class="text-slate-600">·</span>
+          <span class="text-slate-300 font-semibold" x-text="pct(summaryVal('verifiedPctCumulative')) + '% project'"></span>
         </div>
         <!-- Export / Import buttons -->
         <button
@@ -251,7 +253,9 @@
             <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Verified</div>
             <div class="text-3xl font-bold text-green-600"
               x-text="pct(globalWeightedPct('verifiedPct')) + '%'"></div>
-            <div class="text-xs text-slate-500 mt-1">weighted average</div>
+            <div class="text-xs text-slate-500 mt-1">phase · weighted avg</div>
+            <div class="text-sm font-semibold text-slate-400 mt-1"
+              x-text="pct(globalWeightedPct('verifiedPctCumulative')) + '% project'"></div>
             <div class="progress-mini mt-2">
               <div class="progress-mini-fill bg-green-500"
                 :style="'width:' + globalWeightedPct('verifiedPct') + '%'"></div>
@@ -302,8 +306,9 @@
                   <th scope="col" style="width:110px">Active Phase</th>
                   <th scope="col" class="text-center" style="width:90px">Reqs</th>
                   <th scope="col" class="text-center" style="width:90px">Stories</th>
-                  <th scope="col" style="width:170px">Verified %</th>
-                  <th scope="col" style="width:170px">Story Coverage</th>
+                  <th scope="col" style="width:140px">Phase %</th>
+                  <th scope="col" style="width:140px">Project %</th>
+                  <th scope="col" style="width:140px">Story Coverage</th>
                 </tr></thead>
                 <tbody>
                   <template x-for="proj in globalSummary" :key="proj.slug">
@@ -326,6 +331,16 @@
                           </div>
                           <span class="text-xs font-semibold text-slate-600 w-10 text-right"
                             x-text="pct(proj.verifiedPct) + '%'"></span>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="flex items-center gap-2">
+                          <div class="progress-track flex-1">
+                            <div class="progress-fill progress-fill--green"
+                              :style="'width:' + (proj.verifiedPctCumulative || 0) + '%'"></div>
+                          </div>
+                          <span class="text-xs font-semibold text-slate-400 w-10 text-right"
+                            x-text="pct(proj.verifiedPctCumulative) + '%'"></span>
                         </div>
                       </td>
                       <td>
@@ -423,7 +438,8 @@
             <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Requirements</div>
             <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('requirements')"></div>
             <div class="text-xs text-slate-500 mt-1">
-              <span class="text-green-600 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '%'"></span> verified
+              <span class="text-green-600 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '%'"></span> phase ·
+              <span class="text-slate-400 font-semibold" x-text="pct(summaryVal('verifiedPctCumulative')) + '%'"></span> project
             </div>
             <div class="progress-mini mt-2">
               <div class="progress-mini-fill bg-green-500" :style="'width:' + summaryVal('verifiedPct') + '%'"></div>
@@ -459,7 +475,9 @@
           <div class="kpi-card border-indigo-100 bg-gradient-to-br from-indigo-50 to-white">
             <div class="text-xs font-semibold text-indigo-500 uppercase tracking-wide mb-1">Verified</div>
             <div class="text-4xl font-bold text-indigo-600" x-text="pct(summaryVal('verifiedPct')) + '%'"></div>
-            <div class="text-xs text-slate-500 mt-1">of all requirements</div>
+            <div class="text-xs text-slate-500 mt-1">this phase</div>
+            <div class="text-sm font-semibold text-slate-400 mt-1"
+                 x-text="pct(summaryVal('verifiedPctCumulative')) + '% project'"></div>
             <div class="progress-mini mt-2">
               <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('verifiedPct') + '%'"></div>
             </div>
@@ -951,14 +969,22 @@
         <template x-if="coverage?.summary">
           <div class="section-card">
             <div class="section-card-header">Summary</div>
-            <div class="grid grid-cols-2 sm:grid-cols-4 divide-x divide-slate-100">
+            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 divide-x divide-slate-100">
               <div class="cov-stat">
                 <div class="value text-green-700" x-text="pct(coverage.summary.verifiedPct) + '%'"></div>
-                <div class="label">Verified</div>
+                <div class="label">Verified (phase)</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value text-green-500" x-text="pct(summaryVal('verifiedPctCumulative')) + '%'"></div>
+                <div class="label">Verified (project)</div>
               </div>
               <div class="cov-stat">
                 <div class="value text-indigo-700" x-text="pct(coverage.summary.storyCoveragePct) + '%'"></div>
-                <div class="label">Story Coverage</div>
+                <div class="label">Story Cov. (phase)</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value text-indigo-500" x-text="pct(summaryVal('storyCoveragePctCumulative')) + '%'"></div>
+                <div class="label">Story Cov. (project)</div>
               </div>
               <div class="cov-stat">
                 <div class="value text-slate-700"

@@ -296,6 +296,7 @@ document.addEventListener('alpine:init', function () {
                 if (!prev || d.vcsRefs !== prev.vcsRefs) self.loadVcsRefs();
                 var coverageChanged = !prev ||
                   d.verifiedPct !== prev.verifiedPct ||
+                  d.verifiedPctCumulative !== prev.verifiedPctCumulative ||
                   d.storyCoveragePct !== prev.storyCoveragePct ||
                   d.stories !== prev.stories ||
                   d.requirements !== prev.requirements;
