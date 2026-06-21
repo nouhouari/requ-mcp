@@ -613,6 +613,38 @@ tool(
 );
 
 tool(
+  "search_requirements",
+  {
+    title: "Search requirements",
+    description:
+      "Case-insensitive substring search across requirement title, description, source, and tags. " +
+      "Supports optional filters (status, component, phase) combined with the text query.",
+    inputSchema: {
+      query:     z.string().min(1).describe("Substring to search for (case-insensitive)."),
+      status:    RequirementStatus.optional(),
+      component: z.string().optional(),
+      phase:     z.string().optional().describe("Filter by assigned target phase (exact match)."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const q = args.query.toLowerCase();
+    let reqs = await store.listRequirements();
+    if (args.status)    reqs = reqs.filter((r) => r.status === args.status);
+    if (args.component) reqs = reqs.filter((r) => r.components.includes(args.component));
+    if (args.phase)     reqs = reqs.filter((r) => r.phase === args.phase);
+    const matches = reqs.filter(
+      (r) =>
+        r.title.toLowerCase().includes(q) ||
+        r.description.toLowerCase().includes(q) ||
+        r.source.toLowerCase().includes(q) ||
+        r.tags.some((t) => t.toLowerCase().includes(q)),
+    );
+    return json({ query: args.query, total: matches.length, requirements: matches });
+  },
+);
+
+tool(
   "get_requirement",
   {
     title: "Get requirement",
@@ -736,6 +768,37 @@ tool(
     if (args.requirement) stories = stories.filter((s) => s.requirements.includes(args.requirement));
     if (args.phase) stories = stories.filter((s) => s.phase === args.phase);
     return json(stories);
+  },
+);
+
+tool(
+  "search_user_stories",
+  {
+    title: "Search user stories",
+    description:
+      "Case-insensitive substring search across story title, description, and acceptance criteria text. " +
+      "Supports optional filters (status, requirement, phase) combined with the text query.",
+    inputSchema: {
+      query:       z.string().min(1).describe("Substring to search for (case-insensitive)."),
+      status:      StoryStatus.optional(),
+      requirement: z.string().regex(/^REQ-\d+$/).optional(),
+      phase:       z.string().optional().describe("Filter by assigned target phase (exact match)."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const q = args.query.toLowerCase();
+    let stories = await store.listStories();
+    if (args.status)      stories = stories.filter((s) => s.status === args.status);
+    if (args.requirement) stories = stories.filter((s) => s.requirements.includes(args.requirement));
+    if (args.phase)       stories = stories.filter((s) => s.phase === args.phase);
+    const matches = stories.filter(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        s.description.toLowerCase().includes(q) ||
+        s.acceptanceCriteria.some((ac) => ac.text.toLowerCase().includes(q)),
+    );
+    return json({ query: args.query, total: matches.length, stories: matches });
   },
 );
 
@@ -953,6 +1016,46 @@ tool(
       links,
       storiesWithoutScenario: links.filter((l) => l.scenarios.length === 0).map((l) => l.story),
       danglingTags: danglingStoryTags(index, knownIds),
+    });
+  },
+);
+
+tool(
+  "search_tests",
+  {
+    title: "Search test scenarios",
+    description:
+      "Case-insensitive substring search across Conductor feature file scenarios: " +
+      "feature name, scenario name, and tags. Optionally filter results to scenarios " +
+      "linked to a specific story (@US-xxx tag). Requires an initialized Conductor project with feature files.",
+    inputSchema: {
+      query:   z.string().min(1).describe("Substring to search for (case-insensitive)."),
+      storyId: z.string().regex(/^US-\d+$/).optional().describe("Restrict to scenarios tagged with this story id."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const q = args.query.toLowerCase();
+    const { root, index } = await loadConductorIndex(store);
+    let scenarios = index.scenarios;
+    if (args.storyId) scenarios = scenarios.filter((sc) => sc.stories.includes(args.storyId));
+    const matches = scenarios.filter(
+      (sc) =>
+        sc.feature.toLowerCase().includes(q) ||
+        sc.name.toLowerCase().includes(q) ||
+        sc.tags.some((t) => t.toLowerCase().includes(q)),
+    );
+    return json({
+      query: args.query,
+      conductorRoot: root,
+      total: matches.length,
+      scenarios: matches.map((sc) => ({
+        feature: sc.feature,
+        name: sc.name,
+        file: sc.file,
+        tags: sc.tags,
+        stories: sc.stories,
+      })),
     });
   },
 );
