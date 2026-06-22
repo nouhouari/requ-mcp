@@ -1534,6 +1534,29 @@
                               </div>
                               <div class="text-xs text-slate-400 self-end pb-1 hidden md:block font-mono truncate max-w-xs" x-text="sc.file"></div>
                             </div>
+                            <div class="mt-4">
+                              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Gherkin</div>
+                              <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'loading'">
+                                <p class="text-xs text-slate-400 italic">Loading…</p>
+                              </template>
+                              <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'ready'">
+                                <div class="space-y-1.5">
+                                  <template x-if="scenarioContent[scenarioKey(sc)].backgroundHtml">
+                                    <div>
+                                      <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Background</div>
+                                      <pre class="gherkin-block"><code class="hljs language-gherkin" x-html="scenarioContent[scenarioKey(sc)].backgroundHtml"></code></pre>
+                                    </div>
+                                  </template>
+                                  <pre class="gherkin-block"><code class="hljs language-gherkin" x-html="scenarioContent[scenarioKey(sc)].html"></code></pre>
+                                </div>
+                              </template>
+                              <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'none'">
+                                <p class="text-xs text-slate-400 italic">No gherkin content available (legacy scenario).</p>
+                              </template>
+                              <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'error'">
+                                <p class="text-xs text-red-400 italic">Failed to load scenario.</p>
+                              </template>
+                            </div>
                           </div>
                         </td>
                       </tr>

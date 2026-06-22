@@ -1105,11 +1105,13 @@ document.addEventListener('alpine:init', function () {
       },
 
       // Scenarios-tab row expansion (distinct from the Stories-tab gherkin viewer's
-      // toggleScenario, which tracks scenarioOpenId + lazy-loads content).
+      // toggleScenario, which tracks scenarioOpenId). Lazy-loads the gherkin content
+      // into the shared scenarioContent cache so the detail panel can render it.
       toggleScenarioRow(sc) {
         var k = this.scenarioKey(sc);
         this.scenariosExpanded = (this.scenariosExpanded === k) ? null : k;
         this.scenariosNote = '';
+        if (this.scenariosExpanded === k && !this.scenarioContent[k]) this.loadScenario(sc);
       },
 
       scenariosTotalPages() {
