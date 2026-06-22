@@ -52,6 +52,14 @@ document.addEventListener('alpine:init', function () {
       storyPhaseFilter: 'all',
       storyExpanded: null,
 
+      // ── Story detail modal ───────────────────────────────────────────────────
+      storyDetailOpen: false,
+      storyDetail: null,
+      storyDetailLoading: false,
+
+      // ── Allure report status (per active project) ────────────────────────────
+      allureStatus: { available: false, url: '/allure/' },
+
       // ── VCS filters ──────────────────────────────────────────────────────────
       vcsKindFilter: 'all',
       vcsStateFilter: 'all',
@@ -138,6 +146,7 @@ document.addEventListener('alpine:init', function () {
           this.loadCoverage(),
           this.loadTrend(),
           this.loadGaps(),
+          this.loadAllureStatus(),
         ];
         if (this.projects.length > 1) loaders.push(this.loadGlobalSummary());
         await Promise.all(loaders);
@@ -220,6 +229,7 @@ document.addEventListener('alpine:init', function () {
           self.loadCoverage(),
           self.loadTrend(),
           self.loadGaps(),
+          self.loadAllureStatus(),
         ]);
       },
 
@@ -263,6 +273,15 @@ document.addEventListener('alpine:init', function () {
         var d = await this._fetch(this.apiUrl('/api/components'));
         if (d) this.components = d;
         this.loading.components = false;
+      },
+
+      async loadAllureStatus() {
+        var d = await this._fetch(this.apiUrl('/api/allure-status'));
+        if (d && typeof d === 'object') {
+          this.allureStatus = { available: !!d.available, url: d.url || '/allure/' };
+        } else {
+          this.allureStatus = { available: false, url: '/allure/' };
+        }
       },
 
       async loadPhases() {
@@ -730,6 +749,57 @@ document.addEventListener('alpine:init', function () {
 
       toggleStory(id) {
         this.storyExpanded = (this.storyExpanded === id) ? null : id;
+      },
+
+      // =========================================================================
+      // Story detail modal
+      // =========================================================================
+
+      /**
+       * Open the detail modal for a story. Seeds it from the already-loaded list
+       * data (instant render), then fetches /api/story for the enriched payload
+       * (scenarios + pass/total) and merges it in.
+       */
+      openStoryDetail(story) {
+        if (!story) return;
+        var self = this;
+        // Merge coverage scenarios we already have so the modal is useful even
+        // before/without the /api/story round-trip.
+        var cov = this.storyCoverage(story);
+        this.storyDetail = Object.assign({}, story, {
+          scenarios: cov && cov.scenarios ? cov.scenarios : [],
+          scenariosTotal: cov ? (cov.scenarios || []).length : 0,
+          scenariosPassing: cov ? (cov.passing || 0) : 0,
+        });
+        this.storyDetailOpen = true;
+        this.storyDetailLoading = true;
+        this._fetch(this.apiUrl('/api/story?id=' + encodeURIComponent(story.id)))
+          .then(function (d) {
+            if (d && d.id === story.id) {
+              self.storyDetail = d;
+            }
+          })
+          .finally(function () { self.storyDetailLoading = false; });
+      },
+
+      closeStoryDetail() {
+        this.storyDetailOpen = false;
+        this.storyDetail = null;
+        this.storyDetailLoading = false;
+      },
+
+      /**
+       * Open the Allure report for a story in a new tab.
+       * Adds #?tag=@US-<id> as a hint so the report can be filtered by the
+       * story's scenario tag (Allure's behaviors/suites view honours tag search).
+       */
+      openAllure(story) {
+        if (!this.allureStatus || !this.allureStatus.available) return;
+        var base = this.allureStatus.url || '/allure/';
+        // Allure 2 supports a tag deep-link via the URL hash on the categories/
+        // behaviors tabs; if it isn't honoured the report still opens at its root.
+        var hash = story && story.id ? ('#categories/?q=' + encodeURIComponent('@' + story.id)) : '';
+        window.open(base + hash, '_blank', 'noopener');
       },
 
       sortReqBy(col) {

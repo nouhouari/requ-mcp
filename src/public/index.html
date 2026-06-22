@@ -883,6 +883,7 @@
                     <th style="width:55px;" class="text-center">ACs</th>
                     <th style="width:190px;">Requirements</th>
                     <th style="width:110px;">Coverage</th>
+                    <th style="width:150px;" class="text-right">Actions</th>
                   </tr>
                 </thead>
                 <template x-for="story in filteredStories()" :key="story.id">
@@ -919,11 +920,34 @@
                         <span class="badge" :class="coverageBadge(storyCoverage(story))"
                           x-text="coverageLabel(storyCoverage(story))"></span>
                       </td>
+                      <!-- Actions: Détail + Rapport Allure -->
+                      <td class="text-right whitespace-nowrap">
+                        <div class="flex items-center justify-end gap-1.5">
+                          <button
+                            @click.stop="openStoryDetail(story)"
+                            class="btn-secondary text-xs flex items-center gap-1"
+                            :aria-label="'Voir le détail de ' + story.id"
+                            title="Voir le détail complet de la story">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="8"/><line x1="11" y1="11" x2="11" y2="14"/></svg>
+                            Détail
+                          </button>
+                          <button
+                            @click.stop="openAllure(story)"
+                            class="btn-secondary text-xs flex items-center gap-1"
+                            :class="allureStatus.available ? '' : 'opacity-50 cursor-not-allowed'"
+                            :disabled="!allureStatus.available"
+                            :aria-label="'Ouvrir le rapport Allure pour ' + story.id"
+                            :title="allureStatus.available ? 'Ouvrir le rapport Allure (scénarios @' + story.id + ')' : 'Aucun rapport Allure disponible — générez-le dans le projet e2e'">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3"/></svg>
+                            Allure
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                     <!-- Expanded detail -->
                     <template x-if="storyExpanded === story.id">
                       <tr class="detail-row">
-                        <td colspan="7">
+                        <td colspan="8">
                           <div class="detail-content">
                             <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
                               <div>
@@ -1663,6 +1687,147 @@
           class="btn-secondary text-xs">
           Close
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       STORY DETAIL MODAL
+  ════════════════════════════════════════════════════════════ -->
+  <div
+    x-show="storyDetailOpen"
+    x-cloak
+    class="fixed inset-0 z-50 flex items-center justify-center p-4"
+    @keydown.escape.window="closeStoryDetail()"
+    x-effect="if (storyDetailOpen) $nextTick(() => $refs.storyDetailClose && $refs.storyDetailClose.focus())">
+    <!-- Backdrop -->
+    <div class="absolute inset-0 bg-black/50" @click="closeStoryDetail()"></div>
+    <!-- Panel -->
+    <div class="relative bg-white rounded-xl shadow-2xl w-full max-w-2xl z-10 max-h-[85vh] flex flex-col"
+      role="dialog" aria-modal="true" aria-labelledby="story-detail-title">
+
+      <!-- Header -->
+      <div class="flex items-start justify-between gap-3 px-6 py-4 border-b border-slate-200 shrink-0">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 mb-1">
+            <code class="chip chip-indigo" x-text="storyDetail?.id"></code>
+            <span class="badge" :class="storyStatusBadge(storyDetail?.status)"
+              x-text="storyDetail?.status ? storyDetail.status.replace('_',' ') : '—'"></span>
+            <template x-if="storyDetail?.phase">
+              <span class="chip chip-indigo" x-text="phaseName(storyDetail.phase)"></span>
+            </template>
+          </div>
+          <h2 id="story-detail-title" class="font-semibold text-slate-800 text-base leading-snug" x-text="storyDetail?.title"></h2>
+        </div>
+        <button x-ref="storyDetailClose" @click="closeStoryDetail()" class="p-2 text-slate-400 hover:text-slate-600 transition-colors shrink-0" aria-label="Fermer">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Body (scrollable) -->
+      <div class="px-6 py-5 overflow-y-auto space-y-5">
+
+        <!-- Loading -->
+        <template x-if="storyDetailLoading">
+          <div class="flex items-center justify-center py-8"><div class="spinner"></div></div>
+        </template>
+
+        <template x-if="!storyDetailLoading && storyDetail">
+          <div class="space-y-5">
+
+            <!-- Description -->
+            <div>
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Description</div>
+              <p class="text-sm text-slate-700 leading-relaxed" x-text="storyDetail.description || 'Aucune description.'"></p>
+            </div>
+
+            <!-- Scenario stats -->
+            <div class="grid grid-cols-3 gap-3">
+              <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-center">
+                <div class="text-lg font-bold text-green-600" x-text="storyDetail.scenariosPassing ?? 0"></div>
+                <div class="text-xs text-slate-500">passants</div>
+              </div>
+              <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-center">
+                <div class="text-lg font-bold text-slate-700" x-text="storyDetail.scenariosTotal ?? 0"></div>
+                <div class="text-xs text-slate-500">scénarios</div>
+              </div>
+              <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-center">
+                <div class="text-lg font-bold text-indigo-600" x-text="(storyDetail.acceptanceCriteria || []).length"></div>
+                <div class="text-xs text-slate-500">critères</div>
+              </div>
+            </div>
+
+            <!-- Acceptance criteria -->
+            <div>
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+                Critères d'acceptation (<span x-text="(storyDetail.acceptanceCriteria || []).length"></span>)
+              </div>
+              <template x-if="(storyDetail.acceptanceCriteria || []).length === 0">
+                <p class="text-sm text-slate-400 italic">Aucun critère défini.</p>
+              </template>
+              <ul class="space-y-1.5">
+                <template x-for="ac in (storyDetail.acceptanceCriteria || [])" :key="ac.id || ac.text">
+                  <li class="flex gap-2 text-sm text-slate-700">
+                    <span class="text-green-500 shrink-0 mt-0.5">✓</span>
+                    <span x-text="ac.text"></span>
+                  </li>
+                </template>
+              </ul>
+            </div>
+
+            <!-- Linked requirements -->
+            <div>
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+                Requirements liés (<span x-text="(storyDetail.requirements || []).length"></span>)
+              </div>
+              <template x-if="(storyDetail.requirements || []).length === 0">
+                <p class="text-sm text-slate-400 italic">Aucun requirement lié.</p>
+              </template>
+              <div class="flex flex-wrap gap-2">
+                <template x-for="rid in (storyDetail.requirements || [])" :key="rid">
+                  <button class="chip chip-indigo hover:bg-indigo-100 transition-colors"
+                    @click="closeStoryDetail(); navTo('requirements'); reqSearch = rid"
+                    x-text="rid"></button>
+                </template>
+              </div>
+            </div>
+
+            <!-- Scenarios -->
+            <div>
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+                Scénarios de test (<span x-text="(storyDetail.scenarios || []).length"></span>)
+              </div>
+              <template x-if="(storyDetail.scenarios || []).length === 0">
+                <p class="text-sm text-slate-400 italic">Aucun scénario lié (tag @<span x-text="storyDetail.id"></span>).</p>
+              </template>
+              <ul class="space-y-1.5">
+                <template x-for="sc in (storyDetail.scenarios || [])" :key="sc.feature + '::' + sc.name">
+                  <li class="text-xs text-slate-700 flex items-start gap-2">
+                    <span :class="sc.status==='pass'?'text-green-600':sc.status==='fail'?'text-red-500':'text-amber-500'"
+                      x-text="sc.status==='pass'?'✓':sc.status==='fail'?'✗':'○'"></span>
+                    <span><span class="text-slate-400" x-text="sc.feature + ' › '"></span><span x-text="sc.name"></span></span>
+                  </li>
+                </template>
+              </ul>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Footer -->
+      <div class="px-6 py-4 border-t border-slate-200 flex items-center justify-between gap-3 shrink-0">
+        <button
+          @click="openAllure(storyDetail)"
+          class="btn-secondary text-xs flex items-center gap-1.5"
+          :class="allureStatus.available ? '' : 'opacity-50 cursor-not-allowed'"
+          :disabled="!allureStatus.available"
+          :title="allureStatus.available ? 'Ouvrir le rapport Allure' : 'Aucun rapport Allure disponible'">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3"/></svg>
+          Rapport Allure
+        </button>
+        <button @click="closeStoryDetail()" class="btn-primary text-xs">Fermer</button>
       </div>
     </div>
   </div>
