@@ -1057,11 +1057,12 @@ document.addEventListener('alpine:init', function () {
 
       async loadScenarios() {
         this.scenariosLoading = true;
+        // Backend contract (OpenAPI): q, tags, limit, offset → { total, scenarios[] }.
         var params = new URLSearchParams({
-          page: String(this.scenariosPage),
-          pageSize: String(this.scenariosPageSize),
-          q: this.scenariosSearch,
-          tag: this.scenariosTag,
+          limit:  String(this.scenariosPageSize),
+          offset: String((this.scenariosPage - 1) * this.scenariosPageSize),
+          q:      this.scenariosSearch,
+          tags:   this.scenariosTag,
         });
         if (this.projects.length > 1 && this.activeProject) {
           params.set('project', this.activeProject.slug);
@@ -1103,11 +1104,9 @@ document.addEventListener('alpine:init', function () {
         return 'badge-slate';
       },
 
-      scenarioKey(sc) {
-        return (sc.feature || '') + '::' + (sc.name || '');
-      },
-
-      toggleScenario(sc) {
+      // Scenarios-tab row expansion (distinct from the Stories-tab gherkin viewer's
+      // toggleScenario, which tracks scenarioOpenId + lazy-loads content).
+      toggleScenarioRow(sc) {
         var k = this.scenarioKey(sc);
         this.scenariosExpanded = (this.scenariosExpanded === k) ? null : k;
         this.scenariosNote = '';

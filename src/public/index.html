@@ -1480,9 +1480,9 @@
                     <th style="width:90px;">Status</th>
                   </tr>
                 </thead>
-                <tbody>
-                  <template x-for="sc in scenarios" :key="scenarioKey(sc)">
-                    <tr @click="toggleScenario(sc)" :class="scenariosExpanded === scenarioKey(sc) ? 'expanded' : ''" class="cursor-pointer">
+                <template x-for="sc in scenarios" :key="scenarioKey(sc)">
+                  <tbody>
+                    <tr @click="toggleScenarioRow(sc)" :class="scenariosExpanded === scenarioKey(sc) ? 'expanded' : ''" class="cursor-pointer">
                       <td class="text-sm text-slate-600 truncate max-w-xs" x-text="sc.feature"></td>
                       <td class="font-medium text-slate-800" x-text="sc.name"></td>
                       <td>
@@ -1498,11 +1498,11 @@
                       </td>
                       <td>
                         <div class="flex flex-wrap gap-1">
-                          <template x-for="sid in sc.stories" :key="sid">
+                          <template x-for="sid in (sc.storyIds || [])" :key="sid">
                             <span class="chip chip-indigo text-xs cursor-pointer"
                               @click.stop="navTo('stories'); storySearch = sid" x-text="sid"></span>
                           </template>
-                          <span x-show="sc.stories.length === 0" class="text-slate-400 text-xs">—</span>
+                          <span x-show="(sc.storyIds || []).length === 0" class="text-slate-400 text-xs">—</span>
                         </div>
                       </td>
                       <td>
@@ -1538,8 +1538,8 @@
                         </td>
                       </tr>
                     </template>
-                  </template>
-                </tbody>
+                  </tbody>
+                </template>
               </table>
             </div>
           </template>

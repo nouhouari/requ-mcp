@@ -278,6 +278,7 @@ function scenarioSummary(
     id: sc.testKey,
     feature: sc.feature,
     name: sc.name,
+    file: sc.file,
     tags: sc.tags,
     storyIds: sc.stories,
     requirementIds: requirementIdsForScenario(sc, storyById),
