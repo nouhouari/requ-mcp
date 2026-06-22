@@ -135,6 +135,7 @@
         {id:'coverage',     label:'Coverage'},
         {id:'components',   label:'Components'},
         {id:'vcs',          label:'VCS'},
+        {id:'scenarios',    label:'Scenarios'},
       ]" :key="t.id">
         <button
           :id="'tab-' + t.id"
@@ -1350,6 +1351,130 @@
             </div>
           </template>
         </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: SCENARIOS
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-scenarios" role="tabpanel" aria-labelledby="tab-scenarios" tabindex="0" x-show="tab === 'scenarios'" class="tab-panel space-y-4">
+
+        <!-- Filters -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+          <div class="relative">
+            <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input type="text" class="search-input" placeholder="Search feature or scenario…" x-model="scenariosSearch" aria-label="Search scenarios">
+          </div>
+          <div class="relative">
+            <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+            <input type="text" class="search-input" placeholder="Filter by tag (e.g. manual)…" x-model="scenariosTag" aria-label="Filter by tag">
+          </div>
+          <div class="ml-auto text-sm text-slate-500">
+            <span class="font-semibold text-slate-700" x-text="scenariosTotal"></span> scenario<span x-show="scenariosTotal !== 1">s</span>
+          </div>
+        </div>
+
+        <!-- Table -->
+        <div class="section-card">
+          <template x-if="scenariosLoading">
+            <div class="p-6 space-y-3">
+              <template x-for="i in [1,2,3,4,5]" :key="i"><div class="skeleton skeleton-md"></div></template>
+            </div>
+          </template>
+
+          <template x-if="!scenariosLoading && scenarios.length === 0">
+            <div class="empty-state">
+              <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>
+              <h3>No scenarios found</h3>
+              <p>No Cucumber feature files detected, or no scenarios match the current filter.</p>
+            </div>
+          </template>
+
+          <template x-if="!scenariosLoading && scenarios.length > 0">
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width:160px;">Feature</th>
+                    <th>Scenario</th>
+                    <th style="width:180px;">Tags</th>
+                    <th style="width:120px;">Stories</th>
+                    <th style="width:90px;">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="sc in scenarios" :key="scenarioKey(sc)">
+                    <tr @click="toggleScenario(sc)" :class="scenariosExpanded === scenarioKey(sc) ? 'expanded' : ''" class="cursor-pointer">
+                      <td class="text-sm text-slate-600 truncate max-w-xs" x-text="sc.feature"></td>
+                      <td class="font-medium text-slate-800" x-text="sc.name"></td>
+                      <td>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="tag in sc.tags.filter(function(t){return t.indexOf('@US-') !== 0}).slice(0,3)" :key="tag">
+                            <span class="chip chip-indigo text-xs" x-text="tag"></span>
+                          </template>
+                          <template x-if="sc.tags.filter(function(t){return t.indexOf('@US-') !== 0}).length > 3">
+                            <span class="chip text-slate-400 text-xs">+<span x-text="sc.tags.filter(function(t){return t.indexOf('@US-') !== 0}).length - 3"></span></span>
+                          </template>
+                          <span x-show="sc.tags.filter(function(t){return t.indexOf('@US-') !== 0}).length === 0" class="text-slate-400 text-xs">—</span>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="sid in sc.stories" :key="sid">
+                            <span class="chip chip-indigo text-xs cursor-pointer"
+                              @click.stop="navTo('stories'); storySearch = sid" x-text="sid"></span>
+                          </template>
+                          <span x-show="sc.stories.length === 0" class="text-slate-400 text-xs">—</span>
+                        </div>
+                      </td>
+                      <td>
+                        <span class="badge" :class="scenarioStatusBadge(sc.status)"
+                          x-text="sc.status || '—'"></span>
+                      </td>
+                    </tr>
+                    <!-- Expanded: record manual execution -->
+                    <template x-if="scenariosExpanded === scenarioKey(sc)">
+                      <tr class="detail-row">
+                        <td colspan="5">
+                          <div class="detail-content">
+                            <div class="flex flex-wrap items-start gap-6">
+                              <div>
+                                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Record manual result</div>
+                                <div class="flex gap-2">
+                                  <button class="exec-btn exec-btn-pass" :disabled="scenariosExecuting"
+                                    @click.stop="executeScenario(sc.feature, sc.name, 'pass')">✓ Pass</button>
+                                  <button class="exec-btn exec-btn-fail" :disabled="scenariosExecuting"
+                                    @click.stop="executeScenario(sc.feature, sc.name, 'fail')">✗ Fail</button>
+                                  <button class="exec-btn exec-btn-pending" :disabled="scenariosExecuting"
+                                    @click.stop="executeScenario(sc.feature, sc.name, 'pending')">· Pending</button>
+                                </div>
+                              </div>
+                              <div class="flex-1 min-w-48">
+                                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Note (optional)</div>
+                                <input type="text" class="search-input w-full" placeholder="Add a note…"
+                                  x-model="scenariosNote" @click.stop>
+                              </div>
+                              <div class="text-xs text-slate-400 self-end pb-1 hidden md:block font-mono truncate max-w-xs" x-text="sc.file"></div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+
+        <!-- Pagination -->
+        <div x-show="scenariosTotalPages() > 1" class="flex items-center justify-between bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm text-slate-600">
+          <button class="btn-secondary text-xs" :disabled="scenariosPage === 1"
+            @click="scenariosPage--; loadScenarios()">← Prev</button>
+          <span>Page <span class="font-semibold text-slate-800" x-text="scenariosPage"></span> of <span x-text="scenariosTotalPages()"></span></span>
+          <button class="btn-secondary text-xs" :disabled="scenariosPage >= scenariosTotalPages()"
+            @click="scenariosPage++; loadScenarios()">Next →</button>
+        </div>
+
       </div>
 
       </div><!-- /tab panels -->
