@@ -51,6 +51,18 @@ document.addEventListener('alpine:init', function () {
       vcsKindFilter: 'all',
       vcsStateFilter: 'all',
 
+      // ── Scenarios ────────────────────────────────────────────────────────────
+      scenarios: [],
+      scenariosTotal: 0,
+      scenariosPage: 1,
+      scenariosPageSize: 25,
+      scenariosSearch: '',
+      scenariosTag: '',
+      scenariosLoading: false,
+      scenariosExpanded: null,
+      scenariosNote: '',
+      scenariosExecuting: false,
+
       // ── Coverage controls ────────────────────────────────────────────────────
       coveragePhase: null,
       coverageMode: 'cumulative',
@@ -116,6 +128,9 @@ document.addEventListener('alpine:init', function () {
         ];
         if (this.projects.length > 1) loaders.push(this.loadGlobalSummary());
         await Promise.all(loaders);
+
+        this.$watch('scenariosSearch', function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
+        this.$watch('scenariosTag',    function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
       },
 
       // =========================================================================
@@ -315,7 +330,8 @@ document.addEventListener('alpine:init', function () {
 
       navTo(id) {
         this.tab = id;
-        if (id === 'global') { this.loadGlobalSummary(); }
+        if (id === 'global')     { this.loadGlobalSummary(); }
+        if (id === 'scenarios')  { this.loadScenarios(); }
       },
 
       /**
@@ -324,8 +340,8 @@ document.addEventListener('alpine:init', function () {
        */
       shiftFocus(dir) {
         var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'stories', 'coverage', 'components', 'vcs']
-          : ['overview', 'requirements', 'stories', 'coverage', 'components', 'vcs'];
+          ? ['global', 'overview', 'requirements', 'stories', 'coverage', 'components', 'vcs', 'scenarios']
+          : ['overview', 'requirements', 'stories', 'coverage', 'components', 'vcs', 'scenarios'];
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }
@@ -908,6 +924,72 @@ document.addEventListener('alpine:init', function () {
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;')
           .replace(/\n/g, '<br>');
+      },
+
+      // =========================================================================
+      // Scenarios tab
+      // =========================================================================
+
+      async loadScenarios() {
+        this.scenariosLoading = true;
+        var params = new URLSearchParams({
+          page: String(this.scenariosPage),
+          pageSize: String(this.scenariosPageSize),
+          q: this.scenariosSearch,
+          tag: this.scenariosTag,
+        });
+        if (this.projects.length > 1 && this.activeProject) {
+          params.set('project', this.activeProject.slug);
+        }
+        var d = await this._fetch('/api/scenarios?' + params.toString());
+        if (d) {
+          this.scenarios = d.scenarios || [];
+          this.scenariosTotal = d.total || 0;
+        }
+        this.scenariosLoading = false;
+      },
+
+      async executeScenario(feature, name, status) {
+        this.scenariosExecuting = true;
+        var self = this;
+        try {
+          var body = { feature: feature, name: name, status: status, note: this.scenariosNote };
+          if (this.projects.length > 1 && this.activeProject) {
+            body.project = this.activeProject.slug;
+          }
+          await window.fetch('/api/scenarios/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+        } finally {
+          self.scenariosNote = '';
+          self.scenariosExpanded = null;
+          self.scenariosExecuting = false;
+          await self.loadScenarios();
+          await self.loadSummary();
+        }
+      },
+
+      scenarioStatusBadge(status) {
+        if (status === 'pass')    return 'badge-green';
+        if (status === 'fail')    return 'badge-red';
+        if (status === 'pending') return 'badge-amber';
+        return 'badge-slate';
+      },
+
+      scenarioKey(sc) {
+        return (sc.feature || '') + '::' + (sc.name || '');
+      },
+
+      toggleScenario(sc) {
+        var k = this.scenarioKey(sc);
+        this.scenariosExpanded = (this.scenariosExpanded === k) ? null : k;
+        this.scenariosNote = '';
+      },
+
+      scenariosTotalPages() {
+        return Math.max(1, Math.ceil(this.scenariosTotal / this.scenariosPageSize));
       },
 
     }; // end return

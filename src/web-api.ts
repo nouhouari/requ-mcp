@@ -13,10 +13,10 @@ import type { SqliteStore } from "./sqlite-store.js";
 import type { PostgresStore } from "./postgres-store.js";
 
 type AnyHttpStore = SqliteStore | PostgresStore;
-import { indexConductor, scenariosByStory } from "./conductor.js";
+import { indexConductor, scenariosByStory, validateTestRef } from "./conductor.js";
 import { buildReport, buildTrend, findGaps, resolveStatuses } from "./coverage.js";
 import type { CoverageMode } from "./schema.js";
-import { ExportPayload } from "./schema.js";
+import { ExportPayload, testKey } from "./schema.js";
 import { buildExport, applyImport } from "./export-import.js";
 
 // ---------------------------------------------------------------------------
@@ -784,6 +784,117 @@ export async function handleWebRequest(
         const msg = (err as Error).message;
         if (msg === "Payload too large") { jsonError(res, 413, msg); }
         else { jsonError(res, 500, msg); }
+      }
+      return true;
+    }
+
+    // --- GET /api/scenarios ---
+    if (matchRoute(pathname, method, "/api/scenarios", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        if (!await r.store.isInitialized()) return notInitialized(res);
+        const page     = Math.max(1, parseInt(searchParams.get("page")     ?? "1",  10) || 1);
+        const pageSize = Math.min(200, Math.max(1, parseInt(searchParams.get("pageSize") ?? "25", 10) || 25));
+        const q   = (searchParams.get("q")   ?? "").toLowerCase().trim();
+        const tag = (searchParams.get("tag") ?? "").toLowerCase().trim();
+
+        let allScenarios: import("./conductor.js").ConductorScenario[] = [];
+        try {
+          const conductorRoot = await r.store.conductorRoot();
+          const index = await indexConductor(conductorRoot);
+          allScenarios = index.scenarios;
+        } catch { /* Conductor not available — return empty list */ }
+
+        const [phases, execByPhase] = await Promise.all([
+          r.store.listPhases(),
+          r.store.readAllExecutions(),
+        ]);
+        const activePhase = await r.store.resolvePhaseId();
+        const statusMap = resolveStatuses(execByPhase, phases, activePhase, "cumulative");
+
+        let filtered = allScenarios;
+        if (q)   filtered = filtered.filter((sc) => sc.feature.toLowerCase().includes(q) || sc.name.toLowerCase().includes(q));
+        if (tag) filtered = filtered.filter((sc) => sc.tags.some((t) => t.toLowerCase().includes(tag)));
+
+        const total = filtered.length;
+        const slice = filtered.slice((page - 1) * pageSize, page * pageSize);
+
+        jsonOk(res, {
+          total,
+          page,
+          pageSize,
+          scenarios: slice.map((sc) => ({
+            feature: sc.feature,
+            name:    sc.name,
+            file:    sc.file,
+            tags:    sc.tags,
+            stories: sc.stories,
+            status:  statusMap.get(testKey(sc)) ?? null,
+          })),
+        });
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- POST /api/scenarios/execute ---
+    if (matchRoute(pathname, method, "/api/scenarios/execute", "POST") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        if (!await r.store.isInitialized()) return notInitialized(res);
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(await collectBody(req));
+        } catch {
+          jsonError(res, 400, "Request body is not valid JSON");
+          return true;
+        }
+        const feature = typeof body.feature === "string" ? body.feature.trim() : "";
+        const name    = typeof body.name    === "string" ? body.name.trim()    : "";
+        const status  = typeof body.status  === "string" ? body.status.trim()  : "";
+        if (!feature || !name) {
+          jsonError(res, 400, "feature and name are required");
+          return true;
+        }
+        if (status !== "pass" && status !== "fail" && status !== "pending") {
+          jsonError(res, 400, `status must be "pass", "fail", or "pending"`);
+          return true;
+        }
+        const phaseId = await r.store.resolvePhaseId(
+          typeof body.phase === "string" && body.phase ? body.phase : undefined,
+        );
+        if (!phaseId) {
+          jsonError(res, 400, "No active phase — create a phase first");
+          return true;
+        }
+        let conductorRoot: string;
+        try {
+          conductorRoot = await r.store.conductorRoot();
+        } catch {
+          jsonError(res, 400, "Conductor project not configured");
+          return true;
+        }
+        const index = await indexConductor(conductorRoot);
+        const check = validateTestRef({ feature, name }, index);
+        if (!check.ok) {
+          jsonError(res, 400, check.reason ?? "Scenario not found in conductor project");
+          return true;
+        }
+        const exec = {
+          feature,
+          name,
+          status: status as "pass" | "fail" | "pending",
+          ranAt:  new Date().toISOString(),
+          source: "manual" as const,
+          note:   typeof body.note === "string" && body.note ? body.note : undefined,
+        };
+        await r.store.appendExecutions(phaseId, [exec]);
+        jsonOk(res, { phase: phaseId, recorded: exec });
+      } catch (err) {
+        jsonError(res, 500, String(err));
       }
       return true;
     }
