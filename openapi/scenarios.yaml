@@ -1,0 +1,364 @@
+openapi: 3.1.0
+info:
+  title: requ scenario API
+  version: 0.7.1
+  description: Fetch and filter cucumber scenarios owned by requ.
+servers:
+  - url: /
+components:
+  schemas:
+    Scenario:
+      type: object
+      properties:
+        feature:
+          type: string
+          minLength: 1
+        name:
+          type: string
+          minLength: 1
+        testKey:
+          type: string
+          minLength: 1
+        content:
+          type: string
+          default: ""
+        background:
+          type: string
+          default: ""
+        tags:
+          type: array
+          items:
+            type: string
+          default: []
+        stories:
+          type: array
+          items:
+            type: string
+            pattern: ^US-\d+$
+          default: []
+        source:
+          type: string
+          enum:
+            - manual
+            - import-feature
+            - import
+          default: manual
+        file:
+          type: string
+        valid:
+          type: boolean
+          default: true
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+      required:
+        - feature
+        - name
+        - testKey
+        - createdAt
+        - updatedAt
+    ScenarioSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        feature:
+          type: string
+        name:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        storyIds:
+          type: array
+          items:
+            type: string
+        requirementIds:
+          type: array
+          items:
+            type: string
+        valid:
+          type: boolean
+        hasContent:
+          type: boolean
+        hasBackground:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - pass
+            - fail
+            - pending
+        content:
+          type: string
+        background:
+          type: string
+      required:
+        - id
+        - feature
+        - name
+        - tags
+        - storyIds
+        - requirementIds
+        - valid
+        - hasContent
+        - hasBackground
+    ScenarioListResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        scenarios:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScenarioSummary"
+      required:
+        - total
+        - scenarios
+    GherkinValidation:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              message:
+                type: string
+              line:
+                type: integer
+              column:
+                type: integer
+            required:
+              - message
+      required:
+        - ok
+        - errors
+    TagCount:
+      type: object
+      properties:
+        tag:
+          type: string
+        count:
+          type: integer
+      required:
+        - tag
+        - count
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+  parameters: {}
+paths:
+  /api/scenarios:
+    get:
+      summary: List/filter scenarios
+      description: Query scenarios by story, requirement, phase, and tags (cucumber
+        tag expressions). Filters combine with AND.
+      parameters:
+        - schema:
+            type: string
+            description: Project slug (required when >1 project loaded).
+          required: false
+          name: project
+          in: query
+        - schema:
+            type: string
+            description: Project key (alternative to slug).
+          required: false
+          name: key
+          in: query
+        - schema:
+            type: string
+            description: Story id or comma-separated ids (match any).
+            example: US-007
+          required: false
+          name: story
+          in: query
+        - schema:
+            type: string
+            description: Requirement id or comma-separated ids; resolved via its stories.
+            example: REQ-001
+          required: false
+          name: requirement
+          in: query
+        - schema:
+            type: string
+            description: Phase id; restricts to in-scope scenarios and annotates per-phase
+              status.
+            example: P1
+          required: false
+          name: phase
+          in: query
+        - schema:
+            type: string
+            enum:
+              - cumulative
+              - strict
+            description: Phase resolution mode (default cumulative).
+          required: false
+          name: mode
+          in: query
+        - schema:
+            type: string
+            description: Cucumber tag expression.
+            example: "@smoke and not @wip"
+          required: false
+          name: tags
+          in: query
+        - schema:
+            type: string
+            description: Exact feature name.
+          required: false
+          name: feature
+          in: query
+        - schema:
+            type: string
+            description: Case-insensitive substring over name/feature/content.
+          required: false
+          name: q
+          in: query
+        - schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
+            description: Filter by gherkin validity.
+          required: false
+          name: valid
+          in: query
+        - schema:
+            type: string
+            enum:
+              - "true"
+              - "false"
+            description: Include full gherkin content inline.
+          required: false
+          name: content
+          in: query
+        - schema:
+            type:
+              - integer
+              - "null"
+          required: false
+          name: limit
+          in: query
+        - schema:
+            type:
+              - integer
+              - "null"
+          required: false
+          name: offset
+          in: query
+      responses:
+        "200":
+          description: Matching scenarios
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScenarioListResponse"
+        "400":
+          description: Invalid query (e.g. malformed tag expression)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /api/scenarios/{id}:
+    get:
+      summary: Get one scenario by testKey
+      parameters:
+        - schema:
+            type: string
+            description: testKey (feature::name), URL-encoded.
+          required: true
+          name: id
+          in: path
+        - schema:
+            type: string
+            description: Project slug (required when >1 project loaded).
+          required: false
+          name: project
+          in: query
+        - schema:
+            type: string
+            description: Project key (alternative to slug).
+          required: false
+          name: key
+          in: query
+      responses:
+        "200":
+          description: The scenario
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Scenario"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /api/stories/{id}/scenarios:
+    get:
+      summary: List a story's scenarios (with content)
+      parameters:
+        - schema:
+            type: string
+            example: US-007
+          required: true
+          name: id
+          in: path
+        - schema:
+            type: string
+            description: Project slug (required when >1 project loaded).
+          required: false
+          name: project
+          in: query
+        - schema:
+            type: string
+            description: Project key (alternative to slug).
+          required: false
+          name: key
+          in: query
+      responses:
+        "200":
+          description: Scenarios linked to the story
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ScenarioSummary"
+  /api/tags:
+    get:
+      summary: Distinct tags with counts
+      parameters:
+        - schema:
+            type: string
+            description: Project slug (required when >1 project loaded).
+          required: false
+          name: project
+          in: query
+        - schema:
+            type: string
+            description: Project key (alternative to slug).
+          required: false
+          name: key
+          in: query
+      responses:
+        "200":
+          description: Tags across stored scenarios
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TagCount"
+webhooks: {}

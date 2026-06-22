@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import YAML from "yaml";
 import {
@@ -8,6 +9,7 @@ import {
   ExecutionLog,
   Phase,
   Requirement,
+  Scenario,
   UserStory,
   VcsRef,
   type Component as TComponent,
@@ -15,6 +17,7 @@ import {
   type Execution as TExecution,
   type Phase as TPhase,
   type Requirement as TRequirement,
+  type Scenario as TScenario,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
@@ -44,6 +47,7 @@ export class Store {
   private get phaseDir()     { return path.join(this.baseDir, "phases"); }
   private get execDir()      { return path.join(this.baseDir, "executions"); }
   private get vcsDir()       { return path.join(this.baseDir, "vcs"); }
+  private get scenarioDir()  { return path.join(this.baseDir, "scenarios"); }
   private get configPath()   { return path.join(this.baseDir, "config.yaml"); }
 
   async isInitialized(): Promise<boolean> {
@@ -57,6 +61,7 @@ export class Store {
     await fs.mkdir(this.phaseDir,     { recursive: true });
     await fs.mkdir(this.execDir,      { recursive: true });
     await fs.mkdir(this.vcsDir,       { recursive: true });
+    await fs.mkdir(this.scenarioDir,  { recursive: true });
     await this.writeConfig(config);
   }
 
@@ -206,6 +211,39 @@ export class Store {
     const merged = VcsRef.parse({ ...existing, ...patch, id: existing.id });
     await this.writeVcsRef(merged);
     return merged;
+  }
+
+  // --- scenarios ---
+
+  /** testKey contains `::` and `/`; derive a filesystem-safe, collision-resistant
+   *  filename. The canonical testKey is stored inside the file, not the name. */
+  private scenarioPath(testKey: string): string {
+    const safe = testKey.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
+    const hash = createHash("sha1").update(testKey).digest("hex").slice(0, 8);
+    const p = path.join(this.scenarioDir, `${safe}-${hash}.yaml`);
+    if (path.relative(this.scenarioDir, p).startsWith("..")) throw new Error("invalid scenario key");
+    return p;
+  }
+
+  async listScenarios(): Promise<TScenario[]> {
+    return this.readAll(this.scenarioDir, Scenario);
+  }
+  async getScenario(testKey: string): Promise<TScenario | null> {
+    return this.readOne(this.scenarioPath(testKey), Scenario);
+  }
+  async writeScenario(sc: TScenario): Promise<void> {
+    await fs.mkdir(this.scenarioDir, { recursive: true });
+    const v = Scenario.parse(sc);
+    await fs.writeFile(this.scenarioPath(v.testKey), YAML.stringify(v), "utf8");
+  }
+  async deleteScenario(testKey: string): Promise<boolean> {
+    try {
+      await fs.unlink(this.scenarioPath(testKey));
+      return true;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+      throw err;
+    }
   }
 
   // --- helpers ---

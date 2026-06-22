@@ -6,6 +6,7 @@ import {
   Execution,
   Phase,
   Requirement,
+  Scenario,
   UserStory,
   VcsRef,
   type Component as TComponent,
@@ -13,6 +14,7 @@ import {
   type Execution as TExecution,
   type Phase as TPhase,
   type Requirement as TRequirement,
+  type Scenario as TScenario,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
@@ -71,6 +73,12 @@ const SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_exec_project_phase ON executions(project_id, phase_id, ran_at);
   CREATE TABLE IF NOT EXISTS vcs_refs (
+    project_id TEXT  NOT NULL,
+    id         TEXT  NOT NULL,
+    data       JSONB NOT NULL,
+    PRIMARY KEY (project_id, id)
+  );
+  CREATE TABLE IF NOT EXISTS scenarios (
     project_id TEXT  NOT NULL,
     id         TEXT  NOT NULL,
     data       JSONB NOT NULL,
@@ -385,6 +393,53 @@ export class PostgresStore {
     const merged = VcsRef.parse({ ...existing, ...patch, id: existing.id });
     await this.writeVcsRef(merged);
     return merged;
+  }
+
+  // --- scenarios ---
+
+  async listScenarios(): Promise<TScenario[]> {
+    const pool = await this.pool();
+    const { rows } = await pool.query(
+      "SELECT data FROM scenarios WHERE project_id = $1 ORDER BY id",
+      [this.projectId],
+    );
+    return rows.map((r) => Scenario.parse(r.data));
+  }
+
+  async getScenario(testKey: string): Promise<TScenario | null> {
+    const pool = await this.pool();
+    const { rows } = await pool.query(
+      "SELECT data FROM scenarios WHERE project_id = $1 AND id = $2",
+      [this.projectId, testKey],
+    );
+    return rows.length ? Scenario.parse(rows[0].data) : null;
+  }
+
+  async writeScenario(sc: TScenario): Promise<void> {
+    const pool = await this.pool();
+    const v = Scenario.parse(sc);
+    await pool.query(
+      `INSERT INTO scenarios(project_id, id, data) VALUES($1, $2, $3)
+       ON CONFLICT (project_id, id) DO UPDATE SET data = EXCLUDED.data`,
+      [this.projectId, v.testKey, v],
+    );
+  }
+
+  async deleteScenario(testKey: string): Promise<boolean> {
+    const pool = await this.pool();
+    const res = await pool.query(
+      "DELETE FROM scenarios WHERE project_id = $1 AND id = $2",
+      [this.projectId, testKey],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  /** Discover all project_ids that have a config row (DB-native project list). */
+  static async listProjectIds(): Promise<string[]> {
+    if (!_pool) throw new Error("PostgreSQL not configured. Set REQU_PG_URL.");
+    await _schemaReady;
+    const { rows } = await _pool.query("SELECT DISTINCT project_id FROM config ORDER BY project_id");
+    return rows.map((r) => r.project_id as string);
   }
 
   static nextId = Store.nextId;

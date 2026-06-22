@@ -103,16 +103,40 @@ Or in your MCP client config:
 
 | Tab | Content |
 |-----|---------|
-| **Overview** | KPI cards (requirements, stories, scenario pass rate, verified %) + coverage trend chart + component breakdown + gaps summary + phases strip |
+| **Overview** | KPI cards with project totals (requirements, stories, scenarios, verified %), a **counts-by-phase** table (requirements / stories / scenarios per phase, partitioned by earliest phase, with an Unassigned row and a Total), coverage trend chart, component breakdown, gaps summary, and phases strip |
 | **Requirements** | Sortable/filterable table of all requirements with inline expansion showing linked story IDs and tags |
 | **Stories** | User stories with status, acceptance criteria count, and coverage badge; expand to see acceptance criteria and linked scenarios with pass/fail/pending icons |
 | **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs) linked to stories and requirements, with state badges and external links |
 
-**Live updates:** The dashboard polls for KPI count changes every 5 seconds via Server-Sent Events (SSE) — no page refresh needed.
+**Live updates:** The dashboard polls for KPI count changes every 5 seconds via Server-Sent Events (SSE) — no page refresh needed. The summary payload (`GET /api/summary` and the SSE feed) includes project totals plus `scenariosTotal` and a `byPhase[]` array of per-phase `{ requirements, stories, scenarios }` counts (partitioned by earliest phase, with an Unassigned bucket).
 
 **Before init:** If the project hasn't been initialized with `init_project` yet, all API endpoints and the dashboard show a "Project not initialized" message rather than crashing.
+
+## Scenario REST API
+
+requ stores cucumber scenario gherkin as the single source of truth (see [Scenarios](#scenarios)). In HTTP mode it exposes a small, CORS-enabled REST API so any external tool — including the tool that runs the scenarios — can fetch and filter them. The contract is published as **OpenAPI 3.1** at `openapi/scenarios.yaml` (committed) and served live at `GET /api/openapi.json` and `GET /api/openapi.yaml`.
+
+Select a project with `?project=<slug>` or `?key=<key>` (required only when more than one project is loaded).
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/scenarios` | List/filter scenarios. Query params (AND-combined): `story`, `requirement`, `phase`+`mode`, `tags` (cucumber tag expression), `feature`, `q`, `valid`, `content=true`, `limit`, `offset`. Returns `{ total, scenarios[] }`. |
+| `GET /api/scenarios/:id` | One scenario by `testKey` (`feature::name`, URL-encoded), including full gherkin `content`. |
+| `GET /api/stories/:id/scenarios` | All scenarios linked to a story, with content. |
+| `GET /api/tags` | Distinct tags across stored scenarios, with counts. |
+| `GET /api/openapi.json` / `.yaml` | The OpenAPI 3.1 contract. |
+
+```bash
+# scenarios tagged @smoke but not @wip, with their pass/fail status in phase P1
+curl 'http://localhost:8788/api/scenarios?tags=@smoke%20and%20not%20@wip&phase=P1'
+
+# every scenario tracing to a requirement, gherkin content inline
+curl 'http://localhost:8788/api/scenarios?requirement=REQ-001&content=true'
+```
+
+`story`, `requirement`, and `phase` are also accepted as filters by the MCP `list_scenarios` tool — the tool and the REST API share one filter implementation, so results match.
 
 ## Usage
 
@@ -152,11 +176,18 @@ two modes:
 
 ### Phase planning & scope
 
-Requirements and user stories can be **assigned a target phase** — the release
-they're planned for — via the optional `phase` field on `create_requirement` /
-`create_user_story` (defaults to the active phase; pass `phase: ""` to leave
-unassigned) and `update_requirement` / `update_user_story`. This is *planning*
-("what's in scope for v1.1?"), distinct from *execution* ("what was tested").
+Requirements are **assigned a target phase** — the release they're planned for —
+via the optional `phase` field on `create_requirement` (defaults to the active
+phase; pass `phase: ""` to leave unassigned) and `update_requirement`. This is
+*planning* ("what's in scope for v1.1?"), distinct from *execution* ("what was
+tested").
+
+A **user story has no phase of its own** — its phase is *derived* from the phases
+of the requirements it traces to. The requirement is the single source of truth,
+so there's no second field to drift. A story is in scope for a phase when **any**
+of its linked requirements is in scope (under the same cumulative/strict rules),
+and the dashboard shows the distinct set of requirement phases per story. Filter
+stories by phase (`list_user_stories phase=…`, `?project` API) the same way.
 
 Phase reports are then scoped to the items planned for that phase, mirroring the
 coverage modes:
@@ -165,6 +196,7 @@ coverage modes:
 - **strict** — only items assigned to **that** phase.
 - items with **no** phase assigned are **always in scope** (so existing,
   un-phased data behaves exactly as before until you start assigning phases).
+- a story counts wherever **any** of its requirements is in scope.
 
 ### Components
 
@@ -211,6 +243,10 @@ reviewable in PRs:
 | `update_user_story` / `add_acceptance_criterion` / `list_user_stories` / `get_user_story` | PO | Edit stories & criteria |
 | `create_phase` / `list_phases` / `update_phase` / `set_active_phase` | release | Manage phases/releases |
 | `list_links` | tester | Show which scenarios are tagged to which story; flag dangling `@US-xxx` tags and stories with no scenario |
+| `create_scenario` / `update_scenario` / `get_scenario` / `delete_scenario` | tester/PO | Manage requ-owned cucumber scenarios (gherkin content, tags, story links) — see [Scenarios](#scenarios) |
+| `list_scenarios` | tester/PO | List/filter scenarios by story, requirement, phase, feature, and tags (cucumber tag expression) |
+| `validate_scenario` | tester/PO | Validate cucumber gherkin syntax (content, or a stored scenario) |
+| `import_scenarios_from_features` | tester | One-time migration: import `.feature` files into requ as stored scenarios |
 | `record_execution` | tester | Record one scenario result against a phase |
 | `import_execution_report` | tester | Ingest a Conductor cucumber-json file into a phase |
 | `coverage_report` | reporting | Phase/mode rollup + per-component + summary % (json or markdown) |
@@ -235,6 +271,29 @@ links by scanning `features/**/*.feature` (the same tags ride along in the
 cucumber-JSON, so imported results map straight onto stories). `list_links`
 shows the derived graph and flags `@US-xxx` tags that point at a story that
 doesn't exist.
+
+## Scenarios
+
+requ can own the cucumber **scenario content** itself — the gherkin text — as the
+single source of truth, instead of only deriving scenario names from disk feature
+files. A stored scenario holds its `feature`/`name` identity (the same `testKey`
+executions join on), the full gherkin `content`, the feature's `background` block
+(the steps that run before the scenario, so a runner can execute it standalone),
+its `tags`, and explicit `stories` links (defaulted from `@US-xxx` tags but
+independently settable).
+
+- **Validation:** gherkin content is checked with the official cucumber parser on
+  write; invalid content is rejected unless `force:true` (stored with `valid:false`).
+- **Migration:** run `import_scenarios_from_features` once to import your existing
+  `.feature` files. Authoring afterwards uses `create_scenario`/`update_scenario`.
+- **Source precedence (backward compatible):** if a project has **any** stored
+  scenario, coverage is derived from stored scenarios; otherwise it falls back to
+  scanning `features/**/*.feature` on disk exactly as before. Legacy projects and
+  stdio/YAML mode are unaffected until you import.
+- **HTTP/DB mode:** with `REQU_PG_URL` set, projects live entirely in Postgres —
+  no filesystem root is needed; select a project by its `key` or slug. The
+  [Scenario REST API](#scenario-rest-api) + OpenAPI contract expose stored
+  scenarios to external tools (including the scenario runner).
 
 ## Develop
 

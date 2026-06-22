@@ -17,6 +17,7 @@
       }
     }
   </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/styles/github.min.css">
   <link rel="stylesheet" href="/public/style.css">
 </head>
 <body class="bg-slate-50 font-sans text-slate-800" x-data="requApp" x-init="init()" x-cloak>
@@ -38,6 +39,9 @@
         <template x-if="projects.length <= 1">
           <span class="text-slate-500 text-xs hidden sm:inline" x-text="config?.name ? '/ ' + config.name : ''"></span>
         </template>
+        <span class="hidden md:inline text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700"
+          x-text="'Phase: ' + (coveragePhase ? (phases.find(p => p.id === coveragePhase)?.name || coveragePhase) : 'All phases')"
+          aria-label="Selected coverage phase"></span>
         <template x-if="projects.length > 1">
           <select
             class="filter-select filter-select--dark text-xs bg-slate-800 border-slate-700 focus:border-indigo-400"
@@ -460,12 +464,10 @@
 
           <div class="kpi-card">
             <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Scenarios</div>
-            <div class="text-3xl font-bold text-slate-900">
-              <span x-text="summaryVal('scenariosPassing')"></span>
-              <span class="text-slate-300 text-xl">/</span>
-              <span class="text-xl text-slate-400" x-text="summaryVal('scenariosLinked')"></span>
+            <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('scenariosTotal')"></div>
+            <div class="text-xs text-slate-500 mt-1">
+              <span class="text-emerald-600 font-semibold" x-text="summaryVal('scenariosPassing')"></span> / <span x-text="summaryVal('scenariosLinked')"></span> passing this phase
             </div>
-            <div class="text-xs text-slate-500 mt-1">passing / linked</div>
             <div class="progress-mini mt-2">
               <div class="progress-mini-fill bg-emerald-500"
                 :style="'width:' + (summaryVal('scenariosLinked') > 0 ? (summaryVal('scenariosPassing') / summaryVal('scenariosLinked') * 100).toFixed(1) : 0) + '%'">
@@ -484,6 +486,44 @@
             </div>
           </div>
         </div>
+
+        <!-- Counts by phase -->
+        <template x-if="summary && summary.byPhase">
+          <div class="section-card">
+            <div class="section-card-header">
+              Counts by phase
+              <span class="text-xs font-normal text-slate-400">requirements · stories · scenarios</span>
+            </div>
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Phase</th>
+                    <th style="width:140px;" class="text-right">Requirements</th>
+                    <th style="width:120px;" class="text-right">Stories</th>
+                    <th style="width:120px;" class="text-right">Scenarios</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="row in summary.byPhase" :key="row.phase || '(unassigned)'">
+                    <tr>
+                      <td class="font-medium text-slate-700" x-text="row.phaseName"></td>
+                      <td class="text-right text-slate-700" x-text="row.requirements"></td>
+                      <td class="text-right text-slate-700" x-text="row.stories"></td>
+                      <td class="text-right text-slate-700" x-text="row.scenarios"></td>
+                    </tr>
+                  </template>
+                  <tr class="font-semibold border-t-2 border-slate-200">
+                    <td class="text-slate-900">Total</td>
+                    <td class="text-right text-slate-900" x-text="summaryVal('requirements')"></td>
+                    <td class="text-right text-slate-900" x-text="summaryVal('stories')"></td>
+                    <td class="text-right text-slate-900" x-text="summaryVal('scenariosTotal')"></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </template>
 
         <!-- Charts row -->
         <div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
@@ -694,8 +734,8 @@
                     <th style="width:65px;" class="text-center">Stories</th>
                   </tr>
                 </thead>
-                <tbody>
-                  <template x-for="req in filteredRequirements()" :key="req.id">
+                <template x-for="req in filteredRequirements()" :key="req.id">
+                  <tbody>
                     <tr @click="toggleReq(req.id)" :class="reqExpanded === req.id ? 'expanded' : ''">
                       <td>
                         <span class="badge" :class="reqStatusBadge(req).cls">
@@ -773,8 +813,8 @@
                         </td>
                       </tr>
                     </template>
-                  </template>
-                </tbody>
+                  </tbody>
+                </template>
               </table>
             </div>
           </template>
@@ -841,8 +881,8 @@
                     <th style="width:110px;">Coverage</th>
                   </tr>
                 </thead>
-                <tbody>
-                  <template x-for="story in filteredStories()" :key="story.id">
+                <template x-for="story in filteredStories()" :key="story.id">
+                  <tbody>
                     <tr @click="toggleStory(story.id)" :class="storyExpanded === story.id ? 'expanded' : ''">
                       <td><code class="chip chip-indigo" x-text="story.id"></code></td>
                       <td class="font-medium text-slate-800" x-text="story.title"></td>
@@ -851,12 +891,14 @@
                           x-text="story.status ? story.status.replace('_', ' ') : '—'"></span>
                       </td>
                       <td>
-                        <template x-if="story.phase">
-                          <span class="chip chip-indigo" x-text="phaseName(story.phase)"></span>
-                        </template>
-                        <template x-if="!story.phase">
-                          <span class="text-slate-300">—</span>
-                        </template>
+                        <div class="flex flex-wrap gap-1">
+                          <template x-for="ph in storyPhases(story)" :key="ph">
+                            <span class="chip chip-indigo" x-text="phaseName(ph)"></span>
+                          </template>
+                          <template x-if="storyPhases(story).length === 0">
+                            <span class="text-slate-300">—</span>
+                          </template>
+                        </div>
                       </td>
                       <td class="text-center text-slate-500 text-sm" x-text="(story.acceptanceCriteria || []).length"></td>
                       <td>
@@ -902,15 +944,41 @@
                               </div>
                               <div>
                                 <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Scenarios</div>
-                                <template x-if="!storyCoverage(story) || (storyCoverage(story)?.scenarios || []).length === 0">
+                                <template x-if="!storyCoverage(story) || (visibleScenarios(storyCoverage(story)?.scenarios)).length === 0">
                                   <p class="text-sm text-slate-400 italic">No scenarios linked.</p>
                                 </template>
                                 <ul class="space-y-1.5">
-                                  <template x-for="sc in (storyCoverage(story)?.scenarios || [])" :key="sc.name">
-                                    <li class="text-xs text-slate-700 flex items-center gap-2">
-                                      <span :class="sc.status==='pass'?'text-green-600':sc.status==='fail'?'text-red-500':'text-amber-500'"
-                                        x-text="sc.status==='pass'?'✓':sc.status==='fail'?'✗':'○'"></span>
-                                      <span x-text="sc.name"></span>
+                                  <template x-for="sc in visibleScenarios(storyCoverage(story)?.scenarios)" :key="scenarioKey(sc)">
+                                    <li class="text-xs text-slate-700">
+                                      <button type="button" class="scenario-row" @click="toggleScenario(sc)">
+                                        <span :class="sc.status==='pass'?'text-green-600':sc.status==='fail'?'text-red-500':'text-amber-500'"
+                                          x-text="sc.status==='pass'?'✓':sc.status==='fail'?'✗':'○'"></span>
+                                        <span class="flex-1 text-left" x-text="sc.name"></span>
+                                        <span x-show="scenarioContent[scenarioKey(sc)]?.valid === false" class="badge badge-red">invalid gherkin</span>
+                                        <span class="scenario-chevron" :class="scenarioOpenId === scenarioKey(sc) ? 'open' : ''" x-show="sc.hasContent !== false">▸</span>
+                                      </button>
+                                      <div x-show="scenarioOpenId === scenarioKey(sc)" x-cloak class="mt-1.5">
+                                        <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'loading'">
+                                          <p class="text-xs text-slate-400 italic">Loading…</p>
+                                        </template>
+                                        <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'ready'">
+                                          <div class="space-y-1.5">
+                                            <template x-if="scenarioContent[scenarioKey(sc)].backgroundHtml">
+                                              <div>
+                                                <div class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Background</div>
+                                                <pre class="gherkin-block"><code class="hljs language-gherkin" x-html="scenarioContent[scenarioKey(sc)].backgroundHtml"></code></pre>
+                                              </div>
+                                            </template>
+                                            <pre class="gherkin-block"><code class="hljs language-gherkin" x-html="scenarioContent[scenarioKey(sc)].html"></code></pre>
+                                          </div>
+                                        </template>
+                                        <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'none'">
+                                          <p class="text-xs text-slate-400 italic">No gherkin content available (legacy scenario).</p>
+                                        </template>
+                                        <template x-if="scenarioContent[scenarioKey(sc)]?.state === 'error'">
+                                          <p class="text-xs text-red-400 italic">Failed to load scenario.</p>
+                                        </template>
+                                      </div>
                                     </li>
                                   </template>
                                 </ul>
@@ -920,8 +988,8 @@
                         </td>
                       </tr>
                     </template>
-                  </template>
-                </tbody>
+                  </tbody>
+                </template>
               </table>
             </div>
           </template>
@@ -964,7 +1032,18 @@
             </template>
             Refresh
           </button>
+          <div class="flex items-center gap-2 ml-auto">
+            <label for="scenario-tags" class="text-sm font-medium text-slate-600">Tags:</label>
+            <input id="scenario-tags" type="text" class="filter-select" style="min-width:200px;"
+              placeholder="e.g. @smoke and not @wip"
+              x-model="scenarioTagFilter"
+              @keydown.enter="applyTagFilter()"
+              aria-label="Filter scenarios by cucumber tag expression">
+            <button class="btn-secondary text-xs" @click="applyTagFilter()">Filter</button>
+            <button class="btn-secondary text-xs" x-show="scenarioTagMatchIds" @click="clearTagFilter()">Clear</button>
+          </div>
         </div>
+        <p x-show="scenarioTagError" class="text-xs text-red-500" x-text="scenarioTagError"></p>
 
         <!-- Summary stats -->
         <template x-if="coverage?.summary">
@@ -1563,6 +1642,8 @@
 
   <script src="https://cdn.jsdelivr.net/npm/marked@14/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/languages/gherkin.min.js"></script>
   <script src="/public/app.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 </body>

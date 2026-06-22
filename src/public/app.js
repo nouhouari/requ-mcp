@@ -4,6 +4,11 @@
  */
 document.addEventListener('alpine:init', function () {
   Alpine.data('requApp', function () {
+    // Chart.js instances are kept in closure scope (NOT reactive component state):
+    // assigning a Chart to a reactive Alpine property makes Alpine deep-proxy its
+    // circular internals, causing a "Maximum call stack size exceeded" recursion.
+    var _trendChart = null;
+    var _donutChart = null;
     return {
 
       // ── Navigation ──────────────────────────────────────────────────────────
@@ -68,9 +73,17 @@ document.addEventListener('alpine:init', function () {
       coverageMode: 'cumulative',
       showStoriesDetail: false,
 
-      // ── Charts ───────────────────────────────────────────────────────────────
-      _trendChart: null,
-      _donutChart: null,
+      // ── Scenario viewer (gherkin) ─────────────────────────────────────────────
+      /** testKey of the currently-open scenario, or null. */
+      scenarioOpenId: null,
+      /** Cache keyed by scenario testKey → { state, html, valid }. */
+      scenarioContent: {},
+      /** Tag-expression filter (cucumber syntax) and the resolved match set. */
+      scenarioTagFilter: '',
+      scenarioTagMatchIds: null,
+      scenarioTagError: '',
+
+      // ── Charts: instances live in factory-closure scope, not here (see top) ────
 
       // ── SSE handle ───────────────────────────────────────────────────────────
       _sse: null,
@@ -131,6 +144,12 @@ document.addEventListener('alpine:init', function () {
 
         this.$watch('scenariosSearch', function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
         this.$watch('scenariosTag',    function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
+
+        // Coverage phase/mode require a server round-trip (unlike the client-side
+        // requirement/story filters), so re-fetch whenever either selection changes.
+        var self = this;
+        this.$watch('coveragePhase', function () { self.refreshCoverage(); });
+        this.$watch('coverageMode', function () { self.refreshCoverage(); });
       },
 
       // =========================================================================
@@ -262,7 +281,8 @@ document.addEventListener('alpine:init', function () {
 
       async loadCoverage() {
         this.loading.coverage = true;
-        var phase = this.coveragePhase ? ('&phase=' + encodeURIComponent(this.coveragePhase)) : '';
+        // Always send phase= (empty => "All phases"), else the server defaults to the active phase.
+        var phase = '&phase=' + encodeURIComponent(this.coveragePhase || '');
         var d = await this._fetch(this.apiUrl('/api/coverage?mode=' + this.coverageMode + phase));
         if (d) this.coverage = d;
         this.loading.coverage = false;
@@ -277,7 +297,8 @@ document.addEventListener('alpine:init', function () {
 
       async loadGaps() {
         this.loading.gaps = true;
-        var phase = this.coveragePhase ? ('&phase=' + encodeURIComponent(this.coveragePhase)) : '';
+        // Always send phase= (empty => "All phases"), else the server defaults to the active phase.
+        var phase = '&phase=' + encodeURIComponent(this.coveragePhase || '');
         var d = await this._fetch(this.apiUrl('/api/coverage/gaps?mode=' + this.coverageMode + phase));
         if (d) this.gaps = d;
         this.loading.gaps = false;
@@ -422,7 +443,8 @@ document.addEventListener('alpine:init', function () {
         return this.stories.filter(function (s) {
           if (self.storyStatusFilter !== 'all' && s.status !== self.storyStatusFilter) return false;
           if (self.storyPhaseFilter !== 'all') {
-            if (self.storyPhaseFilter === '(none)' ? !!s.phase : s.phase !== self.storyPhaseFilter) return false;
+            var phs = self.storyPhases(s);
+            if (self.storyPhaseFilter === '(none)' ? phs.length > 0 : phs.indexOf(self.storyPhaseFilter) === -1) return false;
           }
           if (self.storySearch) {
             var q = self.storySearch.toLowerCase();
@@ -476,6 +498,84 @@ document.addEventListener('alpine:init', function () {
           if (this.coverage.stories[i].id === story.id) return this.coverage.stories[i];
         }
         return null;
+      },
+
+      // ── Scenario viewer (gherkin) ─────────────────────────────────────────────
+
+      /** Stable key for a scenario coverage entry. */
+      scenarioKey: function (sc) {
+        return sc.id || ((sc.feature || '') + '::' + (sc.name || ''));
+      },
+
+      /** Apply the active tag-match filter to a story's scenario list. */
+      visibleScenarios: function (scenarios) {
+        var list = scenarios || [];
+        if (!this.scenarioTagMatchIds) return list;
+        var ids = this.scenarioTagMatchIds;
+        var self = this;
+        return list.filter(function (sc) { return ids.has(self.scenarioKey(sc)); });
+      },
+
+      /** Toggle the inline gherkin panel for a scenario; lazy-load its content. */
+      toggleScenario: function (sc) {
+        var key = this.scenarioKey(sc);
+        if (this.scenarioOpenId === key) { this.scenarioOpenId = null; return; }
+        this.scenarioOpenId = key;
+        if (!this.scenarioContent[key]) this.loadScenario(sc);
+      },
+
+      async loadScenario(sc) {
+        var key = this.scenarioKey(sc);
+        this.scenarioContent[key] = { state: 'loading' };
+        var d = await this._fetch(this.apiUrl('/api/scenarios/' + encodeURIComponent(key)));
+        if (!d) { this.scenarioContent[key] = { state: 'error' }; return; }
+        var content = d.content || '';
+        var background = d.background || '';
+        if (!content.trim()) { this.scenarioContent[key] = { state: 'none', valid: d.valid }; return; }
+        this.scenarioContent[key] = {
+          state: 'ready',
+          html: this.highlightGherkin(content),
+          backgroundHtml: background.trim() ? this.highlightGherkin(background) : '',
+          valid: d.valid,
+        };
+      },
+
+      /** Produce highlighted, HTML-escaped markup for gherkin content. */
+      highlightGherkin: function (text) {
+        try {
+          if (window.hljs && window.hljs.getLanguage && window.hljs.getLanguage('gherkin')) {
+            return window.hljs.highlight(text, { language: 'gherkin' }).value;
+          }
+        } catch (_) { /* fall through to escaped plain text */ }
+        return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      },
+
+      /** Resolve the tag expression to a set of matching scenario ids via the API. */
+      async applyTagFilter() {
+        var expr = (this.scenarioTagFilter || '').trim();
+        this.scenarioTagError = '';
+        if (!expr) { this.clearTagFilter(); return; }
+        try {
+          var res = await window.fetch(this.apiUrl('/api/scenarios?content=false&tags=' + encodeURIComponent(expr)));
+          if (res.status === 400) {
+            var body = await res.json().catch(function () { return {}; });
+            this.scenarioTagError = (body && body.error) || 'Invalid tag expression';
+            return;
+          }
+          if (!res.ok) { this.scenarioTagError = 'Failed to apply filter'; return; }
+          var data = await res.json();
+          var ids = new Set();
+          (data.scenarios || []).forEach(function (s) { ids.add(s.id); });
+          this.scenarioTagMatchIds = ids;
+        } catch (_) {
+          this.scenarioTagError = 'Failed to apply filter';
+        }
+      },
+
+      clearTagFilter: function () {
+        this.scenarioTagFilter = '';
+        this.scenarioTagMatchIds = null;
+        this.scenarioTagError = '';
       },
 
       _reqCoverageKey(req) {
@@ -589,6 +689,31 @@ document.addEventListener('alpine:init', function () {
         return id;
       },
 
+      /**
+       * A story has no phase of its own — its phase is derived from the phases of
+       * the requirements it traces to. Returns the distinct phase ids (sorted by
+       * phase order), so a story spanning phases shows each one.
+       */
+      storyPhases(story) {
+        var self = this;
+        var ids = [];
+        (story.requirements || []).forEach(function (rid) {
+          for (var i = 0; i < self.requirements.length; i++) {
+            if (self.requirements[i].id === rid) {
+              var ph = self.requirements[i].phase;
+              if (ph && ids.indexOf(ph) === -1) ids.push(ph);
+              break;
+            }
+          }
+        });
+        var order = {};
+        this.phases.forEach(function (p) { order[p.id] = p.order; });
+        ids.sort(function (a, b) {
+          return ((order[a] !== undefined ? order[a] : 1e9) - (order[b] !== undefined ? order[b] : 1e9));
+        });
+        return ids;
+      },
+
       reqCountForComponent(componentId) {
         var count = 0;
         this.requirements.forEach(function (r) {
@@ -618,10 +743,10 @@ document.addEventListener('alpine:init', function () {
         if (!canvas || typeof Chart === 'undefined') return;
         // Destroy any stale instance so the new canvas gets a fresh Chart.js context
         // (x-if can recycle the canvas reference while _trendChart still holds the old one).
-        if (self._trendChart) { self._trendChart.destroy(); self._trendChart = null; }
+        if (_trendChart) { _trendChart.destroy(); _trendChart = null; }
         var ctx = canvas.getContext('2d');
 
-        self._trendChart = new Chart(ctx, {
+        _trendChart = new Chart(ctx, {
           type: 'line',
           data: {
             labels: [],
@@ -677,15 +802,15 @@ document.addEventListener('alpine:init', function () {
         });
 
         function applyTrend(data) {
-          if (!data || !self._trendChart) return;
-          self._trendChart.data.labels = data.map(function (p) { return p.phaseName || p.phase; });
-          self._trendChart.data.datasets[0].data = data.map(function (p) {
+          if (!data || !_trendChart) return;
+          _trendChart.data.labels = data.map(function (p) { return p.phaseName || p.phase; });
+          _trendChart.data.datasets[0].data = data.map(function (p) {
             return p.summary ? Number((p.summary.verifiedPct || 0).toFixed(1)) : 0;
           });
-          self._trendChart.data.datasets[1].data = data.map(function (p) {
+          _trendChart.data.datasets[1].data = data.map(function (p) {
             return p.summary ? Number((p.summary.storyCoveragePct || 0).toFixed(1)) : 0;
           });
-          self._trendChart.update('none');
+          _trendChart.update('none');
         }
 
         this.$watch('trend', applyTrend);
@@ -696,7 +821,7 @@ document.addEventListener('alpine:init', function () {
         var self = this;
         if (!canvas || typeof Chart === 'undefined') return;
         // Same as trendChart: destroy any stale instance before re-init.
-        if (self._donutChart) { self._donutChart.destroy(); self._donutChart = null; }
+        if (_donutChart) { _donutChart.destroy(); _donutChart = null; }
         var ctx = canvas.getContext('2d');
 
         var COLORS = [
@@ -705,7 +830,7 @@ document.addEventListener('alpine:init', function () {
           '#f97316', '#84cc16',
         ];
 
-        self._donutChart = new Chart(ctx, {
+        _donutChart = new Chart(ctx, {
           type: 'doughnut',
           data: {
             labels: [],
@@ -738,16 +863,16 @@ document.addEventListener('alpine:init', function () {
         });
 
         function applyDonut(data) {
-          if (!data || !self._donutChart) return;
+          if (!data || !_donutChart) return;
           var by = data.byComponent || [];
-          self._donutChart.data.labels = by.map(function (c) { return c.component; });
-          self._donutChart.data.datasets[0].data = by.map(function (c) {
+          _donutChart.data.labels = by.map(function (c) { return c.component; });
+          _donutChart.data.datasets[0].data = by.map(function (c) {
             return Number((c.verifiedPct || 0).toFixed(1));
           });
-          self._donutChart.data.datasets[0].backgroundColor = by.map(function (_, i) {
+          _donutChart.data.datasets[0].backgroundColor = by.map(function (_, i) {
             return COLORS[i % COLORS.length];
           });
-          self._donutChart.update('none');
+          _donutChart.update('none');
         }
 
         this.$watch('coverage', applyDonut);

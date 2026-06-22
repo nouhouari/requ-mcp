@@ -7,6 +7,7 @@ import {
   Execution,
   Phase,
   Requirement,
+  Scenario,
   UserStory,
   VcsRef,
   type Component as TComponent,
@@ -14,6 +15,7 @@ import {
   type Execution as TExecution,
   type Phase as TPhase,
   type Requirement as TRequirement,
+  type Scenario as TScenario,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
@@ -54,6 +56,10 @@ const SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_exec_phase ON executions(phase_id);
   CREATE TABLE IF NOT EXISTS vcs_refs (
+    id   TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS scenarios (
     id   TEXT PRIMARY KEY,
     data TEXT NOT NULL
   );
@@ -258,6 +264,26 @@ export class SqliteStore {
     const merged = VcsRef.parse({ ...existing, ...patch, id: existing.id });
     await this.writeVcsRef(merged);
     return merged;
+  }
+
+  // --- scenarios ---
+
+  async listScenarios(): Promise<TScenario[]> {
+    return this.all("SELECT data FROM scenarios ORDER BY id", Scenario);
+  }
+
+  async getScenario(testKey: string): Promise<TScenario | null> {
+    return this.get("SELECT data FROM scenarios WHERE id = ?", [testKey], Scenario);
+  }
+
+  async writeScenario(sc: TScenario): Promise<void> {
+    const v = Scenario.parse(sc);
+    this.put("scenarios", v.testKey, v);
+  }
+
+  async deleteScenario(testKey: string): Promise<boolean> {
+    const info = this.db.prepare("DELETE FROM scenarios WHERE id = ?").run(testKey);
+    return info.changes > 0;
   }
 
   // Reuse static helper from Store

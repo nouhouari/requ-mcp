@@ -194,8 +194,10 @@ async function main() {
     // Items created earlier defaulted to the active phase at creation time (P1).
     const reqByPhase = await call("list_requirements", { phase: "P1" });
     check("create defaults requirement to active phase", reqByPhase.data.length === 3 && reqByPhase.data.every((r: any) => r.phase === "P1"), reqByPhase.data);
+    // A story has no phase of its own; its phase is derived from its requirements.
+    // All 3 stories link a P1 requirement, so the P1 filter returns all 3.
     const storyByPhase = await call("list_user_stories", { phase: "P1" });
-    check("create defaults story to active phase", storyByPhase.data.length === 3 && storyByPhase.data.every((s: any) => s.phase === "P1"), storyByPhase.data);
+    check("story phase derived from requirements (3 in P1)", storyByPhase.data.length === 3 && storyByPhase.data.every((s: any) => s.phase === undefined), storyByPhase.data);
 
     // A requirement explicitly planned for v1.1 (P2), plus an unassigned one.
     await call("create_requirement", { title: "v1.1 only feature", phase: "P2" }); // REQ-004
@@ -207,19 +209,100 @@ async function main() {
     const badPhase = await call("create_requirement", { title: "bad", phase: "NOPE" });
     check("create rejects an unknown phase", badPhase.isError === true, badPhase.data);
 
-    // strict P1: REQ-004 (v1.1) excluded; unassigned REQ-005 included; 3 P1 reqs included => 4 total.
+    // A selected phase excludes both other-phase AND unassigned items.
+    // strict P1: only the 3 P1 reqs (REQ-004=P2 and unassigned REQ-005 both excluded) => 3 total.
     const strictP1 = await call("coverage_report", { phase: "P1", mode: "strict" });
-    check("strict P1 excludes v1.1 req, includes unassigned (4 total)", strictP1.data.summary.requirementsTotal === 4, strictP1.data.summary);
+    check("strict P1 excludes v1.1 req and unassigned (3 total)", strictP1.data.summary.requirementsTotal === 3, strictP1.data.summary);
     check("strict P1 does not list REQ-004", !strictP1.data.requirements.some((r: any) => r.id === "REQ-004"), strictP1.data.requirements.map((r: any) => r.id));
+    check("strict P1 does not list unassigned REQ-005", !strictP1.data.requirements.some((r: any) => r.id === "REQ-005"), strictP1.data.requirements.map((r: any) => r.id));
 
-    // cumulative P2: P1 carries forward + P2 + unassigned => 5 total.
+    // cumulative P2: P1 carries forward (3) + P2 (REQ-004) => 4 total; unassigned REQ-005 still excluded.
     const cumP2 = await call("coverage_report", { phase: "P2", mode: "cumulative" });
-    check("cumulative P2 includes earlier + this phase + unassigned (5 total)", cumP2.data.summary.requirementsTotal === 5, cumP2.data.summary);
+    check("cumulative P2 includes earlier + this phase, excludes unassigned (4 total)", cumP2.data.summary.requirementsTotal === 4, cumP2.data.summary);
 
-    // Clearing a phase returns an item to always-in-scope.
+    // Clearing a req's phase makes it unassigned → excluded whenever a phase is selected.
     await call("update_requirement", { id: "REQ-004", phase: "" });
     const strictP1b = await call("coverage_report", { phase: "P1", mode: "strict" });
-    check("clearing a phase makes the req always in scope (5 total)", strictP1b.data.summary.requirementsTotal === 5, strictP1b.data.summary);
+    check("clearing a phase drops the req from a phase-scoped report (3 total)", strictP1b.data.summary.requirementsTotal === 3, strictP1b.data.summary);
+
+    // =====================================================================
+    // Scenarios: requ-owned gherkin content, validation, tag/story/req filters
+    // (run last — storing scenarios switches coverage to DB-native precedence)
+    // =====================================================================
+    const goodGherkin =
+      "Scenario: Successful login with valid credentials\n" +
+      "  Given a registered user\n" +
+      "  When they submit valid credentials\n" +
+      "  Then they reach the dashboard";
+
+    const vgood = await call("validate_scenario", { content: goodGherkin });
+    check("validate_scenario accepts good gherkin", vgood.data.ok === true, vgood.data);
+    const vbad = await call("validate_scenario", { content: "Scenario: a\n Given x\nScenario: b\n Given y" });
+    check("validate_scenario rejects multi-scenario content with errors", vbad.data.ok === false && vbad.data.errors.length > 0, vbad.data);
+
+    const badCreate = await call("create_scenario", { feature: "Login", name: "Broken", content: "Scenario: a\n Given x\nScenario: b" });
+    check("create_scenario rejects invalid gherkin", badCreate.isError === true, badCreate.data);
+    const forced = await call("create_scenario", { feature: "Login", name: "Broken", content: "Scenario: a\n Given x\nScenario: b", force: true });
+    check("create_scenario force stores invalid (valid=false)", forced.data.scenario?.valid === false, forced.data);
+    const del = await call("delete_scenario", { feature: "Login", name: "Broken" });
+    check("delete_scenario removes the row", del.data.deleted === true, del.data);
+
+    await call("create_scenario", { feature: "Login", name: "Successful login with valid credentials", content: goodGherkin, tags: ["@US-001", "@smoke"] });
+    await call("create_scenario", {
+      feature: "Login",
+      name: "Login fails with wrong password",
+      content: "Scenario: Login fails with wrong password\n  Given a registered user\n  When they submit a wrong password\n  Then they see an error",
+      tags: ["@US-001", "@wip"],
+    });
+
+    const listAll = await call("list_scenarios", {});
+    check("list_scenarios returns the 2 stored scenarios", Array.isArray(listAll.data) && listAll.data.length === 2, listAll.data);
+
+    const linksStore = await call("list_links");
+    check("list_links reports source=store once scenarios are stored", linksStore.data.source === "store", linksStore.data);
+
+    const smoke = await call("list_scenarios", { tags: "@smoke and not @wip" });
+    check("tag expression filters to the @smoke scenario", smoke.data.length === 1 && smoke.data[0].name === "Successful login with valid credentials", smoke.data);
+
+    const badExpr = await call("list_scenarios", { tags: "@a and" });
+    check("invalid tag expression errors", badExpr.isError === true, badExpr.data);
+
+    const byStory = await call("list_scenarios", { story: "US-001" });
+    check("filter by story US-001 returns both", byStory.data.length === 2, byStory.data);
+    const byReq = await call("list_scenarios", { requirement: "REQ-001" });
+    check("filter by requirement REQ-001 returns both (via US-001)", byReq.data.length === 2, byReq.data);
+
+    const getSc = await call("get_scenario", { feature: "Login", name: "Successful login with valid credentials" });
+    check("get_scenario returns content + tags", typeof getSc.data.content === "string" && getSc.data.content.includes("Given a registered user") && getSc.data.tags.includes("@smoke"), getSc.data);
+
+    // DB precedence: coverage now derives from stored scenarios (US-001 keeps its 2).
+    const repStore = await call("coverage_report", { phase: "P1", mode: "cumulative" });
+    check("coverage derives from stored scenarios (US-001 has 2)", repStore.data.stories.find((s: any) => s.id === "US-001")?.scenarios.length === 2, repStore.data.stories);
+
+    // import_scenarios_from_features on a fresh project populates content from disk.
+    const tmp2 = await fs.mkdtemp(path.join(os.tmpdir(), "requ-smoke-import-"));
+    await fs.mkdir(path.join(tmp2, "features"), { recursive: true });
+    await fs.writeFile(
+      path.join(tmp2, "features", "search.feature"),
+      [
+        "Feature: Search",
+        "",
+        "  Background:",
+        "    Given the catalog is loaded",
+        "",
+        "  @US-1",
+        "  Scenario: Find a product by name",
+        "    When I search for a product",
+        "    Then I see matching results",
+      ].join("\n"),
+    );
+    await call("init_project", { projectPath: tmp2, name: "ImportSmoke", conductorPath: "." });
+    const importRes = await call("import_scenarios_from_features", { projectPath: tmp2 });
+    check("import_scenarios_from_features imports disk scenarios", importRes.data.scenariosParsed === 1 && importRes.data.imported === 1, importRes.data);
+    const imported = await call("list_scenarios", { projectPath: tmp2 });
+    check("imported scenario has content populated", imported.data.length === 1 && imported.data[0].content.includes("When I search for a product"), imported.data);
+    check("imported scenario captures the Background block", imported.data[0].background.includes("Given the catalog is loaded"), imported.data[0].background);
+    await fs.rm(tmp2, { recursive: true, force: true });
   } finally {
     await client.close();
     await fs.rm(tmp, { recursive: true, force: true });
