@@ -76,6 +76,10 @@
           <span class="text-indigo-400 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '% phase'"></span>
           <span class="text-slate-600">·</span>
           <span class="text-slate-300 font-semibold" x-text="pct(summaryVal('verifiedPctCumulative')) + '% project'"></span>
+          <span class="text-slate-600">·</span>
+          <span class="text-emerald-400 font-semibold cursor-help"
+                title="Verified (livré) : exclut les phases planifiées non démarrées"
+                x-text="pct(summaryVal('deliveredVerifiedPct')) + '% livré'"></span>
         </div>
         <!-- Export / Import buttons -->
         <button
@@ -478,7 +482,14 @@
             <div class="text-xs font-semibold text-indigo-500 uppercase tracking-wide mb-1">Verified</div>
             <div class="text-4xl font-bold text-indigo-600" x-text="pct(summaryVal('verifiedPctProject')) + '%'"></div>
             <div class="text-sm font-semibold text-slate-400 mt-1"
-                 x-text="pct(summaryVal('testedStoryCoveragePctProject')) + '% story coverage'"></div>
+                 x-text="pct(summaryVal('verifiedPctCumulative')) + '% project'"></div>
+            <!-- 2nd indicator: Verified on the DELIVERED scope (excludes planned phases) -->
+            <div class="mt-2 inline-flex items-center gap-1.5 rounded-full bg-emerald-50 border border-emerald-200 px-2.5 py-1"
+                 :title="'Verified (livré) : ' + pct(summaryVal('deliveredVerifiedPct')) + '% — exclut les phases planifiées non démarrées' + (summary && summary.deliveredTotal !== undefined ? ' (' + summaryVal('deliveredVerified') + '/' + summaryVal('deliveredTotal') + ' exigences livrées)' : '')">
+              <span class="text-[11px] font-semibold text-emerald-700 uppercase tracking-wide">Livré</span>
+              <span class="text-sm font-bold text-emerald-700" x-text="pct(summaryVal('deliveredVerifiedPct')) + '%'"></span>
+              <span class="text-emerald-400 cursor-help" aria-hidden="true">ⓘ</span>
+            </div>
             <div class="progress-mini mt-2">
               <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('verifiedPctProject') + '%'"></div>
             </div>

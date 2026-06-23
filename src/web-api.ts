@@ -25,6 +25,7 @@ import {
   filterScenarios,
   countsByPhase,
   requirementIdsForScenario,
+  computeDeliveredCoverage,
   type ScenariosByStory,
   type ScenarioFilter,
 } from "./coverage.js";
@@ -314,6 +315,10 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
   const trendStrict = buildTrend(requirements, stories, storyMap, executionsByPhase, phases, "strict");
   const covByPhase = new Map(trendStrict.map((p) => [p.phase, p.summary]));
 
+  // "Verified on the DELIVERED scope": verified requirements / requirements whose
+  // target phase is delivered (status completed|active), excluding planned phases.
+  const delivered = computeDeliveredCoverage(requirements, stories, storyMap, executionsByPhase, phases, activePhase);
+
   return {
     requirements: requirements.length,
     stories: stories.length,
@@ -338,6 +343,9 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     // Distinct stored scenarios whose latest result (across all phases) is a pass.
     // (Not the per-story link sum, which double-counts multi-story scenarios.)
     scenariosPassingDistinct:     scenarios.filter((sc) => statusAll.get(testKey(sc)) === "pass").length,
+    deliveredVerifiedPct:       delivered.deliveredVerifiedPct,
+    deliveredVerified:          delivered.deliveredVerified,
+    deliveredTotal:             delivered.deliveredTotal,
     activePhase,
   };
 }
