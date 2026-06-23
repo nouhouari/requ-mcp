@@ -209,6 +209,12 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
   const statusCumulative = resolveStatuses(executionsByPhase, phases, activePhase, "cumulative");
   const reportCumulative = buildReport(requirements, stories, storyMap, statusCumulative, activePhase, "cumulative", vcsRefs, phases);
 
+  const statusAll = resolveStatuses(executionsByPhase, phases, null, "cumulative");
+  const reportAll = buildReport(requirements, stories, storyMap, statusAll, null, "cumulative", vcsRefs, phases);
+
+  const trendStrict = buildTrend(requirements, stories, storyMap, executionsByPhase, phases, "strict");
+  const covByPhase = new Map(trendStrict.map((p) => [p.phase, p.summary]));
+
   return {
     requirements: requirements.length,
     stories: stories.length,
@@ -217,13 +223,20 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     vcsRefs: vcsRefs.length,
     scenariosTotal: scenarios.length,
     // Raw counts partitioned across phases (each item counted once, earliest phase).
-    byPhase: countsByPhase(requirements, stories, scenarios, phases),
+    byPhase: countsByPhase(requirements, stories, scenarios, phases).map((row) => {
+      const cov = covByPhase.get(row.phase);
+      return { ...row, verifiedPct: cov ? cov.verifiedPct : null, storyCoveragePct: cov ? cov.storyCoveragePct : null };
+    }),
     scenariosPassing: reportStrict.summary.scenariosPassing,
     scenariosLinked:  reportStrict.summary.scenariosLinked,
     verifiedPct:                reportStrict.summary.verifiedPct,
     storyCoveragePct:           reportStrict.summary.storyCoveragePct,
     verifiedPctCumulative:      reportCumulative.summary.verifiedPct,
     storyCoveragePctCumulative: reportCumulative.summary.storyCoveragePct,
+    verifiedPctProject:       reportAll.summary.verifiedPct,
+    storyCoveragePctProject:  reportAll.summary.storyCoveragePct,
+    scenariosPassingProject:  reportAll.summary.scenariosPassing,
+    scenariosLinkedProject:   reportAll.summary.scenariosLinked,
     activePhase,
   };
 }

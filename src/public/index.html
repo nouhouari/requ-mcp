@@ -443,11 +443,10 @@
             <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Requirements</div>
             <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('requirements')"></div>
             <div class="text-xs text-slate-500 mt-1">
-              <span class="text-green-600 font-semibold" x-text="pct(summaryVal('verifiedPct')) + '%'"></span> phase ·
-              <span class="text-slate-400 font-semibold" x-text="pct(summaryVal('verifiedPctCumulative')) + '%'"></span> project
+              <span class="text-green-600 font-semibold" x-text="pct(summaryVal('verifiedPctProject')) + '%'"></span> verified
             </div>
             <div class="progress-mini mt-2">
-              <div class="progress-mini-fill bg-green-500" :style="'width:' + summaryVal('verifiedPct') + '%'"></div>
+              <div class="progress-mini-fill bg-green-500" :style="'width:' + summaryVal('verifiedPctProject') + '%'"></div>
             </div>
           </div>
 
@@ -455,10 +454,10 @@
             <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Stories</div>
             <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('stories')"></div>
             <div class="text-xs text-slate-500 mt-1">
-              <span class="text-indigo-600 font-semibold" x-text="pct(summaryVal('storyCoveragePct')) + '%'"></span> linked
+              <span class="text-indigo-600 font-semibold" x-text="pct(summaryVal('storyCoveragePctProject')) + '%'"></span> covered
             </div>
             <div class="progress-mini mt-2">
-              <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('storyCoveragePct') + '%'"></div>
+              <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('storyCoveragePctProject') + '%'"></div>
             </div>
           </div>
 
@@ -466,23 +465,23 @@
             <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Scenarios</div>
             <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('scenariosTotal')"></div>
             <div class="text-xs text-slate-500 mt-1">
-              <span class="text-emerald-600 font-semibold" x-text="summaryVal('scenariosPassing')"></span> / <span x-text="summaryVal('scenariosLinked')"></span> passing this phase
+              <span class="text-emerald-600 font-semibold" x-text="summaryVal('scenariosPassingProject')"></span> / <span x-text="summaryVal('scenariosLinkedProject')"></span> passing
             </div>
             <div class="progress-mini mt-2">
               <div class="progress-mini-fill bg-emerald-500"
-                :style="'width:' + (summaryVal('scenariosLinked') > 0 ? (summaryVal('scenariosPassing') / summaryVal('scenariosLinked') * 100).toFixed(1) : 0) + '%'">
+                :style="'width:' + (summaryVal('scenariosLinkedProject') > 0 ? (summaryVal('scenariosPassingProject') / summaryVal('scenariosLinkedProject') * 100).toFixed(1) : 0) + '%'">
               </div>
             </div>
           </div>
 
           <div class="kpi-card border-indigo-100 bg-gradient-to-br from-indigo-50 to-white">
             <div class="text-xs font-semibold text-indigo-500 uppercase tracking-wide mb-1">Verified</div>
-            <div class="text-4xl font-bold text-indigo-600" x-text="pct(summaryVal('verifiedPct')) + '%'"></div>
-            <div class="text-xs text-slate-500 mt-1">this phase</div>
+            <div class="text-4xl font-bold text-indigo-600" x-text="pct(summaryVal('verifiedPctProject')) + '%'"></div>
+            <div class="text-xs text-slate-500 mt-1">project</div>
             <div class="text-sm font-semibold text-slate-400 mt-1"
-                 x-text="pct(summaryVal('verifiedPctCumulative')) + '% project'"></div>
+                 x-text="pct(summaryVal('storyCoveragePctProject')) + '% story coverage'"></div>
             <div class="progress-mini mt-2">
-              <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('verifiedPct') + '%'"></div>
+              <div class="progress-mini-fill bg-indigo-500" :style="'width:' + summaryVal('verifiedPctProject') + '%'"></div>
             </div>
           </div>
         </div>
@@ -492,7 +491,7 @@
           <div class="section-card">
             <div class="section-card-header">
               Counts by phase
-              <span class="text-xs font-normal text-slate-400">requirements · stories · scenarios</span>
+              <span class="text-xs font-normal text-slate-400">requirements · stories · scenarios · coverage</span>
             </div>
             <div class="data-table-wrap">
               <table class="data-table">
@@ -502,6 +501,8 @@
                     <th style="width:140px;" class="text-right">Requirements</th>
                     <th style="width:120px;" class="text-right">Stories</th>
                     <th style="width:120px;" class="text-right">Scenarios</th>
+                    <th style="width:110px;" class="text-right">Verified %</th>
+                    <th style="width:120px;" class="text-right">Story Cov. %</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -511,6 +512,8 @@
                       <td class="text-right text-slate-700" x-text="row.requirements"></td>
                       <td class="text-right text-slate-700" x-text="row.stories"></td>
                       <td class="text-right text-slate-700" x-text="row.scenarios"></td>
+                      <td class="text-right text-slate-700" x-text="row.verifiedPct == null ? '—' : pct(row.verifiedPct) + '%'"></td>
+                      <td class="text-right text-slate-700" x-text="row.storyCoveragePct == null ? '—' : pct(row.storyCoveragePct) + '%'"></td>
                     </tr>
                   </template>
                   <tr class="font-semibold border-t-2 border-slate-200">
@@ -518,6 +521,8 @@
                     <td class="text-right text-slate-900" x-text="summaryVal('requirements')"></td>
                     <td class="text-right text-slate-900" x-text="summaryVal('stories')"></td>
                     <td class="text-right text-slate-900" x-text="summaryVal('scenariosTotal')"></td>
+                    <td class="text-right text-slate-900" x-text="pct(summaryVal('verifiedPctProject')) + '%'"></td>
+                    <td class="text-right text-slate-900" x-text="pct(summaryVal('storyCoveragePctProject')) + '%'"></td>
                   </tr>
                 </tbody>
               </table>
