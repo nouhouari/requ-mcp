@@ -465,11 +465,11 @@
             <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1">Scenarios</div>
             <div class="text-3xl font-bold text-slate-900" x-text="summaryVal('scenariosTotal')"></div>
             <div class="text-xs text-slate-500 mt-1">
-              <span class="text-emerald-600 font-semibold" x-text="summaryVal('scenariosPassingProject')"></span> / <span x-text="summaryVal('scenariosLinkedProject')"></span> passing
+              <span class="text-emerald-600 font-semibold" x-text="summaryVal('scenariosPassingDistinct')"></span> / <span x-text="summaryVal('scenariosTotal')"></span> passing
             </div>
             <div class="progress-mini mt-2">
               <div class="progress-mini-fill bg-emerald-500"
-                :style="'width:' + (summaryVal('scenariosLinkedProject') > 0 ? (summaryVal('scenariosPassingProject') / summaryVal('scenariosLinkedProject') * 100).toFixed(1) : 0) + '%'">
+                :style="'width:' + (summaryVal('scenariosTotal') > 0 ? (summaryVal('scenariosPassingDistinct') / summaryVal('scenariosTotal') * 100).toFixed(1) : 0) + '%'">
               </div>
             </div>
           </div>

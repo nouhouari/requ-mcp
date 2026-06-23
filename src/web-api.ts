@@ -236,8 +236,9 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     storyCoveragePctCumulative: reportCumulative.summary.storyCoveragePct,
     verifiedPctProject:           reportAll.summary.verifiedPct,
     testedStoryCoveragePctProject: reportAll.summary.testedStoryCoveragePct,
-    scenariosPassingProject:      reportAll.summary.scenariosPassing,
-    scenariosLinkedProject:       reportAll.summary.scenariosLinked,
+    // Distinct stored scenarios whose latest result (across all phases) is a pass.
+    // (Not the per-story link sum, which double-counts multi-story scenarios.)
+    scenariosPassingDistinct:     scenarios.filter((sc) => statusAll.get(testKey(sc)) === "pass").length,
     activePhase,
   };
 }
