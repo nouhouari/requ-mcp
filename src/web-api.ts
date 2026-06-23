@@ -225,7 +225,8 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     // Raw counts partitioned across phases (each item counted once, earliest phase).
     byPhase: countsByPhase(requirements, stories, scenarios, phases).map((row) => {
       const cov = covByPhase.get(row.phase);
-      return { ...row, verifiedPct: cov ? cov.verifiedPct : null, storyCoveragePct: cov ? cov.storyCoveragePct : null };
+      // testedStoryCoveragePct = % of stories whose scenarios all pass (real "story coverage").
+      return { ...row, verifiedPct: cov ? cov.verifiedPct : null, testedStoryCoveragePct: cov ? cov.testedStoryCoveragePct : null };
     }),
     scenariosPassing: reportStrict.summary.scenariosPassing,
     scenariosLinked:  reportStrict.summary.scenariosLinked,
@@ -233,10 +234,10 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     storyCoveragePct:           reportStrict.summary.storyCoveragePct,
     verifiedPctCumulative:      reportCumulative.summary.verifiedPct,
     storyCoveragePctCumulative: reportCumulative.summary.storyCoveragePct,
-    verifiedPctProject:       reportAll.summary.verifiedPct,
-    storyCoveragePctProject:  reportAll.summary.storyCoveragePct,
-    scenariosPassingProject:  reportAll.summary.scenariosPassing,
-    scenariosLinkedProject:   reportAll.summary.scenariosLinked,
+    verifiedPctProject:           reportAll.summary.verifiedPct,
+    testedStoryCoveragePctProject: reportAll.summary.testedStoryCoveragePct,
+    scenariosPassingProject:      reportAll.summary.scenariosPassing,
+    scenariosLinkedProject:       reportAll.summary.scenariosLinked,
     activePhase,
   };
 }
