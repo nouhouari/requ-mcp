@@ -290,7 +290,9 @@ document.addEventListener('alpine:init', function () {
 
       async loadTrend() {
         this.loading.trend = true;
-        var d = await this._fetch(this.apiUrl('/api/coverage/trend'));
+        // Cumulative = project-to-date at each phase (the last point = project total),
+        // not strict per-phase coverage.
+        var d = await this._fetch(this.apiUrl('/api/coverage/trend?mode=cumulative'));
         if (d) this.trend = d;
         this.loading.trend = false;
       },
@@ -808,7 +810,7 @@ document.addEventListener('alpine:init', function () {
             return p.summary ? Number((p.summary.verifiedPct || 0).toFixed(1)) : 0;
           });
           _trendChart.data.datasets[1].data = data.map(function (p) {
-            return p.summary ? Number((p.summary.storyCoveragePct || 0).toFixed(1)) : 0;
+            return p.summary ? Number((p.summary.testedStoryCoveragePct || 0).toFixed(1)) : 0;
           });
           _trendChart.update('none');
         }
