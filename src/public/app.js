@@ -676,6 +676,35 @@ document.addEventListener('alpine:init', function () {
         return (v !== undefined && v !== null) ? v : 0;
       },
 
+      /**
+       * Project-global count of linked scenarios (all stories, every phase).
+       * `scenariosLinked` is phase-independent server-side, but we read the
+       * cumulative coverage payload when available so these KPI cards never
+       * reflect the active phase. Falls back to the summary value.
+       */
+      projectScenariosLinked() {
+        if (this.coverage && this.coverage.stories) {
+          return this.coverage.stories.reduce(function (n, s) {
+            return n + ((s.scenarios && s.scenarios.length) || 0);
+          }, 0);
+        }
+        return this.summaryVal('scenariosLinked');
+      },
+
+      /**
+       * Project-global count of passing scenarios. Aggregated from the
+       * cumulative coverage data (status carried across phases) so the value is
+       * the project total, not the active phase. Falls back to the summary value.
+       */
+      projectScenariosPassing() {
+        if (this.coverage && this.coverage.stories && this.coverageMode === 'cumulative') {
+          return this.coverage.stories.reduce(function (n, s) {
+            return n + (s.passing || 0);
+          }, 0);
+        }
+        return this.summaryVal('scenariosPassing');
+      },
+
       /** Format a percentage value (number) to one decimal place. */
       pct(v) {
         if (typeof v !== 'number') return '0.0';
