@@ -3,12 +3,15 @@
  * global Chart, Alpine
  */
 document.addEventListener('alpine:init', function () {
+  // Non-reactive registry for Chart.js instances. Storing a Chart on the Alpine
+  // component proxies the entire instance through Alpine reactivity; Chart.js'
+  // own deep internal mutations then recurse through the proxy, producing
+  // "Maximum call stack size exceeded" and corrupting its layout object
+  // ("Cannot set properties of undefined (setting 'fullSize')"). Keeping the
+  // instances in this closure variable keeps them raw and non-reactive.
+  var CHARTS = { trend: null, donut: null };
+
   Alpine.data('requApp', function () {
-    // Chart.js instances are kept in closure scope (NOT reactive component state):
-    // assigning a Chart to a reactive Alpine property makes Alpine deep-proxy its
-    // circular internals, causing a "Maximum call stack size exceeded" recursion.
-    var _trendChart = null;
-    var _donutChart = null;
     return {
 
       // ── Navigation ──────────────────────────────────────────────────────────
@@ -91,7 +94,15 @@ document.addEventListener('alpine:init', function () {
       scenarioTagMatchIds: null,
       scenarioTagError: '',
 
-      // ── Charts: instances live in factory-closure scope, not here (see top) ────
+      // ── Charts ───────────────────────────────────────────────────────────────
+      // NOTE: live Chart.js instances live in the non-reactive CHARTS closure
+      // object (see top of alpine:init), NOT on this reactive component — that
+      // is what prevents the reactivity-recursion crashes.
+      // $watch must be registered exactly once per chart, regardless of how many
+      // times x-if recycles the canvas / re-fires x-init. Stacking watchers is
+      // what produced the "Maximum call stack size exceeded" cascades.
+      _trendWatched: false,
+      _donutWatched: false,
 
       // ── SSE handle ───────────────────────────────────────────────────────────
       _sse: null,
@@ -810,15 +821,49 @@ document.addEventListener('alpine:init', function () {
       // Chart initialisation
       // =========================================================================
 
-      initTrendChart(canvas) {
+      /**
+       * True when an element is actually laid out (visible and has a non-zero
+       * box). Chart.js throws "fullSize" / sizing errors when asked to render
+       * into a 0×0 canvas — which happens while the Overview tab is hidden
+       * (x-show toggles display:none but keeps the DOM mounted).
+       */
+      _isLaidOut(el) {
+        if (!el) return false;
+        if (el.offsetParent === null) return false; // display:none somewhere up the tree
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      },
+
+      initTrendChart(canvas, tries) {
         var self = this;
         if (!canvas || typeof Chart === 'undefined') return;
+        // If x-if has already swapped this canvas out of the live DOM, abandon
+        // it — retrying a detached node never lays out and would recurse forever
+        // (that runaway rAF loop is what produced "Maximum call stack size
+        // exceeded"). A fresh x-init will fire for the replacement canvas.
+        if (!document.contains(canvas)) return;
+        // Wait until the canvas is really on-screen and sized. If layout hasn't
+        // settled yet, retry a bounded number of frames, then give up — the
+        // Overview tab becoming visible re-fires x-init, so we don't need to
+        // spin forever while the panel is hidden.
+        if (!self._isLaidOut(canvas)) {
+          var n = (tries || 0) + 1;
+          if (n > 30) return;
+          requestAnimationFrame(function () { self.initTrendChart(canvas, n); });
+          return;
+        }
+        // If we already have a live chart bound to THIS canvas, just refresh its
+        // data — never stack a second Chart instance on the same canvas.
+        if (CHARTS.trend && CHARTS.trend.canvas === canvas) {
+          if (self.trend) self._applyTrend(self.trend);
+          return;
+        }
         // Destroy any stale instance so the new canvas gets a fresh Chart.js context
         // (x-if can recycle the canvas reference while _trendChart still holds the old one).
-        if (_trendChart) { _trendChart.destroy(); _trendChart = null; }
+        if (CHARTS.trend) { CHARTS.trend.destroy(); CHARTS.trend = null; }
         var ctx = canvas.getContext('2d');
 
-        _trendChart = new Chart(ctx, {
+        CHARTS.trend = new Chart(ctx, {
           type: 'line',
           data: {
             labels: [],
@@ -873,27 +918,53 @@ document.addEventListener('alpine:init', function () {
           },
         });
 
-        function applyTrend(data) {
-          if (!data || !_trendChart) return;
-          _trendChart.data.labels = data.map(function (p) { return p.phaseName || p.phase; });
-          _trendChart.data.datasets[0].data = data.map(function (p) {
-            return p.summary ? Number((p.summary.verifiedPct || 0).toFixed(1)) : 0;
-          });
-          _trendChart.data.datasets[1].data = data.map(function (p) {
-            return p.summary ? Number((p.summary.testedStoryCoveragePct || 0).toFixed(1)) : 0;
-          });
-          _trendChart.update('none');
+        // Register the reactive watcher exactly once, ever — re-running init
+        // (x-if recycling the canvas) must not stack additional watchers.
+        if (!self._trendWatched) {
+          self._trendWatched = true;
+          self.$watch('trend', function (data) { self._applyTrend(data); });
         }
-
-        this.$watch('trend', applyTrend);
-        if (this.trend) applyTrend(this.trend);
+        if (this.trend) self._applyTrend(this.trend);
       },
 
-      initDonutChart(canvas) {
+      _applyTrend(data) {
+        var self = this;
+        if (!data || !CHARTS.trend) return;
+        // Don't push an update into a chart whose canvas is detached or 0×0
+        // (e.g. the Overview tab is hidden, or x-if just swapped the canvas):
+        // Chart.js' resize path throws "fullSize" on a zero-size canvas. The
+        // data will be applied when initTrendChart re-runs on a visible canvas.
+        if (!self._isLaidOut(CHARTS.trend.canvas)) return;
+        CHARTS.trend.data.labels = data.map(function (p) { return p.phaseName || p.phase; });
+        CHARTS.trend.data.datasets[0].data = data.map(function (p) {
+          return p.summary ? Number((p.summary.verifiedPct || 0).toFixed(1)) : 0;
+        });
+        CHARTS.trend.data.datasets[1].data = data.map(function (p) {
+          return p.summary ? Number((p.summary.storyCoveragePct || 0).toFixed(1)) : 0;
+        });
+        CHARTS.trend.update('none');
+      },
+
+      initDonutChart(canvas, tries) {
         var self = this;
         if (!canvas || typeof Chart === 'undefined') return;
+        // Abandon a canvas x-if has detached (see initTrendChart) — prevents the
+        // runaway retry recursion behind "Maximum call stack size exceeded".
+        if (!document.contains(canvas)) return;
+        // Wait for the canvas to be visible & sized (bounded; see initTrendChart).
+        if (!self._isLaidOut(canvas)) {
+          var n = (tries || 0) + 1;
+          if (n > 30) return;
+          requestAnimationFrame(function () { self.initDonutChart(canvas, n); });
+          return;
+        }
+        // Already bound to this canvas → refresh data only, don't re-create.
+        if (CHARTS.donut && CHARTS.donut.canvas === canvas) {
+          if (self.coverage) self._applyDonut(self.coverage);
+          return;
+        }
         // Same as trendChart: destroy any stale instance before re-init.
-        if (_donutChart) { _donutChart.destroy(); _donutChart = null; }
+        if (CHARTS.donut) { CHARTS.donut.destroy(); CHARTS.donut = null; }
         var ctx = canvas.getContext('2d');
 
         var COLORS = [
@@ -902,7 +973,7 @@ document.addEventListener('alpine:init', function () {
           '#f97316', '#84cc16',
         ];
 
-        _donutChart = new Chart(ctx, {
+        CHARTS.donut = new Chart(ctx, {
           type: 'doughnut',
           data: {
             labels: [],
@@ -934,21 +1005,29 @@ document.addEventListener('alpine:init', function () {
           },
         });
 
-        function applyDonut(data) {
-          if (!data || !_donutChart) return;
-          var by = data.byComponent || [];
-          _donutChart.data.labels = by.map(function (c) { return c.component; });
-          _donutChart.data.datasets[0].data = by.map(function (c) {
-            return Number((c.verifiedPct || 0).toFixed(1));
-          });
-          _donutChart.data.datasets[0].backgroundColor = by.map(function (_, i) {
-            return COLORS[i % COLORS.length];
-          });
-          _donutChart.update('none');
+        self._donutColors = COLORS;
+        if (!self._donutWatched) {
+          self._donutWatched = true;
+          self.$watch('coverage', function (data) { self._applyDonut(data); });
         }
+        if (this.coverage) self._applyDonut(this.coverage);
+      },
 
-        this.$watch('coverage', applyDonut);
-        if (this.coverage) applyDonut(this.coverage);
+      _applyDonut(data) {
+        var self = this;
+        if (!data || !CHARTS.donut) return;
+        // See _applyTrend: skip updates while the canvas is hidden/detached.
+        if (!self._isLaidOut(CHARTS.donut.canvas)) return;
+        var COLORS = self._donutColors || [];
+        var by = data.byComponent || [];
+        CHARTS.donut.data.labels = by.map(function (c) { return c.component; });
+        CHARTS.donut.data.datasets[0].data = by.map(function (c) {
+          return Number((c.verifiedPct || 0).toFixed(1));
+        });
+        CHARTS.donut.data.datasets[0].backgroundColor = by.map(function (_, i) {
+          return COLORS[i % COLORS.length];
+        });
+        CHARTS.donut.update('none');
       },
 
       // =========================================================================
