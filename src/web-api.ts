@@ -831,6 +831,10 @@ export async function handleWebRequest(
                 stories:      summary.stories as number,
                 verifiedPct:  summary.verifiedPct as number,
                 storyCoveragePct: summary.storyCoveragePct as number,
+                // Project-wide (cumulative) verified % — drives the "Project %" column
+                // and the "% project" KPI. Falls back to 0 for uninitialised stores.
+                verifiedPctCumulative: (summary.verifiedPctCumulative as number) ?? 0,
+                deliveredVerifiedPct:  (summary.deliveredVerifiedPct as number) ?? 0,
               };
             } catch { return null; }   // truly broken store (no schema) — skip silently
           })
