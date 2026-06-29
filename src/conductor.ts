@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { STORY_TAG_RE, testKey } from "./schema.js";
+import { storiesFromTags, testKey } from "./schema.js";
 
 /**
  * Reads the Conductor project's feature files directly off disk — no runtime
@@ -20,6 +20,11 @@ export interface ConductorScenario {
   tags: string[];
   /** Story ids parsed from tags, e.g. ["US-007"]. */
   stories: string[];
+  /** Raw gherkin text of the scenario block (leading tag lines through the line
+   *  before the next scenario / EOF, incl. any Examples). For storing as content. */
+  content: string;
+  /** The feature's Background: block text (steps that run before this scenario), if any. */
+  background: string;
 }
 
 export interface ConductorIndex {
@@ -51,31 +56,48 @@ function parseTags(line: string): string[] {
   return line.split(/\s+/).filter((t) => t.startsWith("@"));
 }
 
-function storiesFromTags(tags: string[]): string[] {
-  const out: string[] = [];
-  for (const t of tags) {
-    const m = t.match(STORY_TAG_RE);
-    if (m && !out.includes(m[1])) out.push(m[1]);
-  }
-  return out;
+interface PartialScenario {
+  feature: string;
+  name: string;
+  file: string;
+  tags: string[];
+  stories: string[];
+  /** Index of the first raw line of this scenario's block (its leading tags or
+   *  its Scenario: line when untagged). */
+  startIdx: number;
+  /** The feature's Background block text in scope for this scenario. */
+  background: string;
+}
+
+/** Join a raw-line range into a scenario content string, dropping trailing blanks. */
+function sliceContent(rawLines: string[], start: number, end: number): string {
+  let last = end;
+  while (last > start && rawLines[last - 1].trim() === "") last--;
+  return rawLines.slice(start, last).join("\n");
 }
 
 /**
- * Lightweight gherkin scan: pull the Feature name, each Scenario name, and the
- * tags attached to each (tag lines immediately above the Scenario, plus
- * feature-level tags above the `Feature:` line, which apply to all scenarios).
+ * Lightweight gherkin scan: pull the Feature name, each Scenario name, the tags
+ * attached to each (tag lines immediately above the Scenario, plus feature-level
+ * tags above the `Feature:` line), and the raw text span of each scenario block
+ * so it can be stored as content.
  */
 function parseFeatureFile(content: string, file: string): ConductorScenario[] {
   let feature = path.basename(file, ".feature");
   let featureTags: string[] = [];
   let pendingTags: string[] = [];
-  const scenarios: ConductorScenario[] = [];
+  let pendingTagsStart = -1;
+  let background = "";        // Background text currently in scope (per feature).
+  let bgStart = -1;          // Index where the current Background: block begins.
+  const rawLines = content.split(/\r?\n/);
+  const partials: PartialScenario[] = [];
 
-  for (const lineRaw of content.split(/\r?\n/)) {
-    const line = lineRaw.trim();
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i].trim();
     if (line === "" || line.startsWith("#")) continue;
 
     if (line.startsWith("@")) {
+      if (pendingTags.length === 0) pendingTagsStart = i;
       pendingTags.push(...parseTags(line));
       continue;
     }
@@ -84,25 +106,37 @@ function parseFeatureFile(content: string, file: string): ConductorScenario[] {
       feature = fm[1].trim();
       featureTags = pendingTags;
       pendingTags = [];
+      background = "";
+      bgStart = -1;
+      continue;
+    }
+    if (/^Background:/.test(line)) {
+      bgStart = i;             // capture from the Background: line itself
+      pendingTags = [];
       continue;
     }
     const sm = line.match(/^Scenario(?:\s+Outline)?:\s*(.+)$/);
     if (sm) {
       const tags = [...featureTags, ...pendingTags];
-      scenarios.push({
-        feature,
-        name: sm[1].trim(),
-        file,
-        tags,
-        stories: storiesFromTags(tags),
-      });
+      const startIdx = pendingTags.length ? pendingTagsStart : i;
+      // Finalize an open Background block at this scenario's boundary.
+      if (bgStart >= 0) { background = sliceContent(rawLines, bgStart, startIdx); bgStart = -1; }
+      partials.push({ feature, name: sm[1].trim(), file, tags, stories: storiesFromTags(tags), startIdx, background });
       pendingTags = [];
       continue;
     }
-    // Any other content line (steps, Background, Examples) ends a tag block.
+    // Any other content line (steps, Examples) ends a tag block.
     pendingTags = [];
   }
-  return scenarios;
+
+  // Each scenario's content runs from its block start to the next scenario's
+  // block start (or EOF for the last one).
+  return partials.map((p, idx) => {
+    const end = idx + 1 < partials.length ? partials[idx + 1].startIdx : rawLines.length;
+    const { startIdx, ...rest } = p;
+    return { ...rest, content: sliceContent(rawLines, startIdx, end) };
+  });
+  // Note: a scenario's `background` is the feature-level Background block in scope.
 }
 
 async function dirExists(p: string): Promise<boolean> {

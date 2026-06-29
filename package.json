@@ -1,6 +1,6 @@
 {
   "name": "requ-mcp",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "MCP server to track requirements coverage and its evolution across phases/releases. Pairs with Conductor for e2e tests; links scenarios to user stories via @US-xxx tags.",
   "type": "module",
   "bin": {
@@ -13,7 +13,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
+    "build": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\" && tsx scripts/gen-openapi.ts",
+    "gen:openapi": "tsx scripts/gen-openapi.ts",
     "dev": "tsx src/index.ts",
     "start:http": "REQU_TRANSPORT=http tsx src/index.ts",
     "smoke": "tsx scripts/smoke.ts",
@@ -47,6 +48,10 @@
     "access": "public"
   },
   "dependencies": {
+    "@asteasolutions/zod-to-openapi": "^7.3.4",
+    "@cucumber/gherkin": "^41.0.0",
+    "@cucumber/messages": "^33.0.3",
+    "@cucumber/tag-expressions": "^10.0.0",
     "@modelcontextprotocol/sdk": "^1.1.0",
     "better-sqlite3": "^12.10.0",
     "pg": "^8.13.0",

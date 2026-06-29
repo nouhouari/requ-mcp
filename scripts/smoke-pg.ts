@@ -10,10 +10,11 @@
 import os from "node:os";
 import path from "node:path";
 import url from "node:url";
+import { spawn } from "node:child_process";
 import { Pool } from "pg";
 import { PostgresStore, initPgPool } from "../src/postgres-store.js";
 import { buildExport, applyImport } from "../src/export-import.js";
-import type { Component, Requirement, UserStory, Phase, Execution, VcsRef, Config } from "../src/schema.js";
+import type { Component, Requirement, UserStory, Phase, Execution, VcsRef, Config, Scenario } from "../src/schema.js";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -37,7 +38,7 @@ const ts = () => new Date().toISOString();
 async function cleanup(pool: Pool, ...projectIds: string[]): Promise<void> {
   for (const pid of projectIds) {
     await pool.query("DELETE FROM executions WHERE project_id = $1", [pid]);
-    for (const t of ["config", "components", "requirements", "stories", "phases", "vcs_refs"]) {
+    for (const t of ["config", "components", "requirements", "stories", "scenarios", "phases", "vcs_refs"]) {
       await pool.query(`DELETE FROM ${t} WHERE project_id = $1`, [pid]);
     }
   }
@@ -187,6 +188,30 @@ async function main() {
     const missing = await storeA.updateVcsRef("MR-999", { state: "closed" });
     check("updateVcsRef returns null for unknown id", missing === null);
 
+    // --- scenarios ---
+    console.log("\n  [scenarios]");
+    const sc1: Scenario = {
+      feature: "Login", name: "Valid login", testKey: "Login::Valid login",
+      content: "Scenario: Valid login\n  When they log in\n  Then ok",
+      background: "Background:\n  Given a registered user",
+      tags: ["@US-001", "@smoke"], stories: ["US-001"], source: "manual", valid: true,
+      createdAt: ts(), updatedAt: ts(),
+    };
+    await storeA.writeScenario(sc1);
+    check("listScenarios returns 1", (await storeA.listScenarios()).length === 1);
+    const gotSc = await storeA.getScenario("Login::Valid login");
+    check("getScenario round-trips content + tags", gotSc?.content.includes("When they log in") === true && gotSc?.tags.includes("@smoke") === true);
+    check("getScenario round-trips background", gotSc?.background.includes("Given a registered user") === true, gotSc?.background);
+    check("getScenario null for missing", await storeA.getScenario("Nope::Nope") === null);
+    await storeA.writeScenario({ ...sc1, valid: false });
+    check("writeScenario upserts (valid=false)", (await storeA.getScenario("Login::Valid login"))?.valid === false);
+    check("listProjectIds includes this project", (await PostgresStore.listProjectIds()).includes(pidA));
+    check("deleteScenario removes the row", await storeA.deleteScenario("Login::Valid login") === true);
+    check("deleteScenario false for missing", await storeA.deleteScenario("Login::Valid login") === false);
+    // Restore one scenario for the export round-trip + HTTP checks below.
+    await storeA.writeScenario(sc1);
+    check("scenario isolated from project B", (await storeB.listScenarios()).length === 0);
+
     // --- static nextId ---
     console.log("\n  [nextId]");
     check("nextId REQ-001 from empty", PostgresStore.nextId("REQ", []) === "REQ-001");
@@ -211,11 +236,13 @@ async function main() {
     check("buildExport includes source name", payload.source?.name === "PG Smoke", payload.source);
     check("buildExport has requirements", payload.data.requirements.length === 1);
     check("buildExport has stories", payload.data.stories.length === 1);
+    check("buildExport has scenarios", payload.data.scenarios.length === 1, payload.data.scenarios);
     check("buildExport has executions for P1", payload.data.executions["P1"]?.length === 2);
 
     const report = await applyImport(storeB, payload);
     check("applyImport imports 1 requirement", report.imported.requirements === 1, report);
     check("applyImport imports 1 story", report.imported.stories === 1, report);
+    check("applyImport imports 1 scenario", report.imported.scenarios === 1, report);
     check("applyImport imports 1 component", report.imported.components === 1, report);
     check("applyImport imports executions", (report.imported.executions ?? 0) > 0, report);
     check("applyImport skips existing phases (B already has P1,P2)", (report.skipped.phases?.length ?? 0) === 2, report.skipped.phases);
@@ -228,6 +255,53 @@ async function main() {
     // Verify B now has the imported data
     check("B has requirement after import", (await storeB.listRequirements()).length === 1);
     check("B has story after import", (await storeB.listStories()).length === 1);
+
+    // --- HTTP mode without a filesystem root + scenario REST API + OpenAPI ---
+    console.log("\n  [http / db-native / rest api]");
+    const port = 8788 + (Date.now() % 1000);
+    const child = spawn(process.execPath, [path.join(repoRoot, "dist", "index.js")], {
+      env: { ...process.env, REQU_TRANSPORT: "http", REQU_PG_URL: PG_URL, REQU_PORT: String(port), REQU_PROJECTS: "", REQU_ROOT: "" },
+      stdio: "ignore",
+    });
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      // Wait for the server to accept connections (no filesystem project configured).
+      let up = false;
+      for (let i = 0; i < 50; i++) {
+        try { const v = await fetch(`${base}/api/version`); if (v.ok) { up = true; break; } } catch { /* retry */ }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      check("http server starts with no project root", up);
+
+      if (up) {
+        const projects = await (await fetch(`${base}/api/projects`)).json();
+        check("GET /api/projects discovers DB-native projects", Array.isArray(projects) && projects.some((p: any) => p.slug === pidA), projects);
+
+        const list = await (await fetch(`${base}/api/scenarios?project=${pidA}`)).json();
+        check("GET /api/scenarios returns stored scenario", list.total === 1 && list.scenarios[0].id === "Login::Valid login", list);
+
+        const smokeRes = await (await fetch(`${base}/api/scenarios?project=${pidA}&tags=${encodeURIComponent("@smoke and not @wip")}`)).json();
+        check("GET /api/scenarios tag expression filters", smokeRes.total === 1, smokeRes);
+
+        const withContent = await (await fetch(`${base}/api/scenarios?project=${pidA}&content=true`)).json();
+        check("GET /api/scenarios content=true inlines gherkin + background", typeof withContent.scenarios[0].content === "string" && withContent.scenarios[0].content.includes("When they log in") && withContent.scenarios[0].background.includes("Given a registered user"), withContent.scenarios[0]);
+
+        const single = await (await fetch(`${base}/api/scenarios/${encodeURIComponent("Login::Valid login")}?project=${pidA}`)).json();
+        check("GET /api/scenarios/:id returns content", single.id === "Login::Valid login" && single.content.includes("When they log in"), single);
+        check("GET /api/scenarios/:id returns background block", typeof single.background === "string" && single.background.includes("Given a registered user"), single.background);
+
+        const badReq = await fetch(`${base}/api/scenarios?project=${pidA}&tags=${encodeURIComponent("@a and")}`);
+        check("GET /api/scenarios 400 on invalid tag expression", badReq.status === 400, badReq.status);
+
+        const tagsRes = await (await fetch(`${base}/api/tags?project=${pidA}`)).json();
+        check("GET /api/tags lists tags with counts", Array.isArray(tagsRes) && tagsRes.some((t: any) => t.tag === "@smoke"), tagsRes);
+
+        const yamlText = await (await fetch(`${base}/api/openapi.yaml`)).text();
+        check("GET /api/openapi.yaml serves the OpenAPI 3.1 contract", yamlText.includes("openapi: 3.1") && yamlText.includes("/api/scenarios"), yamlText.slice(0, 40));
+      }
+    } finally {
+      child.kill("SIGKILL");
+    }
 
   } finally {
     await cleanup(cleanupPool, pidA, pidB);

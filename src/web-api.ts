@@ -6,18 +6,31 @@
  */
 
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import path from "node:path";
 import { promises as fsp, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { SqliteStore } from "./sqlite-store.js";
-import type { PostgresStore } from "./postgres-store.js";
+import { PostgresStore } from "./postgres-store.js";
 
 type AnyHttpStore = SqliteStore | PostgresStore;
+import { stringify as yamlStringify } from "yaml";
 import { indexConductor, scenariosByStory, validateTestRef } from "./conductor.js";
-import { buildReport, buildTrend, findGaps, resolveStatuses } from "./coverage.js";
-import type { CoverageMode } from "./schema.js";
-import { ExportPayload, testKey } from "./schema.js";
+import {
+  buildReport,
+  buildTrend,
+  findGaps,
+  resolveStatuses,
+  resolveScenariosByStory,
+  filterScenarios,
+  countsByPhase,
+  requirementIdsForScenario,
+  type ScenariosByStory,
+  type ScenarioFilter,
+} from "./coverage.js";
+import { ExportPayload, testKey, type CoverageMode, type Scenario, type TestStatus, type UserStory } from "./schema.js";
 import { buildExport, applyImport } from "./export-import.js";
+import { buildOpenApiDocument } from "./openapi.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -174,24 +187,19 @@ async function serveIndexHtml(res: ServerResponse): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function computeSummary(store: AnyHttpStore): Promise<Record<string, unknown>> {
-  const [requirements, stories, components, phases] = await Promise.all([
+  const [requirements, stories, components, phases, scenarios] = await Promise.all([
     store.listRequirements(),
     store.listStories(),
     store.listComponents(),
     store.listPhases(),
+    store.listScenarios(),
   ]);
 
   const activePhase = await store.resolvePhaseId();
   const executionsByPhase = await store.readAllExecutions();
 
-  let storyMap: Map<string, import("./conductor.js").ConductorScenario[]> = new Map();
-  try {
-    const conductorRoot = await store.conductorRoot();
-    const index = await indexConductor(conductorRoot);
-    storyMap = scenariosByStory(index);
-  } catch {
-    // Conductor not available yet — use empty map.
-  }
+  // Stored scenarios win; disk feature files are the legacy fallback.
+  const storyMap: ScenariosByStory = await resolveScenariosByStory(store);
 
   const vcsRefs = await store.listVcsRefs();
 
@@ -201,18 +209,36 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
   const statusCumulative = resolveStatuses(executionsByPhase, phases, activePhase, "cumulative");
   const reportCumulative = buildReport(requirements, stories, storyMap, statusCumulative, activePhase, "cumulative", vcsRefs, phases);
 
+  const statusAll = resolveStatuses(executionsByPhase, phases, null, "cumulative");
+  const reportAll = buildReport(requirements, stories, storyMap, statusAll, null, "cumulative", vcsRefs, phases);
+
+  const trendStrict = buildTrend(requirements, stories, storyMap, executionsByPhase, phases, "strict");
+  const covByPhase = new Map(trendStrict.map((p) => [p.phase, p.summary]));
+
   return {
     requirements: requirements.length,
     stories: stories.length,
     components: components.length,
     phases: phases.length,
     vcsRefs: vcsRefs.length,
+    scenariosTotal: scenarios.length,
+    // Raw counts partitioned across phases (each item counted once, earliest phase).
+    byPhase: countsByPhase(requirements, stories, scenarios, phases).map((row) => {
+      const cov = covByPhase.get(row.phase);
+      // testedStoryCoveragePct = % of stories whose scenarios all pass (real "story coverage").
+      return { ...row, verifiedPct: cov ? cov.verifiedPct : null, testedStoryCoveragePct: cov ? cov.testedStoryCoveragePct : null };
+    }),
     scenariosPassing: reportStrict.summary.scenariosPassing,
     scenariosLinked:  reportStrict.summary.scenariosLinked,
     verifiedPct:                reportStrict.summary.verifiedPct,
     storyCoveragePct:           reportStrict.summary.storyCoveragePct,
     verifiedPctCumulative:      reportCumulative.summary.verifiedPct,
     storyCoveragePctCumulative: reportCumulative.summary.storyCoveragePct,
+    verifiedPctProject:           reportAll.summary.verifiedPct,
+    testedStoryCoveragePctProject: reportAll.summary.testedStoryCoveragePct,
+    // Distinct stored scenarios whose latest result (across all phases) is a pass.
+    // (Not the per-story link sum, which double-counts multi-story scenarios.)
+    scenariosPassingDistinct:     scenarios.filter((sc) => statusAll.get(testKey(sc)) === "pass").length,
     activePhase,
   };
 }
@@ -226,27 +252,69 @@ async function buildCoverageData(store: AnyHttpStore): Promise<{
   stories: import("./schema.js").UserStory[];
   phases: import("./schema.js").Phase[];
   executionsByPhase: Map<string, import("./schema.js").Execution[]>;
-  storyMap: Map<string, import("./conductor.js").ConductorScenario[]>;
+  storyMap: ScenariosByStory;
   vcsRefs: import("./schema.js").VcsRef[];
 }> {
-  const [requirements, stories, phases, executionsByPhase, vcsRefs] = await Promise.all([
+  const [requirements, stories, phases, executionsByPhase, vcsRefs, storyMap] = await Promise.all([
     store.listRequirements(),
     store.listStories(),
     store.listPhases(),
     store.readAllExecutions(),
     store.listVcsRefs(),
+    resolveScenariosByStory(store),
   ]);
 
-  let storyMap: Map<string, import("./conductor.js").ConductorScenario[]> = new Map();
-  try {
-    const conductorRoot = await store.conductorRoot();
-    const index = await indexConductor(conductorRoot);
-    storyMap = scenariosByStory(index);
-  } catch {
-    // Conductor not available — use empty map.
-  }
-
   return { requirements, stories, phases, executionsByPhase, storyMap, vcsRefs };
+}
+
+// ---------------------------------------------------------------------------
+// Scenario API helpers
+// ---------------------------------------------------------------------------
+
+function splitCsv(v: string | null): string[] | undefined {
+  if (!v) return undefined;
+  const out = v.split(",").map((s) => s.trim()).filter(Boolean);
+  return out.length ? out : undefined;
+}
+
+function intParam(v: string | null): number | undefined {
+  if (v === null) return undefined;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function scenarioSummary(
+  sc: Scenario,
+  storyById: Map<string, UserStory>,
+  status?: TestStatus,
+  includeContent = false,
+): Record<string, unknown> {
+  return {
+    id: sc.testKey,
+    feature: sc.feature,
+    name: sc.name,
+    file: sc.file,
+    tags: sc.tags,
+    storyIds: sc.stories,
+    requirementIds: requirementIdsForScenario(sc, storyById),
+    valid: sc.valid,
+    hasContent: sc.content.trim().length > 0,
+    hasBackground: sc.background.trim().length > 0,
+    ...(status ? { status } : {}),
+    ...(includeContent ? { content: sc.content, background: sc.background } : {}),
+  };
+}
+
+/** Discover DB-native Postgres projects and attach them to the shared store map. */
+async function ensureDbProjects(stores: Map<string, AnyHttpStore>): Promise<void> {
+  if (!process.env.REQU_PG_URL) return;
+  let ids: string[];
+  try { ids = await PostgresStore.listProjectIds(); } catch { return; }
+  for (const id of ids) {
+    if (stores.has(id)) continue;
+    if ([...stores.values()].some((s) => s instanceof PostgresStore && s.projectId === id)) continue;
+    stores.set(id, new PostgresStore(path.join(os.tmpdir(), "requ", id), id));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +406,11 @@ export async function handleWebRequest(
     return true;
   }
 
+  // Discover DB-native projects so the dashboard/API see them without env preload.
+  if (rawUrl.startsWith("/api/") || rawUrl === "/events" || rawUrl.startsWith("/events?")) {
+    await ensureDbProjects(stores);
+  }
+
   // -------------------------------------------------------------------------
   // SSE — GET /events
   // -------------------------------------------------------------------------
@@ -404,8 +477,29 @@ export async function handleWebRequest(
 
     // --- GET /api/projects --- (no store needed)
     if (matchRoute(pathname, method, "/api/projects", "GET") !== null) {
-      const list = [...stores.entries()].map(([slug, s]) => ({ slug, root: s.root }));
+      const list = await Promise.all(
+        [...stores.entries()].map(async ([slug, s]) => {
+          let key: string | null = null;
+          let name: string | null = null;
+          try { const cfg = await s.readConfig(); key = cfg.key ?? null; name = cfg.name; } catch { /* uninitialized */ }
+          return { slug, key, name, root: s.root };
+        }),
+      );
       jsonOk(res, list);
+      return true;
+    }
+
+    // --- GET /api/openapi.json --- (no store needed; the scenario API contract)
+    if (matchRoute(pathname, method, "/api/openapi.json", "GET") !== null) {
+      jsonOk(res, buildOpenApiDocument(SERVER_VERSION));
+      return true;
+    }
+
+    // --- GET /api/openapi.yaml ---
+    if (matchRoute(pathname, method, "/api/openapi.yaml", "GET") !== null) {
+      const body = yamlStringify(buildOpenApiDocument(SERVER_VERSION));
+      res.writeHead(200, { ...CORS_HEADERS, "Content-Type": "application/yaml; charset=utf-8", "Content-Length": Buffer.byteLength(body) });
+      res.end(body);
       return true;
     }
 
@@ -614,6 +708,26 @@ export async function handleWebRequest(
       }
     }
 
+    // --- GET /api/stories/:id/scenarios --- (batch, with gherkin content)
+    {
+      const params = matchRoute(pathname, method, "/api/stories/:id/scenarios", "GET");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const [scenarios, stories] = await Promise.all([r.store.listScenarios(), r.store.listStories()]);
+          const storyById = new Map(stories.map((s) => [s.id, s]));
+          const list = scenarios
+            .filter((sc) => sc.stories.includes(params.id))
+            .map((sc) => scenarioSummary(sc, storyById, undefined, true));
+          jsonOk(res, list);
+        } catch (err) {
+          jsonError(res, 500, String(err));
+        }
+        return true;
+      }
+    }
+
     // --- GET /api/components ---
     if (matchRoute(pathname, method, "/api/components", "GET") !== null) {
       const r = resolveStore(stores, searchParams);
@@ -712,7 +826,10 @@ export async function handleWebRequest(
         if (mode === null) return true;
         const { requirements, stories, phases, executionsByPhase, storyMap } = await buildCoverageData(r.store);
         const phaseParam = searchParams.get("phase");
-        const phaseId = phaseParam ?? (await r.store.resolvePhaseId());
+        // Absent param → default to the active/resolved phase (API back-compat).
+        // Explicit empty (?phase=) → null = "All phases" (the web UI sends this).
+        const phaseId =
+          phaseParam === null ? await r.store.resolvePhaseId() : phaseParam || null;
         const status = resolveStatuses(executionsByPhase, phases, phaseId, mode);
         const gaps = findGaps(requirements, stories, storyMap, status, phaseId, mode, phases);
         jsonOk(res, gaps);
@@ -731,10 +848,123 @@ export async function handleWebRequest(
         if (mode === null) return true;
         const { requirements, stories, phases, executionsByPhase, storyMap, vcsRefs } = await buildCoverageData(r.store);
         const phaseParam = searchParams.get("phase");
-        const phaseId = phaseParam ?? (await r.store.resolvePhaseId());
+        // Absent param → default to the active/resolved phase (API back-compat).
+        // Explicit empty (?phase=) → null = "All phases" (the web UI sends this).
+        const phaseId =
+          phaseParam === null ? await r.store.resolvePhaseId() : phaseParam || null;
         const status = resolveStatuses(executionsByPhase, phases, phaseId, mode);
         const report = buildReport(requirements, stories, storyMap, status, phaseId, mode, vcsRefs, phases);
-        jsonOk(res, report);
+        // Enrich scenario entries with id (testKey) + hasContent so the UI knows
+        // whether a readable gherkin body exists, without inlining content here.
+        const storedByKey = new Map((await r.store.listScenarios()).map((s) => [s.testKey, s]));
+        const enriched = {
+          ...report,
+          stories: report.stories.map((st) => ({
+            ...st,
+            scenarios: st.scenarios.map((scv) => {
+              const tk = testKey({ feature: scv.feature, name: scv.name });
+              const stored = storedByKey.get(tk);
+              return { ...scv, id: tk, hasContent: !!stored && stored.content.trim().length > 0 };
+            }),
+          })),
+        };
+        jsonOk(res, enriched);
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- GET /api/scenarios --- (query by story/requirement/phase/tags/feature/q/valid)
+    if (matchRoute(pathname, method, "/api/scenarios", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const [scenarios, stories, phases, requirements] = await Promise.all([
+          r.store.listScenarios(),
+          r.store.listStories(),
+          r.store.listPhases(),
+          r.store.listRequirements(),
+        ]);
+        const validParam = searchParams.get("valid");
+        const filter: ScenarioFilter = {
+          story:       splitCsv(searchParams.get("story")),
+          requirement: splitCsv(searchParams.get("requirement")),
+          phase:       searchParams.get("phase") ?? undefined,
+          mode:        (searchParams.get("mode") as CoverageMode | null) ?? undefined,
+          feature:     searchParams.get("feature") ?? undefined,
+          q:           searchParams.get("q") ?? undefined,
+          valid:       validParam === null ? undefined : validParam === "true",
+          tags:        searchParams.get("tags") ?? undefined,
+        };
+        let filtered: Scenario[];
+        try {
+          filtered = filterScenarios(scenarios, stories, phases, requirements, filter);
+        } catch (e) {
+          jsonError(res, 400, `Invalid filter: ${(e as Error).message}`);
+          return true;
+        }
+
+        const storyById = new Map(stories.map((s) => [s.id, s]));
+        let statusMap: Map<string, TestStatus> | null = null;
+        const phaseParam = searchParams.get("phase");
+        if (phaseParam) {
+          const execByPhase = await r.store.readAllExecutions();
+          statusMap = resolveStatuses(execByPhase, phases, phaseParam, filter.mode ?? "cumulative");
+        }
+        const includeContent = searchParams.get("content") === "true";
+        const offset = intParam(searchParams.get("offset")) ?? 0;
+        const limit = intParam(searchParams.get("limit"));
+        const total = filtered.length;
+        const page = limit != null ? filtered.slice(offset, offset + limit) : filtered.slice(offset);
+        jsonOk(res, {
+          total,
+          scenarios: page.map((sc) => scenarioSummary(sc, storyById, statusMap?.get(sc.testKey), includeContent)),
+        });
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- GET /api/scenarios/:id --- (single scenario by testKey, with content)
+    {
+      const params = matchRoute(pathname, method, "/api/scenarios/:id", "GET");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const sc = await r.store.getScenario(params.id);
+          if (!sc) { jsonError(res, 404, `Scenario ${params.id} not found`); return true; }
+          jsonOk(res, {
+            id: sc.testKey,
+            feature: sc.feature,
+            name: sc.name,
+            content: sc.content,
+            background: sc.background,
+            tags: sc.tags,
+            storyIds: sc.stories,
+            valid: sc.valid,
+            file: sc.file ?? null,
+            source: sc.source,
+          });
+        } catch (err) {
+          jsonError(res, 500, String(err));
+        }
+        return true;
+      }
+    }
+
+    // --- GET /api/tags --- (distinct tags with counts)
+    if (matchRoute(pathname, method, "/api/tags", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const scenarios = await r.store.listScenarios();
+        const counts = new Map<string, number>();
+        for (const sc of scenarios) for (const t of sc.tags) counts.set(t, (counts.get(t) ?? 0) + 1);
+        const list = [...counts.entries()].map(([tag, count]) => ({ tag, count })).sort((a, b) => a.tag.localeCompare(b.tag));
+        jsonOk(res, list);
       } catch (err) {
         jsonError(res, 500, String(err));
       }

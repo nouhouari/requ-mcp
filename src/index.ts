@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import url from "node:url";
 import { Store } from "./storage.js";
@@ -19,6 +20,7 @@ import {
   StoryStatus,
   TestStatus,
   testKey,
+  storiesFromTags,
   VcsRefKind,
   VcsRefState,
   type AcceptanceCriterion,
@@ -26,6 +28,7 @@ import {
   type Execution,
   type Phase,
   type Requirement,
+  type Scenario as TScenario,
   type UserStory,
   type VcsRef,
 } from "./schema.js";
@@ -38,7 +41,20 @@ import {
   validateTestRef,
   type ConductorIndex,
 } from "./conductor.js";
-import { buildReport, buildTrend, findGaps, resolveStatuses, type ScenariosByStory } from "./coverage.js";
+import {
+  buildReport,
+  buildTrend,
+  findGaps,
+  resolveStatuses,
+  resolveScenariosByStory,
+  groupByStory,
+  filterScenarios,
+  requirementPhaseMap,
+  requirementIdsForScenario,
+  type ScenariosByStory,
+  type ScenarioFilter,
+} from "./coverage.js";
+import { validateGherkin } from "./gherkin.js";
 import { parseCucumberJson } from "./ingest.js";
 import { buildExport, applyImport } from "./export-import.js";
 
@@ -70,25 +86,28 @@ function slugify(root: string): string {
 }
 
 /**
- * Pre-load projects from env vars at HTTP server startup.
- * REQU_PROJECTS: comma-separated absolute paths.
- * Falls back to REQU_ROOT if REQU_PROJECTS is not set.
- * When REQU_PG_URL is set, uses PostgresStore; otherwise uses SqliteStore.
+ * Pre-load projects from env vars at HTTP server startup (legacy SQLite mode only).
+ * REQU_PROJECTS: comma-separated absolute paths. Falls back to REQU_ROOT.
+ *
+ * In Postgres mode this is a no-op: project_ids come from the DB
+ * (attachAllDbProjects) and from init_project — never from a filesystem path.
+ * Slugifying REQU_ROOT/REQU_PROJECTS here would mint a phantom project named
+ * after the server's working directory (e.g. "requ-mcp").
  */
 function loadProjectsFromEnv(): void {
+  if (process.env.REQU_PG_URL) return;
   const raw = process.env.REQU_PROJECTS ?? process.env.REQU_ROOT;
   if (!raw) return;
   // Deduplicate by resolved root — duplicate paths would share one .db file.
   const roots = [...new Set(
     raw.split(",").map((s) => s.trim()).filter(Boolean).map((p) => path.resolve(p)),
   )];
-  const usePg = !!process.env.REQU_PG_URL;
   // Scope REQU_DB to single-project SQLite mode only.
-  const dbOverride = !usePg && roots.length === 1 ? (process.env.REQU_DB ?? undefined) : undefined;
+  const dbOverride = roots.length === 1 ? (process.env.REQU_DB ?? undefined) : undefined;
   for (const root of roots) {
     try {
       const slug = slugify(root);
-      _stores.set(slug, usePg ? new PostgresStore(root, slug) : new SqliteStore(root, dbOverride));
+      _stores.set(slug, new SqliteStore(root, dbOverride));
     } catch (err) {
       throw new Error(
         `Failed to open store for project ${root}: ${(err as Error).message}`,
@@ -142,25 +161,102 @@ async function resolveRoot(server: McpServer, explicit?: string): Promise<string
   return roots[0] ?? process.cwd();
 }
 
-async function getStore(server: McpServer, explicit?: string): Promise<AnyStore> {
+/** Synthetic root for DB-native projects (no filesystem .requ/). */
+function synthRoot(slug: string): string {
+  return path.join(os.tmpdir(), "requ", slug);
+}
+
+/** URL-safe project_id from a user-supplied selector (slug or name). */
+function toSlug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^-+|-+$/g, "") || "project";
+}
+
+/** Attach every project_id present in the Postgres DB to `_stores` (lazy discovery). */
+async function attachAllDbProjects(): Promise<void> {
+  if (!process.env.REQU_PG_URL) return;
+  let ids: string[];
+  try { ids = await PostgresStore.listProjectIds(); } catch { return; }
+  for (const id of ids) {
+    if (_stores.has(id)) continue;
+    if ([..._stores.values()].some((s) => s instanceof PostgresStore && s.projectId === id)) continue;
+    _stores.set(id, new PostgresStore(synthRoot(id), id));
+  }
+}
+
+/** Find a loaded store by slug (the `_stores` key) or by config.key. */
+async function resolveLoadedBySlugOrKey(sel: string): Promise<AnyStore | null> {
+  if (_stores.has(sel)) return _stores.get(sel)!;
+  for (const store of _stores.values()) {
+    try { const cfg = await store.readConfig(); if (cfg.key === sel) return store; } catch { /* skip */ }
+  }
+  return null;
+}
+
+async function getStore(server: McpServer, explicit?: string, allowCreate = false): Promise<AnyStore> {
   if (process.env.REQU_TRANSPORT === "http") {
-    const root = await resolveRoot(server, explicit);
-    // Find an existing store for this root, or create a new one.
-    for (const store of _stores.values()) {
-      if (store.root === root) return store;
+    const usePg = !!process.env.REQU_PG_URL;
+
+    if (explicit) {
+      // 1. Already-loaded project by slug or key.
+      let found = await resolveLoadedBySlugOrKey(explicit);
+      if (found) return found;
+      if (usePg) {
+        // 2. Discover DB projects, retry slug/key.
+        await attachAllDbProjects();
+        found = await resolveLoadedBySlugOrKey(explicit);
+        if (found) return found;
+        // 3. Unknown selector. Only init_project may mint a new project_id, and only
+        //    from a plain name — never a filesystem path. Lookups never create.
+        if (!allowCreate) {
+          throw new Error(
+            `Unknown project '${explicit}'. Known: [${[..._stores.keys()].join(", ")}]`,
+          );
+        }
+        if (/[/\\]/.test(explicit)) {
+          throw new Error(
+            `Invalid project name '${explicit}': pass a plain name, not a filesystem path.`,
+          );
+        }
+        const slug = toSlug(explicit);
+        const store = new PostgresStore(synthRoot(slug), slug);
+        _stores.set(slug, store);
+        return store;
+      }
+      // SQLite legacy: treat `explicit` as a filesystem path.
+      const root = path.resolve(explicit);
+      for (const store of _stores.values()) if (store.root === root) return store;
+      const slug = slugify(root);
+      const store = new SqliteStore(root);
+      _stores.set(slug, store);
+      return store;
     }
-    const slug = slugify(root);
-    const store = process.env.REQU_PG_URL
-      ? new PostgresStore(root, slug)
-      : new SqliteStore(root);
-    _stores.set(slug, store);
-    return store;
+
+    // No explicit selector.
+    if (usePg) await attachAllDbProjects();
+    if (_stores.size === 1) return [..._stores.values()][0];
+    if (_stores.size === 0) {
+      // Postgres mode never derives a project_id from cwd/workspace root — that mints
+      // a phantom project named after the server's directory. Require an explicit name.
+      if (usePg) {
+        throw new Error("No requ project exists; run init_project with an explicit name.");
+      }
+      // Legacy local SQLite dev: fall back to filesystem resolution (cwd/workspace root).
+      const root = await resolveRoot(server, explicit);
+      const slug = slugify(root);
+      const store = new SqliteStore(root);
+      _stores.set(slug, store);
+      return store;
+    }
+    throw new Error(
+      `Multiple projects loaded; pass projectPath=<slug|key>. Known: [${[..._stores.keys()].join(", ")}]`,
+    );
   }
   return new Store(await resolveRoot(server, explicit));
 }
 
 async function getStoreByKey(key: string, server: McpServer): Promise<AnyStore | null> {
-  // HTTP mode: search loaded stores.
+  // HTTP mode: discover DB-native projects, then search loaded stores.
+  await attachAllDbProjects();
   for (const store of _stores.values()) {
     try {
       const cfg = await store.readConfig();
@@ -211,7 +307,7 @@ function tool(
 
 /** Build a fresh McpServer with every collected tool registered on it. */
 function createServer(): McpServer {
-  const server = new McpServer({ name: "requ-mcp", version: "0.5.0" });
+  const server = new McpServer({ name: "requ-mcp", version: "0.7.1" });
   for (const { name, config, handler } of toolDefs) {
     const inputSchema = { ...(config.inputSchema ?? {}), projectPath: projectPathSchema };
     server.registerTool(
@@ -219,7 +315,7 @@ function createServer(): McpServer {
       { title: config.title, description: config.description, inputSchema },
       async (args: any) => {
         try {
-          const store = await getStore(server, args.projectPath);
+          const store = await getStore(server, args.projectPath, name === "init_project");
           return (await handler(args, store)) as ReturnType<typeof json>;
         } catch (e) {
           return fail((e as Error).message);
@@ -241,13 +337,14 @@ function createServer(): McpServer {
     },
     async () => {
       try {
-        // HTTP mode: _stores has one entry per loaded project root.
+        // HTTP mode: discover DB-native projects, then enumerate loaded stores.
+        await attachAllDbProjects();
         if (_stores.size > 0) {
-          const projects: Array<{ key: string | null; name: string; root: string }> = [];
-          for (const store of _stores.values()) {
+          const projects: Array<{ slug: string; key: string | null; name: string; root: string }> = [];
+          for (const [slug, store] of _stores.entries()) {
             try {
               const cfg = await store.readConfig();
-              projects.push({ key: cfg.key ?? null, name: cfg.name, root: (store as any).root ?? "" });
+              projects.push({ slug, key: cfg.key ?? null, name: cfg.name, root: (store as any).root ?? "" });
             } catch { /* skip uninitialized */ }
           }
           return json(projects);
@@ -336,6 +433,19 @@ async function loadConductorIndex(store: AnyStore): Promise<{ root: string; inde
   return { root, index: await indexConductor(root) };
 }
 
+/** testKeys of scenarios linked to a story: stored scenarios win, else disk tags. */
+async function linkedKeysForStore(store: AnyStore): Promise<Set<string>> {
+  const stored = await store.listScenarios();
+  if (stored.length > 0) {
+    return new Set(stored.filter((s) => s.stories.length > 0).map((s) => s.testKey));
+  }
+  try {
+    return linkedScenarioKeys(await indexConductor(await store.conductorRoot()));
+  } catch {
+    return new Set();
+  }
+}
+
 // ===========================================================================
 // Setup
 // ===========================================================================
@@ -363,9 +473,11 @@ tool(
     const existing = (await store.isInitialized()) ? await store.readConfig() : null;
     const conductorPath = args.conductorPath ?? existing?.conductorPath ?? ".";
 
+    // DB-native HTTP projects have no filesystem Conductor folder; skip the hard check.
+    const isHttpPg = process.env.REQU_TRANSPORT === "http" && !!process.env.REQU_PG_URL;
     const conductorAbs = store.resolvePath(conductorPath);
     const conductor = await inspectConductorProject(conductorAbs);
-    if (!conductor.isConductorProject && !args.force) {
+    if (!conductor.isConductorProject && !args.force && !isHttpPg) {
       return fail(
         conductor.exists
           ? `'${conductorAbs}' exists but doesn't look like a Conductor project (no features/ directory or cucumber config). Pass force:true to init anyway, or set the correct conductorPath.`
@@ -713,7 +825,6 @@ tool(
       requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1).describe("IDs of existing requirements this story implements."),
       description: z.string().optional(),
       acceptanceCriteria: z.array(z.string()).optional().describe("Descriptive criterion texts."),
-      phase: z.string().optional().describe("Target phase this story is planned for (e.g. 'P1'). Defaults to the active phase; pass '' to leave unassigned."),
       id: z.string().regex(/^US-\d+$/).optional(),
     },
   },
@@ -722,9 +833,6 @@ tool(
     const missing: string[] = [];
     for (const reqId of args.requirements) if (!(await store.getRequirement(reqId))) missing.push(reqId);
     if (missing.length) return fail(`Unknown requirement(s): ${missing.join(", ")}`);
-
-    const phase = await resolveAssignedPhase(store, args.phase);
-    if (phase.error) return phase.error;
 
     const existing = await store.listStories();
     const id = args.id ?? Store.nextId("US", existing.map((s) => s.id));
@@ -741,7 +849,6 @@ tool(
       requirements: args.requirements,
       acceptanceCriteria,
       status: "draft",
-      ...(phase.value ? { phase: phase.value } : {}),
       createdAt: now(),
       updatedAt: now(),
     };
@@ -758,7 +865,7 @@ tool(
     inputSchema: {
       status: StoryStatus.optional(),
       requirement: z.string().regex(/^REQ-\d+$/).optional(),
-      phase: z.string().optional().describe("Filter by assigned target phase (exact match)."),
+      phase: z.string().optional().describe("Filter by target phase, derived from the story's requirements: matches if any linked requirement is assigned to this phase."),
     },
   },
   async (args, store) => {
@@ -766,7 +873,11 @@ tool(
     let stories = await store.listStories();
     if (args.status) stories = stories.filter((s) => s.status === args.status);
     if (args.requirement) stories = stories.filter((s) => s.requirements.includes(args.requirement));
-    if (args.phase) stories = stories.filter((s) => s.phase === args.phase);
+    if (args.phase) {
+      // A story has no phase of its own — derive it from its requirements' phases.
+      const reqPhaseById = requirementPhaseMap(await store.listRequirements());
+      stories = stories.filter((s) => s.requirements.some((rid) => reqPhaseById.get(rid) === args.phase));
+    }
     return json(stories);
   },
 );
@@ -782,7 +893,7 @@ tool(
       query:       z.string().min(1).describe("Substring to search for (case-insensitive)."),
       status:      StoryStatus.optional(),
       requirement: z.string().regex(/^REQ-\d+$/).optional(),
-      phase:       z.string().optional().describe("Filter by assigned target phase (exact match)."),
+      phase:       z.string().optional().describe("Filter by target phase, derived from the story's requirements: matches if any linked requirement is assigned to this phase."),
     },
   },
   async (args, store) => {
@@ -791,7 +902,11 @@ tool(
     let stories = await store.listStories();
     if (args.status)      stories = stories.filter((s) => s.status === args.status);
     if (args.requirement) stories = stories.filter((s) => s.requirements.includes(args.requirement));
-    if (args.phase)       stories = stories.filter((s) => s.phase === args.phase);
+    if (args.phase) {
+      // A story has no phase of its own — derive it from its requirements' phases.
+      const reqPhaseById = requirementPhaseMap(await store.listRequirements());
+      stories = stories.filter((s) => s.requirements.some((rid) => reqPhaseById.get(rid) === args.phase));
+    }
     const matches = stories.filter(
       (s) =>
         s.title.toLowerCase().includes(q) ||
@@ -814,8 +929,8 @@ tool(
     await ensureInit(store);
     const story = await store.getStory(args.id);
     if (!story) return fail(`Story ${args.id} not found.`);
-    const { index } = await loadConductorIndex(store);
-    const scs = scenariosByStory(index).get(args.id) ?? [];
+    const byStory = await resolveScenariosByStory(store);
+    const scs = byStory.get(args.id) ?? [];
     const [phases, execByPhase] = await Promise.all([store.listPhases(), store.readAllExecutions()]);
     const phaseId = await store.resolvePhaseId();
     const status = resolveStatuses(execByPhase, phases, phaseId, "cumulative");
@@ -825,6 +940,9 @@ tool(
       linkedScenarios: scs.map((sc) => ({
         feature: sc.feature,
         name: sc.name,
+        // content/tags present only for stored scenarios.
+        content: (sc as Partial<TScenario>).content,
+        tags: (sc as Partial<TScenario>).tags,
         status: status.get(testKey(sc)) ?? "pending",
       })),
     });
@@ -842,7 +960,6 @@ tool(
       description: z.string().optional(),
       status: StoryStatus.optional(),
       requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1).optional(),
-      phase: z.string().optional().describe("Target phase (e.g. 'P1'). Pass '' to clear the assignment."),
     },
   },
   async (args, store) => {
@@ -854,14 +971,6 @@ tool(
       for (const reqId of args.requirements) if (!(await store.getRequirement(reqId))) missing.push(reqId);
       if (missing.length) return fail(`Unknown requirement(s): ${missing.join(", ")}`);
       story.requirements = args.requirements;
-    }
-    if (args.phase !== undefined) {
-      if (args.phase === "") story.phase = undefined;
-      else {
-        const error = await phaseError(store, args.phase);
-        if (error) return error;
-        story.phase = args.phase;
-      }
     }
     if (args.title !== undefined) story.title = args.title;
     if (args.description !== undefined) story.description = args.description;
@@ -1002,8 +1111,32 @@ tool(
   },
   async (_args, store) => {
     await ensureInit(store);
-    const [{ root, index }, stories] = await Promise.all([loadConductorIndex(store), store.listStories()]);
+    const [stored, stories] = await Promise.all([store.listScenarios(), store.listStories()]);
     const knownIds = new Set(stories.map((s) => s.id));
+
+    if (stored.length > 0) {
+      // DB-native: links come from stored scenarios.
+      const byStory = groupByStory(stored);
+      const links = stories.map((s) => ({
+        story: s.id,
+        title: s.title,
+        scenarios: (byStory.get(s.id) ?? []).map((sc) => ({ feature: sc.feature, name: sc.name, file: sc.file ?? null })),
+      }));
+      const dangling: { feature: string; name: string; story: string }[] = [];
+      for (const sc of stored) {
+        for (const st of sc.stories) if (!knownIds.has(st)) dangling.push({ feature: sc.feature, name: sc.name, story: st });
+      }
+      return json({
+        source: "store",
+        scenariosIndexed: stored.length,
+        links,
+        storiesWithoutScenario: links.filter((l) => l.scenarios.length === 0).map((l) => l.story),
+        danglingTags: dangling,
+      });
+    }
+
+    // Legacy: scan feature files on disk.
+    const { root, index } = await loadConductorIndex(store);
     const byStory = scenariosByStory(index);
     const links = stories.map((s) => ({
       story: s.id,
@@ -1011,6 +1144,7 @@ tool(
       scenarios: (byStory.get(s.id) ?? []).map((sc) => ({ feature: sc.feature, name: sc.name, file: sc.file })),
     }));
     return json({
+      source: "disk",
       conductorRoot: root,
       scenariosIndexed: index.scenarios.length,
       links,
@@ -1061,6 +1195,299 @@ tool(
 );
 
 // ===========================================================================
+// Scenarios (requ-owned cucumber scenario content + story links)
+// ===========================================================================
+
+/** Story ids referenced by a scenario that don't exist (for non-fatal warnings). */
+async function unknownStories(store: AnyStore, stories: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const id of stories) if (!(await store.getStory(id))) out.push(id);
+  return out;
+}
+
+/** Latest status of a scenario in the active (or given) phase, cumulative. */
+async function scenarioStatus(store: AnyStore, tk: string, phase?: string): Promise<{ phase: string | null; status: TestStatus }> {
+  const [phases, execByPhase] = await Promise.all([store.listPhases(), store.readAllExecutions()]);
+  const phaseId = await store.resolvePhaseId(phase);
+  const status = resolveStatuses(execByPhase, phases, phaseId, "cumulative");
+  return { phase: phaseId, status: status.get(tk) ?? "pending" };
+}
+
+tool(
+  "create_scenario",
+  {
+    title: "Create / upsert a scenario",
+    description:
+      "Store a cucumber scenario's gherkin content in requ as the source of truth, linked to user stories. " +
+      "Upserts by feature+name. Story links default to the @US-xxx tags in `tags` but can be set explicitly. " +
+      "Gherkin content is validated; invalid content is rejected unless force=true (then stored with valid=false). " +
+      "Once a project has any stored scenario, coverage is derived from stored scenarios (not disk feature files).",
+    inputSchema: {
+      feature: z.string().min(1).describe("Feature name (the `Feature:` line)."),
+      name:    z.string().min(1).describe("Scenario name (the `Scenario:` line)."),
+      content: z.string().optional().describe("Full gherkin text of the scenario (Scenario:/Outline + steps + Examples)."),
+      background: z.string().optional().describe("The feature's Background: block (steps that run before this scenario)."),
+      tags:    z.array(z.string()).optional().describe("Tags incl. @US-xxx, e.g. [\"@US-007\",\"@smoke\"]."),
+      stories: z.array(z.string().regex(/^US-\d+$/)).optional().describe("Explicit story links; defaults to @US tags in `tags`."),
+      force:   z.boolean().optional().describe("Store even if the gherkin content is invalid."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const tk = testKey({ feature: args.feature, name: args.name });
+    const tags = args.tags ?? [];
+    const stories = args.stories ?? storiesFromTags(tags);
+    const content = args.content ?? "";
+
+    const validation = validateGherkin(content);
+    if (!validation.ok && !args.force) {
+      return fail("Invalid gherkin content. Pass force:true to store anyway.", { errors: validation.errors });
+    }
+
+    const existing = await store.getScenario(tk);
+    const ts = now();
+    const sc: TScenario = {
+      feature: args.feature,
+      name: args.name,
+      testKey: tk,
+      content,
+      background: args.background ?? existing?.background ?? "",
+      tags,
+      stories,
+      source: existing?.source ?? "manual",
+      file: existing?.file,
+      valid: validation.ok,
+      createdAt: existing?.createdAt ?? ts,
+      updatedAt: ts,
+    };
+    await store.writeScenario(sc);
+    return json({ scenario: sc, valid: validation.ok, warnings: { unknownStories: await unknownStories(store, stories) } });
+  },
+);
+
+tool(
+  "update_scenario",
+  {
+    title: "Update a scenario",
+    description:
+      "Patch a stored scenario's content, tags, or story links (identified by feature+name). " +
+      "If tags change and `stories` is not given, story links are re-derived from @US tags. " +
+      "Edited content is re-validated; invalid content is rejected unless force=true.",
+    inputSchema: {
+      feature: z.string().min(1),
+      name:    z.string().min(1),
+      content: z.string().optional(),
+      background: z.string().optional(),
+      tags:    z.array(z.string()).optional(),
+      stories: z.array(z.string().regex(/^US-\d+$/)).optional(),
+      force:   z.boolean().optional(),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const tk = testKey({ feature: args.feature, name: args.name });
+    const sc = await store.getScenario(tk);
+    if (!sc) return fail(`Scenario "${args.name}" in feature "${args.feature}" not found.`);
+
+    if (args.content !== undefined) {
+      const validation = validateGherkin(args.content);
+      if (!validation.ok && !args.force) {
+        return fail("Invalid gherkin content. Pass force:true to store anyway.", { errors: validation.errors });
+      }
+      sc.content = args.content;
+      sc.valid = validation.ok;
+    }
+    if (args.background !== undefined) sc.background = args.background;
+    if (args.tags !== undefined) sc.tags = args.tags;
+    if (args.stories !== undefined) sc.stories = args.stories;
+    else if (args.tags !== undefined) sc.stories = storiesFromTags(args.tags);
+    sc.updatedAt = now();
+    await store.writeScenario(sc);
+    return json({ scenario: sc, valid: sc.valid, warnings: { unknownStories: await unknownStories(store, sc.stories) } });
+  },
+);
+
+tool(
+  "list_scenarios",
+  {
+    title: "List / filter scenarios",
+    description:
+      "List stored scenarios, filtered by story, requirement, phase, feature, and tags (cucumber tag expression). " +
+      "Filters combine with AND. Returns [] for legacy projects with no stored scenarios. " +
+      "When `phase` is given, each scenario is annotated with its resolved status for that phase.",
+    inputSchema: {
+      story:       z.string().optional().describe("Story id or comma-separated ids (match any), e.g. 'US-007'."),
+      requirement: z.string().optional().describe("Requirement id or comma-separated ids; resolved via its stories."),
+      phase:       z.string().optional().describe("Phase id; restricts to in-scope scenarios and adds per-phase status."),
+      mode:        CoverageMode.optional().describe("Phase resolution mode (default cumulative)."),
+      feature:     z.string().optional().describe("Exact feature name."),
+      q:           z.string().optional().describe("Case-insensitive substring over name/feature/content."),
+      tags:        z.string().optional().describe("Cucumber tag expression, e.g. '@smoke and not @wip'."),
+      valid:       z.boolean().optional().describe("Filter by gherkin validity."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const scenarios = await store.listScenarios();
+    if (scenarios.length === 0) return json([]);
+    const [stories, phases, requirements] = await Promise.all([
+      store.listStories(),
+      store.listPhases(),
+      store.listRequirements(),
+    ]);
+
+    const filter: ScenarioFilter = {
+      story: args.story?.split(",").map((s: string) => s.trim()).filter(Boolean),
+      requirement: args.requirement?.split(",").map((s: string) => s.trim()).filter(Boolean),
+      phase: args.phase,
+      mode: args.mode,
+      feature: args.feature,
+      q: args.q,
+      valid: args.valid,
+      tags: args.tags,
+    };
+    let filtered: TScenario[];
+    try {
+      filtered = filterScenarios(scenarios, stories, phases, requirements, filter);
+    } catch (e) {
+      return fail(`Invalid filter: ${(e as Error).message}`);
+    }
+
+    const storyById = new Map(stories.map((s) => [s.id, s]));
+    let statusMap: Map<string, TestStatus> | null = null;
+    if (args.phase) {
+      const execByPhase = await store.readAllExecutions();
+      statusMap = resolveStatuses(execByPhase, phases, args.phase, args.mode ?? "cumulative");
+    }
+    return json(
+      filtered.map((sc) => ({
+        ...sc,
+        requirementIds: requirementIdsForScenario(sc, storyById),
+        ...(statusMap ? { status: statusMap.get(sc.testKey) ?? "pending" } : {}),
+      })),
+    );
+  },
+);
+
+tool(
+  "get_scenario",
+  {
+    title: "Get a scenario",
+    description: "Fetch one stored scenario (by feature+name) with its content, tags, story links, and latest status.",
+    inputSchema: {
+      feature: z.string().min(1),
+      name:    z.string().min(1),
+      phase:   z.string().optional().describe("Phase id for status (default active)."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const tk = testKey({ feature: args.feature, name: args.name });
+    const sc = await store.getScenario(tk);
+    if (!sc) return fail(`Scenario "${args.name}" in feature "${args.feature}" not found.`);
+    const st = await scenarioStatus(store, tk, args.phase);
+    return json({ ...sc, statusPhase: st.phase, status: st.status });
+  },
+);
+
+tool(
+  "delete_scenario",
+  {
+    title: "Delete a scenario",
+    description: "Remove a stored scenario by feature+name.",
+    inputSchema: { feature: z.string().min(1), name: z.string().min(1) },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const tk = testKey({ feature: args.feature, name: args.name });
+    const deleted = await store.deleteScenario(tk);
+    return json({ deleted, testKey: tk });
+  },
+);
+
+tool(
+  "validate_scenario",
+  {
+    title: "Validate gherkin",
+    description:
+      "Validate cucumber gherkin syntax. Pass `content` to check arbitrary text, or feature+name to validate a stored scenario.",
+    inputSchema: {
+      content: z.string().optional(),
+      feature: z.string().optional(),
+      name:    z.string().optional(),
+    },
+  },
+  async (args, store) => {
+    let content = args.content;
+    if (content === undefined) {
+      if (!args.feature || !args.name) return fail("Pass `content`, or both `feature` and `name`.");
+      await ensureInit(store);
+      const sc = await store.getScenario(testKey({ feature: args.feature, name: args.name }));
+      if (!sc) return fail(`Scenario "${args.name}" in feature "${args.feature}" not found.`);
+      content = sc.content;
+    }
+    return json(validateGherkin(content));
+  },
+);
+
+tool(
+  "import_scenarios_from_features",
+  {
+    title: "Import scenarios from feature files",
+    description:
+      "One-time migration: read the Conductor project's .feature files and store each scenario (content, tags, story " +
+      "links from @US tags) in requ. After this, requ is the source of truth and coverage is derived from stored " +
+      "scenarios. Invalid gherkin is skipped (reported) unless force=true. Existing scenarios are skipped unless overwrite=true.",
+    inputSchema: {
+      conductorPath: z.string().optional().describe("Conductor project root. Defaults to config.conductorPath."),
+      overwrite:     z.boolean().optional().describe("Replace scenarios that already exist."),
+      force:         z.boolean().optional().describe("Import even scenarios whose gherkin is invalid (valid=false)."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const root = args.conductorPath ? store.resolvePath(args.conductorPath) : await store.conductorRoot();
+    let index: ConductorIndex;
+    try { index = await indexConductor(root); }
+    catch (e) { return fail(`Cannot read feature files at ${root}: ${(e as Error).message}`); }
+
+    const imported: string[] = [];
+    const skipped: string[] = [];
+    const invalid: { feature: string; name: string; errors: unknown[] }[] = [];
+    const ts = now();
+
+    for (const cs of index.scenarios) {
+      const tk = testKey({ feature: cs.feature, name: cs.name });
+      const existing = await store.getScenario(tk);
+      if (existing && !args.overwrite) { skipped.push(tk); continue; }
+
+      const validation = validateGherkin(cs.content);
+      if (!validation.ok && !args.force) {
+        invalid.push({ feature: cs.feature, name: cs.name, errors: validation.errors });
+        continue;
+      }
+      const sc: TScenario = {
+        feature: cs.feature,
+        name: cs.name,
+        testKey: tk,
+        content: cs.content,
+        background: cs.background,
+        tags: cs.tags,
+        stories: cs.stories,
+        source: "import-feature",
+        file: cs.file,
+        valid: validation.ok,
+        createdAt: existing?.createdAt ?? ts,
+        updatedAt: ts,
+      };
+      await store.writeScenario(sc);
+      imported.push(tk);
+    }
+    return json({ root, scenariosParsed: index.scenarios.length, imported: imported.length, skipped: skipped.length, invalid });
+  },
+);
+
+// ===========================================================================
 // Executions (test results per phase)
 // ===========================================================================
 
@@ -1085,10 +1512,22 @@ tool(
     if (!phaseId) return fail("No phase to record against. Create one with create_phase.");
     if (!(await store.getPhase(phaseId))) return fail(`Phase ${phaseId} not found.`);
 
-    const { root, index } = await loadConductorIndex(store);
-    const result = validateTestRef({ feature: args.feature, name: args.name }, index);
-    if (!result.ok)
-      return fail(result.reason ?? "Test does not resolve.", { conductorRoot: root, suggestions: result.suggestions });
+    // Validate the scenario exists: stored scenarios win, else the disk index.
+    const stored = await store.listScenarios();
+    if (stored.length > 0) {
+      const tk = testKey({ feature: args.feature, name: args.name });
+      if (!stored.some((s) => s.testKey === tk)) {
+        return fail(`No stored scenario "${args.name}" in feature "${args.feature}".`, {
+          source: "store",
+          suggestions: stored.filter((s) => s.name === args.name).map((s) => `${s.feature} :: ${s.name}`),
+        });
+      }
+    } else {
+      const { root, index } = await loadConductorIndex(store);
+      const result = validateTestRef({ feature: args.feature, name: args.name }, index);
+      if (!result.ok)
+        return fail(result.reason ?? "Test does not resolve.", { conductorRoot: root, suggestions: result.suggestions });
+    }
 
     const exec: Execution = {
       feature: args.feature,
@@ -1146,8 +1585,7 @@ tool(
     }));
     await store.appendExecutions(phaseId, execs);
 
-    const { index } = await loadConductorIndex(store);
-    const linked = linkedScenarioKeys(index);
+    const linked = await linkedKeysForStore(store);
     const matched = execs.filter((e) => linked.has(testKey(e)));
     const counts = {
       pass:    execs.filter((e) => e.status === "pass").length,
@@ -1172,19 +1610,18 @@ tool(
 // ===========================================================================
 
 async function resolveForReport(store: AnyStore, phase?: string, mode?: CoverageMode) {
-  const [reqs, stories, phases, execByPhase, { index }, vcsRefs] = await Promise.all([
+  const [reqs, stories, phases, execByPhase, byStory, vcsRefs] = await Promise.all([
     store.listRequirements(),
     store.listStories(),
     store.listPhases(),
     store.readAllExecutions(),
-    loadConductorIndex(store),
+    resolveScenariosByStory(store),
     store.listVcsRefs(),
   ]);
   const phaseId = await store.resolvePhaseId(phase);
   const m = mode ?? "cumulative";
   const status = resolveStatuses(execByPhase, phases, phaseId, m);
-  const byStory: ScenariosByStory = scenariosByStory(index);
-  return { reqs, stories, phases, byStory, status, phaseId, mode: m, vcsRefs };
+  return { reqs, stories, phases, byStory: byStory as ScenariosByStory, status, phaseId, mode: m, vcsRefs };
 }
 
 tool(
@@ -1233,14 +1670,14 @@ tool(
   },
   async (args, store) => {
     await ensureInit(store);
-    const [reqs, stories, phases, execByPhase, { index }] = await Promise.all([
+    const [reqs, stories, phases, execByPhase, byStory] = await Promise.all([
       store.listRequirements(),
       store.listStories(),
       store.listPhases(),
       store.readAllExecutions(),
-      loadConductorIndex(store),
+      resolveScenariosByStory(store),
     ]);
-    const trend = buildTrend(reqs, stories, scenariosByStory(index), execByPhase, phases, args.mode ?? "cumulative");
+    const trend = buildTrend(reqs, stories, byStory, execByPhase, phases, args.mode ?? "cumulative");
     return json({ mode: args.mode ?? "cumulative", points: trend });
   },
 );

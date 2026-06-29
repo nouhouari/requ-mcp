@@ -4,11 +4,13 @@ import {
   type Execution,
   type Phase,
   type Requirement,
+  type Scenario,
   type TestStatus,
   type UserStory,
   type VcsRef,
 } from "./schema.js";
-import type { ConductorScenario } from "./conductor.js";
+import { indexConductor, scenariosByStory } from "./conductor.js";
+import { matchTags } from "./tags.js";
 
 /**
  * Phase-aware, story-level coverage rollup.
@@ -29,13 +31,131 @@ import type { ConductorScenario } from "./conductor.js";
  */
 
 export type StatusMap = Map<string, TestStatus>;
-export type ScenariosByStory = Map<string, ConductorScenario[]>;
+/** A scenario as far as coverage cares: just its test identity. Both stored
+ *  Scenario rows and disk-derived ConductorScenario satisfy this. */
+export type ScenarioRef = { feature: string; name: string };
+export type ScenariosByStory = Map<string, ScenarioRef[]>;
+
+/** Minimal store surface needed to resolve scenarios (stored or disk fallback). */
+export interface ScenarioStore {
+  listScenarios(): Promise<Scenario[]>;
+  conductorRoot(): Promise<string>;
+}
+
+/** Group stored scenarios by the story ids they link to. */
+export function groupByStory(scenarios: Scenario[]): Map<string, Scenario[]> {
+  const map = new Map<string, Scenario[]>();
+  for (const sc of scenarios) {
+    for (const story of sc.stories) {
+      const arr = map.get(story) ?? [];
+      arr.push(sc);
+      map.set(story, arr);
+    }
+  }
+  return map;
+}
+
+/**
+ * Resolve the story→scenarios map for coverage. Stored scenarios are authoritative
+ * when present; otherwise fall back to scanning disk feature files (legacy). When
+ * neither is available, returns an empty map.
+ */
+export async function resolveScenariosByStory(store: ScenarioStore): Promise<ScenariosByStory> {
+  const out: ScenariosByStory = new Map();
+  const stored = await store.listScenarios();
+  if (stored.length > 0) {
+    for (const [k, v] of groupByStory(stored)) out.set(k, v);
+    return out;
+  }
+  try {
+    const index = await indexConductor(await store.conductorRoot());
+    for (const [k, v] of scenariosByStory(index)) out.set(k, v);
+  } catch {
+    /* no disk, no stored → empty */
+  }
+  return out;
+}
+
+/** Filter applied identically by the MCP `list_scenarios` tool and the REST API. */
+export interface ScenarioFilter {
+  /** Story ids; a scenario matches if any of its stories is listed. */
+  story?: string[];
+  /** Requirement ids; resolved to stories, then matched like `story`. */
+  requirement?: string[];
+  /** Phase id; restricts to scenarios whose linked story is in scope for the phase. */
+  phase?: string;
+  mode?: CoverageMode;
+  feature?: string;
+  q?: string;
+  valid?: boolean;
+  /** Cucumber tag expression. Throws if malformed. */
+  tags?: string;
+}
+
+/**
+ * Filter stored scenarios by story/requirement/phase/feature/tags. Requirement and
+ * phase filters are resolved against `requirements`/`stories`/`phases` here so the
+ * MCP tool and the web API share one implementation (parity). A story has no phase
+ * of its own — phase scope is derived from its requirements' phases.
+ */
+export function filterScenarios(
+  scenarios: Scenario[],
+  stories: UserStory[],
+  phases: Phase[],
+  requirements: Requirement[],
+  filter: ScenarioFilter,
+): Scenario[] {
+  // Requirement → set of story ids tracing to it.
+  let requirementStoryIds: Set<string> | null = null;
+  if (filter.requirement?.length) {
+    const reqs = new Set(filter.requirement);
+    requirementStoryIds = new Set(
+      stories.filter((s) => s.requirements.some((r) => reqs.has(r))).map((s) => s.id),
+    );
+  }
+
+  // Phase → set of in-scope story ids, resolved through each story's requirements.
+  let phaseStoryIds: Set<string> | null = null;
+  if (filter.phase) {
+    const mode = filter.mode ?? "cumulative";
+    const reqPhaseById = requirementPhaseMap(requirements);
+    phaseStoryIds = new Set(
+      stories.filter((s) => storyInScope(s, filter.phase!, reqPhaseById, phases, mode)).map((s) => s.id),
+    );
+  }
+
+  const storySet = filter.story?.length ? new Set(filter.story) : null;
+  const q = filter.q?.toLowerCase();
+
+  return scenarios.filter((sc) => {
+    if (storySet && !sc.stories.some((id) => storySet.has(id))) return false;
+    if (requirementStoryIds && !sc.stories.some((id) => requirementStoryIds!.has(id))) return false;
+    if (phaseStoryIds && !sc.stories.some((id) => phaseStoryIds!.has(id))) return false;
+    if (filter.feature && sc.feature !== filter.feature) return false;
+    if (filter.valid !== undefined && sc.valid !== filter.valid) return false;
+    if (q && !(`${sc.name}\n${sc.feature}\n${sc.content}`.toLowerCase().includes(q))) return false;
+    if (filter.tags && !matchTags(filter.tags, sc.tags)) return false;
+    return true;
+  });
+}
+
+/** Requirement ids a stored scenario traces to (via its linked stories). */
+export function requirementIdsForScenario(sc: Scenario, storyById: Map<string, UserStory>): string[] {
+  const out = new Set<string>();
+  for (const id of sc.stories) {
+    const s = storyById.get(id);
+    if (s) for (const r of s.requirements) out.add(r);
+  }
+  return [...out];
+}
 
 /**
  * Whether a requirement/story is in scope for a phase report.
  *
- * Mirrors the execution cumulative/strict model:
- *   - unassigned (no phase) → always in scope (backward-compatible),
+ *   - no phase selected (targetPhaseId null) → everything is in scope,
+ *     including unassigned items ("All phases" view),
+ *   - a phase IS selected → unassigned items are OUT of scope, so the filter
+ *     narrows to items that actually belong to the phase (or an earlier one),
  *   - strict     → only items assigned to the target phase,
  *   - cumulative → items assigned to the target phase or any earlier phase.
  * An item whose phase id is unknown (not in `phases`) is treated as unassigned.
@@ -46,13 +166,130 @@ export function inScope(
   phases: Phase[],
   mode: CoverageMode,
 ): boolean {
-  if (!itemPhase) return true;
-  if (!targetPhaseId) return true;
+  if (!targetPhaseId) return true; // "All phases" → everything, incl. unassigned
+  if (!itemPhase) return false; // a phase is selected → exclude unassigned items
   if (mode === "strict") return itemPhase === targetPhaseId;
-  const itemOrder = phases.find((p) => p.id === itemPhase)?.order;
   const targetOrder = phases.find((p) => p.id === targetPhaseId)?.order;
-  if (itemOrder === undefined || targetOrder === undefined) return true;
+  if (targetOrder === undefined) return true; // unknown target phase → stay permissive
+  const itemOrder = phases.find((p) => p.id === itemPhase)?.order;
+  if (itemOrder === undefined) return false; // unknown item phase ≈ unassigned → exclude
   return itemOrder <= targetOrder;
+}
+
+/** requirement id → its assigned target phase (undefined when unassigned). */
+export function requirementPhaseMap(requirements: Requirement[]): Map<string, string | undefined> {
+  return new Map(requirements.map((r) => [r.id, r.phase]));
+}
+
+/** Distinct target phases a story belongs to, derived from its requirements. */
+export function storyPhases(
+  story: UserStory,
+  reqPhaseById: Map<string, string | undefined>,
+): string[] {
+  const out: string[] = [];
+  for (const rid of story.requirements) {
+    const p = reqPhaseById.get(rid);
+    if (p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+/**
+ * Whether a story is in scope for a phase report. A story has no phase of its own;
+ * it inherits scope from the requirements it traces to. It is in scope when ANY
+ * linked requirement is in scope for the target phase (so a story spanning phases
+ * counts from its earliest requirement onward under cumulative).
+ */
+export function storyInScope(
+  story: UserStory,
+  targetPhaseId: string | null,
+  reqPhaseById: Map<string, string | undefined>,
+  phases: Phase[],
+  mode: CoverageMode,
+): boolean {
+  if (!targetPhaseId) return true; // "All phases" → everything, incl. unassigned
+  return story.requirements.some((rid) => inScope(reqPhaseById.get(rid), targetPhaseId, phases, mode));
+}
+
+/** Raw count of requirements/stories/scenarios attributed to one phase. */
+export interface PhaseCount {
+  /** Phase id; "" for the Unassigned bucket. */
+  phase: string;
+  /** Display label; "Unassigned" for the "" bucket. */
+  phaseName: string;
+  /** Sort key (Unassigned sorts last). */
+  order: number;
+  requirements: number;
+  stories: number;
+  scenarios: number;
+}
+
+/**
+ * Partition raw counts of requirements, stories and scenarios across phases.
+ *
+ * Each item is counted EXACTLY ONCE, in the earliest phase its requirements
+ * touch, so the per-phase rows sum to the totals (requirements.length /
+ * stories.length / scenarios.length):
+ *   - a requirement → its own assigned phase (or Unassigned),
+ *   - a story → the earliest phase among its requirements' phases,
+ *   - a scenario → the earliest phase among its linked stories' phases.
+ * Items with no known phase (and orphan scenarios with no story) fall into the
+ * Unassigned bucket, which is always returned (0 when empty) and sorts last.
+ */
+export function countsByPhase(
+  requirements: Requirement[],
+  stories: UserStory[],
+  scenarios: Scenario[],
+  phases: Phase[],
+): PhaseCount[] {
+  const orderById = new Map(phases.map((p) => [p.id, p.order]));
+  const reqPhaseById = requirementPhaseMap(requirements);
+  const storyById = new Map(stories.map((s) => [s.id, s]));
+
+  // The earliest (lowest-order) known phase among the candidates, else "".
+  const earliest = (ids: string[]): string => {
+    let best = "";
+    let bestOrder = Infinity;
+    for (const id of ids) {
+      const o = orderById.get(id);
+      if (o === undefined) continue; // unknown phase ≈ unassigned
+      if (o < bestOrder) { bestOrder = o; best = id; }
+    }
+    return best;
+  };
+
+  type Bucket = { requirements: number; stories: number; scenarios: number };
+  const buckets = new Map<string, Bucket>();
+  const bucket = (key: string): Bucket => {
+    let b = buckets.get(key);
+    if (!b) { b = { requirements: 0, stories: 0, scenarios: 0 }; buckets.set(key, b); }
+    return b;
+  };
+  // Pre-seed every phase + Unassigned so empty rows still appear.
+  for (const p of phases) bucket(p.id);
+  bucket("");
+
+  for (const r of requirements) {
+    bucket(r.phase && orderById.has(r.phase) ? r.phase : "").requirements++;
+  }
+  for (const s of stories) {
+    bucket(earliest(storyPhases(s, reqPhaseById))).stories++;
+  }
+  for (const sc of scenarios) {
+    const phaseIds: string[] = [];
+    for (const sid of sc.stories) {
+      const s = storyById.get(sid);
+      if (s) for (const p of storyPhases(s, reqPhaseById)) phaseIds.push(p);
+    }
+    bucket(earliest(phaseIds)).scenarios++;
+  }
+
+  const maxOrder = phases.reduce((m, p) => Math.max(m, p.order), 0);
+  const rows: PhaseCount[] = phases
+    .map((p) => ({ phase: p.id, phaseName: p.name || p.id, order: p.order, ...bucket(p.id) }))
+    .sort((a, b) => a.order - b.order);
+  rows.push({ phase: "", phaseName: "Unassigned", order: maxOrder + 1, ...bucket("") });
+  return rows;
 }
 
 export function resolveStatuses(
@@ -62,14 +299,18 @@ export function resolveStatuses(
   mode: CoverageMode,
 ): StatusMap {
   const out: StatusMap = new Map();
-  if (!targetPhaseId) return out;
-  const target = phases.find((p) => p.id === targetPhaseId);
-  if (!target) return out;
-
-  const feeding =
-    mode === "strict"
-      ? [target]
-      : phases.filter((p) => p.order <= target.order).sort((a, b) => a.order - b.order);
+  // "All phases" (no target): latest status per scenario across every phase.
+  let feeding: Phase[];
+  if (!targetPhaseId) {
+    feeding = [...phases].sort((a, b) => a.order - b.order);
+  } else {
+    const target = phases.find((p) => p.id === targetPhaseId);
+    if (!target) return out;
+    feeding =
+      mode === "strict"
+        ? [target]
+        : phases.filter((p) => p.order <= target.order).sort((a, b) => a.order - b.order);
+  }
 
   for (const phase of feeding) {
     const runs = [...(executionsByPhase.get(phase.id) ?? [])].sort((a, b) =>
@@ -212,8 +453,11 @@ export function buildReport(
   phases: Phase[] = [],
 ): CoverageReport {
   // Scope to the items planned for this phase (unassigned items always count).
+  // A story's phase is derived from its requirements, so resolve the requirement
+  // phase map from the FULL list before narrowing `requirements` itself.
+  const reqPhaseById = requirementPhaseMap(requirements);
   requirements = requirements.filter((r) => inScope(r.phase, phaseId, phases, mode));
-  stories = stories.filter((s) => inScope(s.phase, phaseId, phases, mode));
+  stories = stories.filter((s) => storyInScope(s, phaseId, reqPhaseById, phases, mode));
 
   const mrByStory = mergedMrByStory(vcsRefs);
   const storyCov = stories.map((s) => computeStoryCoverage(s, scenariosByStory, status, mrByStory.get(s.id)));

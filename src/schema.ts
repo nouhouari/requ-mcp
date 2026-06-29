@@ -93,6 +93,16 @@ export function testKey(t: { feature: string; name: string }): string {
 /** Tag convention: a scenario tag like `@US-007` links it to story US-007. */
 export const STORY_TAG_RE = /^@?(US-\d+)$/;
 
+/** Derive story ids from a scenario's tags (e.g. ["@US-007","@auth"] -> ["US-007"]). */
+export function storiesFromTags(tags: string[]): string[] {
+  const out: string[] = [];
+  for (const t of tags) {
+    const m = t.match(STORY_TAG_RE);
+    if (m && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Acceptance Criterion — descriptive PO content
 // ---------------------------------------------------------------------------
@@ -118,10 +128,9 @@ export const UserStory = z.object({
   requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1),
   acceptanceCriteria: z.array(AcceptanceCriterion).default([]),
   status: StoryStatus.default("draft"),
-  /** Target phase this story is planned for (matches Phase.id). Optional and
-   *  independent of the story's requirements; unassigned stories are always in
-   *  scope for every phase report. */
-  phase: z.string().optional(),
+  /** NOTE: a story has no phase of its own. Its phase scope is derived from the
+   *  phases of the requirements it traces to (see `storyInScope` in coverage.ts).
+   *  This keeps requirement phase as the single source of truth — no drift. */
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -175,6 +184,39 @@ export const ExecutionLog = z.object({
   runs: z.array(Execution).default([]),
 });
 export type ExecutionLog = z.infer<typeof ExecutionLog>;
+
+// ---------------------------------------------------------------------------
+// Scenario — a cucumber scenario whose gherkin content requ owns as the single
+// source of truth. Identity = testKey(feature,name) so executions join unchanged.
+// Linked to user stories via explicit `stories` (defaulted from @US-xxx tags).
+// ---------------------------------------------------------------------------
+
+export const ScenarioSource = z.enum(["manual", "import-feature", "import"]);
+export type ScenarioSource = z.infer<typeof ScenarioSource>;
+
+export const Scenario = z.object({
+  ...testIdentity,                               // feature, name (min 1)
+  /** Stable id == testKey(feature,name); the row primary key. */
+  testKey: z.string().min(1),
+  /** Full gherkin scenario text (the Scenario:/Scenario Outline: block incl. steps,
+   *  tag lines, and any Examples:). May be "" for legacy/manually-linked rows. */
+  content: z.string().default(""),
+  /** The feature's Background: block (steps that run before this scenario), if any.
+   *  Stored alongside the scenario so a runner can execute it standalone. */
+  background: z.string().default(""),
+  /** All tags on the scenario incl. inherited feature-level tags, e.g. ["@auth","@US-007"]. */
+  tags: z.array(z.string()).default([]),
+  /** Linked story ids. Defaulted from @US tags on write; explicit value wins. */
+  stories: z.array(z.string().regex(/^US-\d+$/)).default([]),
+  source: ScenarioSource.default("manual"),
+  /** Origin feature file path (for imported scenarios). */
+  file: z.string().optional(),
+  /** Whether the gherkin content parses (set on every write; true when content is empty). */
+  valid: z.boolean().default(true),
+  createdAt: Timestamp,
+  updatedAt: Timestamp,
+});
+export type Scenario = z.infer<typeof Scenario>;
 
 // ---------------------------------------------------------------------------
 // Project config
@@ -244,6 +286,7 @@ export const ExportPayload = z.object({
     components:   z.array(Component).default([]),
     requirements: z.array(Requirement).default([]),
     stories:      z.array(UserStory).default([]),
+    scenarios:    z.array(Scenario).default([]),
     phases:       z.array(Phase).default([]),
     executions:   z.record(z.array(Execution)).default({}),
     vcsRefs:      z.array(VcsRef).default([]),
