@@ -222,23 +222,23 @@ async function getStore(server: McpServer, explicit?: string, allowCreate = fals
         _stores.set(slug, store);
         return store;
       }
-      // SQLite legacy: treat `explicit` as a filesystem path.
-      const root = path.resolve(explicit);
-      for (const store of _stores.values()) if (store.root === root) return store;
-      const slug = slugify(root);
-      const store = new SqliteStore(root);
-      _stores.set(slug, store);
-      return store;
+      // SQLite HTTP (no Postgres): projects are addressed by key/slug, resolved
+      // against the pre-loaded registry above. A key is never a filesystem path,
+      // so an unknown selector cannot mint a new store here.
+      throw new Error(
+        `Unknown project '${explicit}'. Known: [${[..._stores.keys()].join(", ")}]. ` +
+          `Key-based project creation requires Postgres (set REQU_PG_URL).`,
+      );
     }
 
     // No explicit selector.
     if (usePg) await attachAllDbProjects();
     if (_stores.size === 1) return [..._stores.values()][0];
     if (_stores.size === 0) {
-      // Postgres mode never derives a project_id from cwd/workspace root — that mints
-      // a phantom project named after the server's directory. Require an explicit name.
+      // HTTP mode never derives a project_id from cwd/workspace root — that mints
+      // a phantom project named after the server's directory. Require an explicit key.
       if (usePg) {
-        throw new Error("No requ project exists; run init_project with an explicit name.");
+        throw new Error("No requ project exists; run init_project with an explicit `key`.");
       }
       // Legacy local SQLite dev: fall back to filesystem resolution (cwd/workspace root).
       const root = await resolveRoot(server, explicit);
@@ -248,7 +248,7 @@ async function getStore(server: McpServer, explicit?: string, allowCreate = fals
       return store;
     }
     throw new Error(
-      `Multiple projects loaded; pass projectPath=<slug|key>. Known: [${[..._stores.keys()].join(", ")}]`,
+      `Multiple projects loaded; pass \`key\` to select one. Known: [${[..._stores.keys()].join(", ")}]`,
     );
   }
   return new Store(await resolveRoot(server, explicit));
@@ -274,12 +274,48 @@ async function getStoreByKey(key: string, server: McpServer): Promise<AnyStore |
   return null;
 }
 
+/** True when the server is running as an HTTP service (the store is the server, not the filesystem). */
+function isHttpMode(): boolean {
+  return process.env.REQU_TRANSPORT === "http";
+}
+
 const projectPathSchema = z
   .string()
   .optional()
   .describe(
-    "Absolute path to the project root (the dir containing .requ/). Omit to auto-detect: REQU_ROOT, else a workspace root or ancestor of the cwd that contains .requ/.",
+    "Absolute path to the project root (the dir containing .requ/). Omit to auto-detect: REQU_ROOT, else a workspace root or ancestor of the cwd that contains .requ/. " +
+      "Ignored in HTTP mode — projects are addressed by `key` there, not by a filesystem path.",
   );
+
+const keySchema = z
+  .string()
+  .optional()
+  .describe(
+    "Project key identifying the target project (HTTP mode). In HTTP mode the server is the store, so projects are addressed by this key instead of a filesystem path.",
+  );
+
+/**
+ * Resolve the project selector to pass to getStore for a given tool call.
+ *
+ * In HTTP mode there is no meaningful local filesystem: the project is identified
+ * by its `key`, never by an auto-detected path. Passing `projectPath` in HTTP mode
+ * is rejected so a stale/auto-detected path can never silently clobber a project.
+ * In stdio mode the selector remains the (optional) `projectPath`.
+ */
+function selectorFor(toolName: string, args: any): string | undefined {
+  if (!isHttpMode()) return args.projectPath;
+  if (args.projectPath) {
+    throw new Error(
+      "projectPath is not supported in HTTP mode. Identify the project by its `key` instead.",
+    );
+  }
+  if (toolName === "init_project" && !args.key) {
+    throw new Error(
+      "In HTTP mode, init_project requires a `key` to identify the project (no filesystem path is used).",
+    );
+  }
+  return args.key;
+}
 
 type Handler = (args: any, store: AnyStore) => Promise<unknown>;
 
@@ -309,13 +345,18 @@ function tool(
 function createServer(): McpServer {
   const server = new McpServer({ name: "requ-mcp", version: "0.7.1" });
   for (const { name, config, handler } of toolDefs) {
-    const inputSchema = { ...(config.inputSchema ?? {}), projectPath: projectPathSchema };
+    const base = config.inputSchema ?? {};
+    const inputSchema: Record<string, z.ZodTypeAny> = { ...base, projectPath: projectPathSchema };
+    // Every tool accepts `key` as the HTTP-mode project identifier. Tools that
+    // already declare their own `key` (e.g. init_project) keep their definition.
+    if (!("key" in inputSchema)) inputSchema.key = keySchema;
     server.registerTool(
       name,
       { title: config.title, description: config.description, inputSchema },
       async (args: any) => {
         try {
-          const store = await getStore(server, args.projectPath, name === "init_project");
+          const selector = selectorFor(name, args);
+          const store = await getStore(server, selector, name === "init_project");
           return (await handler(args, store)) as ReturnType<typeof json>;
         } catch (e) {
           return fail((e as Error).message);

@@ -14,7 +14,7 @@ REQU_ROOT="${REQU_ROOT:-$PROJECT_DIR}"
 PG_USER="${PG_USER:-requ}"
 PG_PASSWORD="${PG_PASSWORD:-requ}"
 PG_DB="${PG_DB:-requ}"
-PG_PORT="${PG_PORT:-5432}"
+PG_PORT="${PG_PORT:-5433}"
 PG_HOST="${PG_HOST:-127.0.0.1}"
 REQU_PG_URL="${REQU_PG_URL:-postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_DB}}"
 
@@ -23,7 +23,7 @@ start() {
   # 1. Ensure PostgreSQL is running via docker-compose
   # ---------------------------------------------------------------------------
   echo "Starting PostgreSQL (docker-compose)..."
-  docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d postgres
+  docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d --no-recreate postgres
 
   echo "Waiting for PostgreSQL to become healthy..."
   until docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres \
@@ -47,7 +47,7 @@ start() {
   export REQU_HOST
   export REQU_ROOT
 
-  nohup "$PROJECT_DIR/node_modules/.bin/tsx" "$PROJECT_DIR/src/index.ts" > /dev/null 2>&1 &
+  nohup "$PROJECT_DIR/node_modules/.bin/tsx" "$PROJECT_DIR/src/index.ts" > /tmp/requ-mcp.log 2>&1 &
   echo $! > "$PID_FILE"
   echo "requ-mcp started (PID $(cat "$PID_FILE"))."
 }

@@ -253,7 +253,9 @@ reviewable in PRs:
 | `coverage_trend` | reporting | Coverage summary at each phase — the evolution view |
 | `find_gaps` | reporting | Requirements without stories, stories without scenarios, stories not covered (per phase) |
 
-Every tool also accepts an optional `projectPath` (see below).
+Every tool also accepts an optional `projectPath` in **stdio mode**, or a `key`
+in **HTTP mode**, to select the target project (see
+[How it finds the project](#how-it-finds-the-project)).
 
 ## Linking tests — `@US-xxx` tags
 
@@ -325,6 +327,23 @@ So a single global server works across projects: most clients (Claude Code, IDEs
 advertise the open workspace as a root, and you can always pass `projectPath`
 explicitly. The Conductor `features/` location is read from `.requ/config.yaml`
 relative to that resolved root.
+
+### HTTP mode: projects are keyed, not path-based
+
+When the server runs as an HTTP service (`REQU_TRANSPORT=http`, typically with
+`REQU_PG_URL`), **there is no meaningful local filesystem — the server _is_ the
+store.** Path auto-detection is therefore disabled and projects are addressed by
+their **`key`**:
+
+- **`init_project` requires a `key`** and creates a new, independent project
+  identified by it (no `projectPath` needed). Calling it again with the same
+  `key` updates that project; a different `key` creates a separate one — it never
+  clobbers another project.
+- **Every tool accepts `key`** as the project selector (the HTTP-mode equivalent
+  of `projectPath`).
+- **`projectPath` is rejected** in HTTP mode with a clear error, so a stale or
+  auto-detected path can never silently overwrite a project.
+- **`list_projects`** returns every project registered in the server's database.
 
 ## Releasing (npm)
 

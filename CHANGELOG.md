@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Fixed
+- **HTTP mode no longer overwrites projects.** `init_project` previously resolved
+  the target project via filesystem path auto-detection (`REQU_ROOT` / cwd walk).
+  In HTTP mode the server is the store, so auto-detection always landed on the
+  same root and every `init_project` call clobbered the existing project.
+  Project resolution in HTTP mode is now **key-based**: `init_project` requires a
+  `key` and creates an independent project identified by it, all tools accept
+  `key` as the project selector, `projectPath` is rejected with a clear error,
+  and `list_projects` returns every project registered in the server database.
+
 ## [0.7.0] – 2026-06-22
 
 ### Added

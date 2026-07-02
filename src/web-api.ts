@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fsp, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { SqliteStore } from "./sqlite-store.js";
+import { SqliteStore } from "./sqlite-store.js";
 import { PostgresStore } from "./postgres-store.js";
 
 type AnyHttpStore = SqliteStore | PostgresStore;
@@ -506,11 +506,34 @@ export async function handleWebRequest(
     // --- POST /api/init --- (must work before project is initialized)
     if (matchRoute(pathname, method, "/api/init", "POST") !== null) {
       try {
+        // Parse body first — we may need it to mint a new store when none exist.
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(await collectBody(req));
+        } catch {
+          jsonError(res, 400, "Request body is not valid JSON");
+          return true;
+        }
+
         // Store resolution without handleStoreResult — project may not be initialized yet.
         let store: AnyHttpStore;
         if (stores.size === 0) {
-          jsonError(res, 503, "No project root configured on this server");
-          return true;
+          // No pre-configured store: create one on-the-fly from the request body.
+          const projectName =
+            typeof body.name === "string" && body.name.trim()
+              ? body.name.trim()
+              : "project";
+          const slug = projectName
+            .toLowerCase()
+            .replace(/[^a-z0-9_-]/g, "-")
+            .replace(/^-+|-+$/g, "") || "project";
+          const synthRoot = path.join(os.tmpdir(), "requ", slug);
+          if (process.env.REQU_PG_URL) {
+            store = new PostgresStore(synthRoot, slug);
+          } else {
+            store = new SqliteStore(synthRoot);
+          }
+          stores.set(slug, store);
         } else if (stores.size > 1) {
           const slug = searchParams.get("project");
           if (!slug) {
@@ -525,14 +548,6 @@ export async function handleWebRequest(
           store = found;
         } else {
           store = [...stores.values()][0];
-        }
-
-        let body: Record<string, unknown>;
-        try {
-          body = JSON.parse(await collectBody(req));
-        } catch {
-          jsonError(res, 400, "Request body is not valid JSON");
-          return true;
         }
 
         // Derive / validate key.
