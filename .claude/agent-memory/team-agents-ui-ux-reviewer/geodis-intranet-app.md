@@ -1,0 +1,22 @@
+---
+name: geodis-intranet-app
+description: How to drive the GEODIS Intranet app (intranet-portal-web) under Playwright for UI/UX gate reviews — test account switcher, directory SPA nav, admin alert banner form.
+metadata:
+  type: project
+---
+
+The app reviewed from this workspace is the GEODIS Intranet (`GEODIS-INTRANET/intranet-portal-web` + `intranet-portal-api`), served locally at http://localhost:3000 during review sessions. Default nav language is French even when the header language switcher shows "EN" selected in some sessions — check actual rendered text, don't assume from the switcher state.
+
+**Test account switcher**: a "Test account" complementary region is pinned at the bottom of every page (`button "Open the test account switcher"`), showing the active persona (e.g. "Adrien Admin" / ADMIN badge). No login flow needed — the persona is already active on page load. Useful personas seen: Adrien Admin (ADMIN), plus directory-listed fixtures like Alice Admin, Bob Contributor, Rita Reviewer, Sophie Super Admin, Ulysse Reader (Employee), Dave SuperAdmin.
+
+**Directory (`/people`) profile navigation**: employee profile pages at `/people/{uuid}` are client-side routed (SPA/Next.js router) — confirmed via a `window.__marker` set before navigating and checked after clicking a Direct report / Reporting line link: the marker survives, i.e. no full reload. Profile page shows: heading with name, Department/Site/Country, a "Like {name}'s profile" button, and either a "Direct reports (N)" list (manager) or a "Reporting line" list with "Manager (N+1)" label (report). Both link sets route to `/people/{uuid}` and correctly swap content on click.
+
+**`/profile` (My profile) — gamification removed**: as of the P27 batch (2026-07-28), `/profile` has zero gamification traces — no points/streak/rank section, no "View my trophies" link, no "My trophies" shortcut. Only quick link present is "My favorites". Verified via full-text scan for trophy/streak/points/rank/gamif/badge/xp/classement/récompense — all absent.
+
+**`/profile` → Change photo crop**: clicking "Change photo" opens a file chooser; after `browser_file_upload`, an inline crop UI renders with a `<canvas>` (240×240 in observed session), a "Zoom" range slider (`slider "Photo zoom level"`), and Cancel/Save buttons. The canvas correctly draws the uploaded image (verified both visually and via `getImageData` — fully opaque, non-black pixels matching the source image's colors) and redraws on zoom slider changes (pixel values change, image visibly re-cropped/zoomed in screenshot). Cancel discards without persisting.
+
+**Admin — Alert banner** (`/admin/alert-banner`, under Administration → Content): a single global banner config form with: "Enable the alert banner" switch, optional "Active until" date, optional "Clickable link" (must be https://, empty allowed) which when filled enables an otherwise-disabled "Link label" field (empty label ⇒ whole message becomes the clickable target), and per-language message tabs (9 languages: FR required, EN/IT/ES/PL/DE/ZH/NL/PT optional) with a "Message (Français) *" required textbox. Saves show a "Last updated: <timestamp>" readout next to the Save button — reliable confirmation a save round-tripped. On `/home`, the live banner renders as a single `[role=alert]` element (⚠️ icon + message text), and when a link+label are set, the label renders as an `<a>` with `target="_blank" rel="noopener noreferrer"` — verified opens in a genuine new tab, original tab stays put. Disabling the switch and clearing the link field (label auto-disables) fully removes the banner from `/home` (0 `[role=alert]` elements) after a fresh reload.
+
+**Known pre-existing (out-of-scope) issue**: every page load throws one console error — `Executing inline script violates … Content-Security-Policy … script-src 'self'` at `/home:16`. Present before any of my test interactions; not a regression from the batch under review, just worth flagging if asked for a full sweep later.
+
+**Environment note**: this appears to be a shared/reused review workspace — `/Users/amine/Projects/NORDINE/*.png` accumulates dozens of screenshots from many past review sessions (review-*, alertbanner-*, hr7-*, redesign7-*, etc.). Playwright's allowed screenshot roots are `/Users/amine/Projects/NORDINE/.playwright-mcp` and `/Users/amine/Projects/NORDINE` itself (NOT the task scratchpad dir) — `browser_take_screenshot`/`browser_file_upload` file paths must live under one of those roots or they're denied.

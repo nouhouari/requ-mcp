@@ -1,0 +1,1 @@
+- [GEODIS Intranet app driving notes](geodis-intranet-app.md) — test account switcher, directory SPA nav proof technique, admin alert banner form shape, crop canvas verification approach.
