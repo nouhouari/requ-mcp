@@ -94,6 +94,13 @@ document.addEventListener('alpine:init', function () {
       scenarioTagMatchIds: null,
       scenarioTagError: '',
 
+      // ── Coverage Trend chart controls ────────────────────────────────────────
+      // Independent from coverageMode (which drives the Coverage tab): the trend
+      // chart on the Overview tab has its own strict/cumulative toggle. Defaults
+      // to 'cumulative' since it is more representative of real project progress
+      // at a glance; 'strict' remains available for a rigorous per-phase view.
+      trendMode: 'cumulative',
+
       // ── Charts ───────────────────────────────────────────────────────────────
       // NOTE: live Chart.js instances live in the non-reactive CHARTS closure
       // object (see top of alpine:init), NOT on this reactive component — that
@@ -225,13 +232,20 @@ document.addEventListener('alpine:init', function () {
         var found = this.projects.find(function (p) { return p.slug === slug; });
         if (!found || found === this.activeProject) return;
         this.activeProject = found;
+        // Reset the phase filter so it is re-derived from the new project's
+        // active phase (set by loadSummary). Without this reset, a phase id
+        // from the previous project (e.g. P14) would be passed to
+        // loadCoverage() for the new project, returning 0 passing scenarios
+        // because that phase does not exist in the new project.
+        this.coveragePhase = null;
         // Reconnect SSE for the new project.
         if (this._sse) { this._sse.close(); this._sse = null; }
         this.setupSSE();
-        // Reload all data for the new project.
+        // Load config + summary first so that coveragePhase is set to the new
+        // project's activePhase before loadCoverage() reads it.
+        await Promise.all([self.loadConfig(), self.loadSummary()]);
+        // Now load the remaining data in parallel using the correct coveragePhase.
         await Promise.all([
-          self.loadConfig(),
-          self.loadSummary(),
           self.loadRequirements(),
           self.loadStories(),
           self.loadComponents(),
@@ -320,11 +334,22 @@ document.addEventListener('alpine:init', function () {
 
       async loadTrend() {
         this.loading.trend = true;
-        // Cumulative = project-to-date at each phase (the last point = project total),
-        // not strict per-phase coverage.
-        var d = await this._fetch(this.apiUrl('/api/coverage/trend?mode=cumulative'));
+        var d = await this._fetch(this.apiUrl('/api/coverage/trend?mode=' + this.trendMode));
         if (d) this.trend = d;
         this.loading.trend = false;
+      },
+
+      /**
+       * Switch the Coverage Trend chart between 'strict' (each phase counts
+       * only scenarios explicitly attached to it) and 'cumulative' (inherits
+       * scenarios from prior phases). Persists for the session and re-applies
+       * on every subsequent refresh/re-render (SSE updates, project switch, etc.)
+       * because loadTrend() always reads the current trendMode.
+       */
+      setTrendMode(mode) {
+        if (this.trendMode === mode) return;
+        this.trendMode = mode;
+        this.loadTrend();
       },
 
       async loadGaps() {
@@ -385,6 +410,21 @@ document.addEventListener('alpine:init', function () {
         this.tab = id;
         if (id === 'global')     { this.loadGlobalSummary(); }
         if (id === 'scenarios')  { this.loadScenarios(); }
+        // The Overview canvases use x-show (not x-if), so their x-init only ever
+        // fires once at page load. If the 'overview' tab wasn't the active tab at
+        // that moment (e.g. multi-project installs default to 'global' — see
+        // init()), the canvases were 0×0 and initTrendChart/initDonutChart gave
+        // up after their bounded retry, leaving CHARTS.trend/donut permanently
+        // null. Re-invoking here — now that x-show has revealed the panel — is a
+        // safe no-op when the chart is already live (see the "already bound"
+        // guard in each init function) and is what actually creates it otherwise.
+        if (id === 'overview') {
+          var self = this;
+          this.$nextTick(function () {
+            self.initTrendChart(self.$refs.trendCanvas);
+            self.initDonutChart(self.$refs.donutCanvas);
+          });
+        }
       },
 
       /**

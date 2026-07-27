@@ -1,0 +1,14 @@
+---
+name: intranet-portal-api-fake-prisma-e2e-convention
+description: intranet-portal-api's e2e tests use a hand-rolled in-memory fake PrismaService (no real Postgres, no Cucumber/Conductor) — every Prisma model touched by production code needs a matching fake table added to each spec's fake, or it 500s
+metadata:
+  type: project
+---
+
+`intranet-portal-api` (NestJS 10 + Prisma 5, see [[project-stack-mismatch-intranet-portal-api]]) has **no Cucumber/Conductor harness** — `mcp__conductor__list_features` errors with "No cucumber.js found" and there are no `.feature` files anywhere in the repo. The project's real e2e tooling is Jest + supertest specs under `test/*.e2e-spec.ts`, run via `npx jest --config ./test/jest-e2e.json`.
+
+These e2e specs do **not** hit a real database. Each spec file defines its own `buildFakePrisma()` (or similar) — a hand-rolled in-memory object with `jest.fn()` implementations of `findMany`/`findUnique`/`create`/`update`/`delete`/etc. per Prisma model, keyed by model name exactly as Prisma would expose it (e.g. `cmsArticle`, `scopeRestriction`). This whole object is injected via `.overrideProvider(PrismaService).useValue(fakePrisma)` when bootstrapping `AppModule`.
+
+**Why this matters:** if you add a new Prisma model (or a new query on an existing one) to production code, `this.prisma.<newModel>.<method>(...)` will throw "Cannot read properties of undefined" in every e2e spec whose fake Prisma object doesn't define that key — even specs completely unrelated to your feature, because `AppModule` boots the whole app and any code path a request happens to exercise (e.g. a list endpoint that now unconditionally checks a new join table) will hit the gap. `test/news-rbac.e2e-spec.ts`, `test/admin-rbac.e2e-spec.ts`, and `test/p14-remaining.e2e-spec.ts` each maintain independent fakes with different completeness — `p14-remaining.e2e-spec.ts` in particular uses a `makeNoop()` helper for models it doesn't care about testing but still needs stubbed.
+
+**How to apply:** whenever you add a new Prisma model or a new field-dependent code branch (e.g. a `status` enum affecting a `select`) that production code queries unconditionally on a hot path (list/detail), grep every `test/*.e2e-spec.ts` for its own fake Prisma builder and add/extend the corresponding fake table (`makeNoop()` is usually enough if the new model is genuinely irrelevant to that spec's scenarios). Run the full e2e suite (`npx jest --config ./test/jest-e2e.json`) after any such change — a 500 in an unrelated spec almost always means a missing fake table key, not a logic bug. Two suites (`app.e2e-spec.ts`, `throttler.e2e-spec.ts`) use the *real* `PrismaService` against `DATABASE_URL` from `.env` and will fail with 503 in sandboxes where that Postgres instance isn't reachable/credentialed — that's a pre-existing environment gap, not a regression (verify via `git stash` + rerun before blaming your own change).

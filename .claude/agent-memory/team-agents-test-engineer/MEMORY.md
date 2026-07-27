@@ -1,0 +1,5 @@
+- [CSR E2E infra — runner command, FicheCounter sync fix, NEEDS_INFO step fix](project_csr_e2e_infra.md) — critical DB invariant and step bug fixes for CSR Best-Practices API E2E suite
+- [CSR Web smoke suite fixes 2026-06-25](project_csr_web_e2e_fixes.md) — POC API auth, adminStatuses filter, placeholder ID resolution, 61/65 passing; 4 untestable scenarios documented
+- [Web feature tag alignment US-019..035](project_feature_tag_alignment.md) — corrected @US-xxx tags in web features after a numbering shift; file names stable, only tags changed
+- [Angular comment form automation — production build workaround](project_angular_comment_form_automation.md) — pressSequentially proves form fix; direct API + reload to submit; (ngSubmit) not reliable in prod @if block
+- [C-ADMIN dashboard API coverage US-028..031](project_admin_dashboard_api.md) — 18/18 passing; dashboard/stats/export/featured endpoints, 8 new step defs, BOM note on CSV

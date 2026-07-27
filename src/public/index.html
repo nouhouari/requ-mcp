@@ -547,8 +547,15 @@
           <!-- Coverage Trend -->
           <div class="section-card xl:col-span-2">
             <div class="section-card-header">
-              Coverage Trend
-              <span class="text-xs font-normal text-slate-400">cumulative (project-to-date)</span>
+              <span>Coverage Trend <span class="text-xs font-normal text-slate-400">by phase</span></span>
+              <div class="toggle-group" role="group" aria-label="Trend mode">
+                <button class="toggle-btn" :class="trendMode === 'cumulative' ? 'active' : ''"
+                  :aria-pressed="trendMode === 'cumulative'"
+                  @click="setTrendMode('cumulative')">Cumulative</button>
+                <button class="toggle-btn" :class="trendMode === 'strict' ? 'active' : ''"
+                  :aria-pressed="trendMode === 'strict'"
+                  @click="setTrendMode('strict')">Strict</button>
+              </div>
             </div>
             <div class="p-4">
               <template x-if="loading.trend">

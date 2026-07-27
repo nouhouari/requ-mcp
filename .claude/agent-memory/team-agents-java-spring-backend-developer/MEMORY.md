@@ -1,0 +1,3 @@
+- [Stack mismatch: intranet-portal-api](project_stack_mismatch_intranet_portal_api.md) — it's NestJS+Prisma+TS, not Java/Spring; flag it but still deliver, don't hard-block
+- [Fake-Prisma e2e convention](intranet_portal_api_fake_prisma_e2e_convention.md) — no Cucumber/Conductor; new Prisma models need a fake table in every e2e spec or they 500
+- [ScopeRestriction module (US-185/186/187)](intranet_portal_api_scope_restriction_module.md) — two deliberate P23/ADR-019 reversals (403→404, added M:N) + known scope cuts + HIGH fail-open fix (no-actor path never checked M:N junction)
