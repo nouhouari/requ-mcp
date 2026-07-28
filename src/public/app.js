@@ -928,7 +928,7 @@ document.addEventListener('alpine:init', function () {
           return;
         }
         // Destroy any stale instance so the new canvas gets a fresh Chart.js context
-        // (x-if can recycle the canvas reference while _trendChart still holds the old one).
+        // (x-if can recycle the canvas reference while CHARTS.trend still holds the old one).
         if (CHARTS.trend) { CHARTS.trend.destroy(); CHARTS.trend = null; }
         var ctx = canvas.getContext('2d');
 
@@ -1009,7 +1009,7 @@ document.addEventListener('alpine:init', function () {
           return p.summary ? Number((p.summary.verifiedPct || 0).toFixed(1)) : 0;
         });
         CHARTS.trend.data.datasets[1].data = data.map(function (p) {
-          return p.summary ? Number((p.summary.storyCoveragePct || 0).toFixed(1)) : 0;
+          return p.summary ? Number((p.summary.testedStoryCoveragePct || 0).toFixed(1)) : 0;
         });
         CHARTS.trend.update('none');
       },

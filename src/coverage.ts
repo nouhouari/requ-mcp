@@ -566,22 +566,19 @@ const DELIVERED_PHASE_STATUSES: ReadonlySet<string> = new Set(["completed", "act
 
 export function computeDeliveredCoverage(
   requirements: Requirement[],
-  stories: UserStory[],
-  scenariosByStory: ScenariosByStory,
-  executionsByPhase: Map<string, Execution[]>,
+  reportRequirements: RequirementCoverage[],
   phases: Phase[],
-  activePhaseId: string | null,
 ): DeliveredCoverage {
-  // Reuse the cumulative report so verification matches `verifiedPctCumulative`.
-  const status = resolveStatuses(executionsByPhase, phases, activePhaseId, "cumulative");
-  const report = buildReport(requirements, stories, scenariosByStory, status, activePhaseId, "cumulative", [], phases);
-
+  // Takes the already-built cumulative report's requirement coverage (the caller
+  // builds it once via buildReport(..., "cumulative", ...) — reusing it here keeps
+  // verification consistent with `verifiedPctCumulative` without recomputing
+  // resolveStatuses()/buildReport() a second time on the same 5s SSE polling path.
   const phaseById = new Map(phases.map((p) => [p.id, p]));
   const reqById = new Map(requirements.map((r) => [r.id, r]));
 
-  // report.requirements is already restricted to status="active" requirements in
+  // reportRequirements is already restricted to status="active" requirements in
   // cumulative scope. Further restrict to the delivered phase scope.
-  const delivered = report.requirements.filter((rc) => {
+  const delivered = reportRequirements.filter((rc) => {
     const phaseId = reqById.get(rc.id)?.phase;
     if (!phaseId) return true; // unassigned → always delivered scope
     const phase = phaseById.get(phaseId);
