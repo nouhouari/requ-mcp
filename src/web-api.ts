@@ -820,7 +820,9 @@ export async function handleWebRequest(
                     store.listStories(),
                   ]);
                   return { requirements: reqs.length, stories: stories.length,
-                           verifiedPct: 0, storyCoveragePct: 0, activePhase: undefined as string | undefined };
+                           verifiedPct: 0, storyCoveragePct: 0,
+                           verifiedPctCumulative: 0, deliveredVerifiedPct: 0,
+                           activePhase: undefined as string | undefined };
                 }),
               ]);
               return {
