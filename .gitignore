@@ -6,6 +6,8 @@ dist/
 .smoke-tmp/
 # HTTP+Postgres server runtime pid file
 .http-pg.pid
+# Per-user agent memory — never commit (may contain unrelated project context)
+.claude/agent-memory/
 # Playwright MCP scratch output (snapshots, screenshots, console logs)
 .playwright-mcp/
 overview-counts.png

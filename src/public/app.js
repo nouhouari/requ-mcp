@@ -3,12 +3,15 @@
  * global Chart, Alpine
  */
 document.addEventListener('alpine:init', function () {
+  // Non-reactive registry for Chart.js instances. Storing a Chart on the Alpine
+  // component proxies the entire instance through Alpine reactivity; Chart.js'
+  // own deep internal mutations then recurse through the proxy, producing
+  // "Maximum call stack size exceeded" and corrupting its layout object
+  // ("Cannot set properties of undefined (setting 'fullSize')"). Keeping the
+  // instances in this closure variable keeps them raw and non-reactive.
+  var CHARTS = { trend: null, donut: null };
+
   Alpine.data('requApp', function () {
-    // Chart.js instances are kept in closure scope (NOT reactive component state):
-    // assigning a Chart to a reactive Alpine property makes Alpine deep-proxy its
-    // circular internals, causing a "Maximum call stack size exceeded" recursion.
-    var _trendChart = null;
-    var _donutChart = null;
     return {
 
       // ── Navigation ──────────────────────────────────────────────────────────
@@ -52,6 +55,14 @@ document.addEventListener('alpine:init', function () {
       storyPhaseFilter: 'all',
       storyExpanded: null,
 
+      // ── Story detail modal ───────────────────────────────────────────────────
+      storyDetailOpen: false,
+      storyDetail: null,
+      storyDetailLoading: false,
+
+      // ── Allure report status (per active project) ────────────────────────────
+      allureStatus: { available: false, url: '/allure/' },
+
       // ── VCS filters ──────────────────────────────────────────────────────────
       vcsKindFilter: 'all',
       vcsStateFilter: 'all',
@@ -83,7 +94,22 @@ document.addEventListener('alpine:init', function () {
       scenarioTagMatchIds: null,
       scenarioTagError: '',
 
-      // ── Charts: instances live in factory-closure scope, not here (see top) ────
+      // ── Coverage Trend chart controls ────────────────────────────────────────
+      // Independent from coverageMode (which drives the Coverage tab): the trend
+      // chart on the Overview tab has its own strict/cumulative toggle. Defaults
+      // to 'cumulative' since it is more representative of real project progress
+      // at a glance; 'strict' remains available for a rigorous per-phase view.
+      trendMode: 'cumulative',
+
+      // ── Charts ───────────────────────────────────────────────────────────────
+      // NOTE: live Chart.js instances live in the non-reactive CHARTS closure
+      // object (see top of alpine:init), NOT on this reactive component — that
+      // is what prevents the reactivity-recursion crashes.
+      // $watch must be registered exactly once per chart, regardless of how many
+      // times x-if recycles the canvas / re-fires x-init. Stacking watchers is
+      // what produced the "Maximum call stack size exceeded" cascades.
+      _trendWatched: false,
+      _donutWatched: false,
 
       // ── SSE handle ───────────────────────────────────────────────────────────
       _sse: null,
@@ -138,6 +164,7 @@ document.addEventListener('alpine:init', function () {
           this.loadCoverage(),
           this.loadTrend(),
           this.loadGaps(),
+          this.loadAllureStatus(),
         ];
         if (this.projects.length > 1) loaders.push(this.loadGlobalSummary());
         await Promise.all(loaders);
@@ -205,13 +232,20 @@ document.addEventListener('alpine:init', function () {
         var found = this.projects.find(function (p) { return p.slug === slug; });
         if (!found || found === this.activeProject) return;
         this.activeProject = found;
+        // Reset the phase filter so it is re-derived from the new project's
+        // active phase (set by loadSummary). Without this reset, a phase id
+        // from the previous project (e.g. P14) would be passed to
+        // loadCoverage() for the new project, returning 0 passing scenarios
+        // because that phase does not exist in the new project.
+        this.coveragePhase = null;
         // Reconnect SSE for the new project.
         if (this._sse) { this._sse.close(); this._sse = null; }
         this.setupSSE();
-        // Reload all data for the new project.
+        // Load config + summary first so that coveragePhase is set to the new
+        // project's activePhase before loadCoverage() reads it.
+        await Promise.all([self.loadConfig(), self.loadSummary()]);
+        // Now load the remaining data in parallel using the correct coveragePhase.
         await Promise.all([
-          self.loadConfig(),
-          self.loadSummary(),
           self.loadRequirements(),
           self.loadStories(),
           self.loadComponents(),
@@ -220,6 +254,7 @@ document.addEventListener('alpine:init', function () {
           self.loadCoverage(),
           self.loadTrend(),
           self.loadGaps(),
+          self.loadAllureStatus(),
         ]);
       },
 
@@ -265,6 +300,15 @@ document.addEventListener('alpine:init', function () {
         this.loading.components = false;
       },
 
+      async loadAllureStatus() {
+        var d = await this._fetch(this.apiUrl('/api/allure-status'));
+        if (d && typeof d === 'object') {
+          this.allureStatus = { available: !!d.available, url: d.url || '/allure/' };
+        } else {
+          this.allureStatus = { available: false, url: '/allure/' };
+        }
+      },
+
       async loadPhases() {
         this.loading.phases = true;
         var d = await this._fetch(this.apiUrl('/api/phases'));
@@ -290,11 +334,22 @@ document.addEventListener('alpine:init', function () {
 
       async loadTrend() {
         this.loading.trend = true;
-        // Cumulative = project-to-date at each phase (the last point = project total),
-        // not strict per-phase coverage.
-        var d = await this._fetch(this.apiUrl('/api/coverage/trend?mode=cumulative'));
+        var d = await this._fetch(this.apiUrl('/api/coverage/trend?mode=' + this.trendMode));
         if (d) this.trend = d;
         this.loading.trend = false;
+      },
+
+      /**
+       * Switch the Coverage Trend chart between 'strict' (each phase counts
+       * only scenarios explicitly attached to it) and 'cumulative' (inherits
+       * scenarios from prior phases). Persists for the session and re-applies
+       * on every subsequent refresh/re-render (SSE updates, project switch, etc.)
+       * because loadTrend() always reads the current trendMode.
+       */
+      setTrendMode(mode) {
+        if (this.trendMode === mode) return;
+        this.trendMode = mode;
+        this.loadTrend();
       },
 
       async loadGaps() {
@@ -355,6 +410,21 @@ document.addEventListener('alpine:init', function () {
         this.tab = id;
         if (id === 'global')     { this.loadGlobalSummary(); }
         if (id === 'scenarios')  { this.loadScenarios(); }
+        // The Overview canvases use x-show (not x-if), so their x-init only ever
+        // fires once at page load. If the 'overview' tab wasn't the active tab at
+        // that moment (e.g. multi-project installs default to 'global' — see
+        // init()), the canvases were 0×0 and initTrendChart/initDonutChart gave
+        // up after their bounded retry, leaving CHARTS.trend/donut permanently
+        // null. Re-invoking here — now that x-show has revealed the panel — is a
+        // safe no-op when the chart is already live (see the "already bound"
+        // guard in each init function) and is what actually creates it otherwise.
+        if (id === 'overview') {
+          var self = this;
+          this.$nextTick(function () {
+            self.initTrendChart(self.$refs.trendCanvas);
+            self.initDonutChart(self.$refs.donutCanvas);
+          });
+        }
       },
 
       /**
@@ -646,6 +716,38 @@ document.addEventListener('alpine:init', function () {
         return (v !== undefined && v !== null) ? v : 0;
       },
 
+      /**
+       * Project-global count of linked scenarios (all stories, every phase).
+       * Read from the cumulative coverage payload so the KPI card reflects the
+       * whole project. Both helpers use the SAME source and the SAME condition
+       * (cumulative coverage loaded), so the passing/linked pair on the card is
+       * never mixed across scopes; the fallback pair (summary scenariosLinked /
+       * scenariosPassing) is likewise internally consistent (strict report).
+       */
+      projectScenariosLinked() {
+        if (this.coverage && this.coverage.stories && this.coverageMode === 'cumulative') {
+          return this.coverage.stories.reduce(function (n, s) {
+            return n + ((s.scenarios && s.scenarios.length) || 0);
+          }, 0);
+        }
+        return this.summaryVal('scenariosLinked');
+      },
+
+      /**
+       * Project-global count of passing scenarios. Aggregated from the
+       * cumulative coverage data (status carried across phases) so the value is
+       * the project total, not the active phase. Falls back to the summary value
+       * (same source as projectScenariosLinked's fallback — see above).
+       */
+      projectScenariosPassing() {
+        if (this.coverage && this.coverage.stories && this.coverageMode === 'cumulative') {
+          return this.coverage.stories.reduce(function (n, s) {
+            return n + (s.passing || 0);
+          }, 0);
+        }
+        return this.summaryVal('scenariosPassing');
+      },
+
       /** Format a percentage value (number) to one decimal place. */
       pct(v) {
         if (typeof v !== 'number') return '0.0';
@@ -732,6 +834,57 @@ document.addEventListener('alpine:init', function () {
         this.storyExpanded = (this.storyExpanded === id) ? null : id;
       },
 
+      // =========================================================================
+      // Story detail modal
+      // =========================================================================
+
+      /**
+       * Open the detail modal for a story. Seeds it from the already-loaded list
+       * data (instant render), then fetches /api/story for the enriched payload
+       * (scenarios + pass/total) and merges it in.
+       */
+      openStoryDetail(story) {
+        if (!story) return;
+        var self = this;
+        // Merge coverage scenarios we already have so the modal is useful even
+        // before/without the /api/story round-trip.
+        var cov = this.storyCoverage(story);
+        this.storyDetail = Object.assign({}, story, {
+          scenarios: cov && cov.scenarios ? cov.scenarios : [],
+          scenariosTotal: cov ? (cov.scenarios || []).length : 0,
+          scenariosPassing: cov ? (cov.passing || 0) : 0,
+        });
+        this.storyDetailOpen = true;
+        this.storyDetailLoading = true;
+        this._fetch(this.apiUrl('/api/story?id=' + encodeURIComponent(story.id)))
+          .then(function (d) {
+            if (d && d.id === story.id) {
+              self.storyDetail = d;
+            }
+          })
+          .finally(function () { self.storyDetailLoading = false; });
+      },
+
+      closeStoryDetail() {
+        this.storyDetailOpen = false;
+        this.storyDetail = null;
+        this.storyDetailLoading = false;
+      },
+
+      /**
+       * Open the Allure report for a story in a new tab.
+       * Adds #?tag=@US-<id> as a hint so the report can be filtered by the
+       * story's scenario tag (Allure's behaviors/suites view honours tag search).
+       */
+      openAllure(story) {
+        if (!this.allureStatus || !this.allureStatus.available) return;
+        var base = this.allureStatus.url || '/allure/';
+        // Allure 2 supports a tag deep-link via the URL hash on the categories/
+        // behaviors tabs; if it isn't honoured the report still opens at its root.
+        var hash = story && story.id ? ('#categories/?q=' + encodeURIComponent('@' + story.id)) : '';
+        window.open(base + hash, '_blank', 'noopener');
+      },
+
       sortReqBy(col) {
         this.reqSortBy = col;
       },
@@ -740,15 +893,49 @@ document.addEventListener('alpine:init', function () {
       // Chart initialisation
       // =========================================================================
 
-      initTrendChart(canvas) {
+      /**
+       * True when an element is actually laid out (visible and has a non-zero
+       * box). Chart.js throws "fullSize" / sizing errors when asked to render
+       * into a 0×0 canvas — which happens while the Overview tab is hidden
+       * (x-show toggles display:none but keeps the DOM mounted).
+       */
+      _isLaidOut(el) {
+        if (!el) return false;
+        if (el.offsetParent === null) return false; // display:none somewhere up the tree
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      },
+
+      initTrendChart(canvas, tries) {
         var self = this;
         if (!canvas || typeof Chart === 'undefined') return;
+        // If x-if has already swapped this canvas out of the live DOM, abandon
+        // it — retrying a detached node never lays out and would recurse forever
+        // (that runaway rAF loop is what produced "Maximum call stack size
+        // exceeded"). A fresh x-init will fire for the replacement canvas.
+        if (!document.contains(canvas)) return;
+        // Wait until the canvas is really on-screen and sized. If layout hasn't
+        // settled yet, retry a bounded number of frames, then give up — the
+        // Overview tab becoming visible re-fires x-init, so we don't need to
+        // spin forever while the panel is hidden.
+        if (!self._isLaidOut(canvas)) {
+          var n = (tries || 0) + 1;
+          if (n > 30) return;
+          requestAnimationFrame(function () { self.initTrendChart(canvas, n); });
+          return;
+        }
+        // If we already have a live chart bound to THIS canvas, just refresh its
+        // data — never stack a second Chart instance on the same canvas.
+        if (CHARTS.trend && CHARTS.trend.canvas === canvas) {
+          if (self.trend) self._applyTrend(self.trend);
+          return;
+        }
         // Destroy any stale instance so the new canvas gets a fresh Chart.js context
-        // (x-if can recycle the canvas reference while _trendChart still holds the old one).
-        if (_trendChart) { _trendChart.destroy(); _trendChart = null; }
+        // (x-if can recycle the canvas reference while CHARTS.trend still holds the old one).
+        if (CHARTS.trend) { CHARTS.trend.destroy(); CHARTS.trend = null; }
         var ctx = canvas.getContext('2d');
 
-        _trendChart = new Chart(ctx, {
+        CHARTS.trend = new Chart(ctx, {
           type: 'line',
           data: {
             labels: [],
@@ -803,27 +990,53 @@ document.addEventListener('alpine:init', function () {
           },
         });
 
-        function applyTrend(data) {
-          if (!data || !_trendChart) return;
-          _trendChart.data.labels = data.map(function (p) { return p.phaseName || p.phase; });
-          _trendChart.data.datasets[0].data = data.map(function (p) {
-            return p.summary ? Number((p.summary.verifiedPct || 0).toFixed(1)) : 0;
-          });
-          _trendChart.data.datasets[1].data = data.map(function (p) {
-            return p.summary ? Number((p.summary.testedStoryCoveragePct || 0).toFixed(1)) : 0;
-          });
-          _trendChart.update('none');
+        // Register the reactive watcher exactly once, ever — re-running init
+        // (x-if recycling the canvas) must not stack additional watchers.
+        if (!self._trendWatched) {
+          self._trendWatched = true;
+          self.$watch('trend', function (data) { self._applyTrend(data); });
         }
-
-        this.$watch('trend', applyTrend);
-        if (this.trend) applyTrend(this.trend);
+        if (this.trend) self._applyTrend(this.trend);
       },
 
-      initDonutChart(canvas) {
+      _applyTrend(data) {
+        var self = this;
+        if (!data || !CHARTS.trend) return;
+        // Don't push an update into a chart whose canvas is detached or 0×0
+        // (e.g. the Overview tab is hidden, or x-if just swapped the canvas):
+        // Chart.js' resize path throws "fullSize" on a zero-size canvas. The
+        // data will be applied when initTrendChart re-runs on a visible canvas.
+        if (!self._isLaidOut(CHARTS.trend.canvas)) return;
+        CHARTS.trend.data.labels = data.map(function (p) { return p.phaseName || p.phase; });
+        CHARTS.trend.data.datasets[0].data = data.map(function (p) {
+          return p.summary ? Number((p.summary.verifiedPct || 0).toFixed(1)) : 0;
+        });
+        CHARTS.trend.data.datasets[1].data = data.map(function (p) {
+          return p.summary ? Number((p.summary.testedStoryCoveragePct || 0).toFixed(1)) : 0;
+        });
+        CHARTS.trend.update('none');
+      },
+
+      initDonutChart(canvas, tries) {
         var self = this;
         if (!canvas || typeof Chart === 'undefined') return;
+        // Abandon a canvas x-if has detached (see initTrendChart) — prevents the
+        // runaway retry recursion behind "Maximum call stack size exceeded".
+        if (!document.contains(canvas)) return;
+        // Wait for the canvas to be visible & sized (bounded; see initTrendChart).
+        if (!self._isLaidOut(canvas)) {
+          var n = (tries || 0) + 1;
+          if (n > 30) return;
+          requestAnimationFrame(function () { self.initDonutChart(canvas, n); });
+          return;
+        }
+        // Already bound to this canvas → refresh data only, don't re-create.
+        if (CHARTS.donut && CHARTS.donut.canvas === canvas) {
+          if (self.coverage) self._applyDonut(self.coverage);
+          return;
+        }
         // Same as trendChart: destroy any stale instance before re-init.
-        if (_donutChart) { _donutChart.destroy(); _donutChart = null; }
+        if (CHARTS.donut) { CHARTS.donut.destroy(); CHARTS.donut = null; }
         var ctx = canvas.getContext('2d');
 
         var COLORS = [
@@ -832,7 +1045,7 @@ document.addEventListener('alpine:init', function () {
           '#f97316', '#84cc16',
         ];
 
-        _donutChart = new Chart(ctx, {
+        CHARTS.donut = new Chart(ctx, {
           type: 'doughnut',
           data: {
             labels: [],
@@ -864,21 +1077,29 @@ document.addEventListener('alpine:init', function () {
           },
         });
 
-        function applyDonut(data) {
-          if (!data || !_donutChart) return;
-          var by = data.byComponent || [];
-          _donutChart.data.labels = by.map(function (c) { return c.component; });
-          _donutChart.data.datasets[0].data = by.map(function (c) {
-            return Number((c.verifiedPct || 0).toFixed(1));
-          });
-          _donutChart.data.datasets[0].backgroundColor = by.map(function (_, i) {
-            return COLORS[i % COLORS.length];
-          });
-          _donutChart.update('none');
+        self._donutColors = COLORS;
+        if (!self._donutWatched) {
+          self._donutWatched = true;
+          self.$watch('coverage', function (data) { self._applyDonut(data); });
         }
+        if (this.coverage) self._applyDonut(this.coverage);
+      },
 
-        this.$watch('coverage', applyDonut);
-        if (this.coverage) applyDonut(this.coverage);
+      _applyDonut(data) {
+        var self = this;
+        if (!data || !CHARTS.donut) return;
+        // See _applyTrend: skip updates while the canvas is hidden/detached.
+        if (!self._isLaidOut(CHARTS.donut.canvas)) return;
+        var COLORS = self._donutColors || [];
+        var by = data.byComponent || [];
+        CHARTS.donut.data.labels = by.map(function (c) { return c.component; });
+        CHARTS.donut.data.datasets[0].data = by.map(function (c) {
+          return Number((c.verifiedPct || 0).toFixed(1));
+        });
+        CHARTS.donut.data.datasets[0].backgroundColor = by.map(function (_, i) {
+          return COLORS[i % COLORS.length];
+        });
+        CHARTS.donut.update('none');
       },
 
       // =========================================================================

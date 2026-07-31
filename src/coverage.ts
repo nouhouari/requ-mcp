@@ -538,6 +538,63 @@ export function buildReport(
   };
 }
 
+/**
+ * "Verified on the DELIVERED scope" — a less-pessimistic verified metric.
+ *
+ * The global cumulative `verifiedPct` is pessimistic because it counts every
+ * requirement scoped to the active phase or earlier, including requirements
+ * planned for phases that are NOT yet delivered (status="planned"). This helper
+ * restricts the denominator to requirements whose target phase is actually
+ * delivered — i.e. its phase status is "completed" or "active" — so the figure
+ * reflects what has shipped, not what is still on the roadmap.
+ *
+ * Rules:
+ *   - A requirement is in the delivered scope when it is status="active" AND
+ *     (it has no phase, OR its phase exists with status "completed"/"active").
+ *     Unassigned and unknown-phase requirements are kept (backward-compatible
+ *     with the rest of the coverage model, which treats them as always in scope).
+ *   - Verification re-uses the cumulative coverage model (latest known scenario
+ *     result carried forward), identical to `verifiedPctCumulative`.
+ */
+export interface DeliveredCoverage {
+  deliveredTotal: number;
+  deliveredVerified: number;
+  deliveredVerifiedPct: number;
+}
+
+const DELIVERED_PHASE_STATUSES: ReadonlySet<string> = new Set(["completed", "active"]);
+
+export function computeDeliveredCoverage(
+  requirements: Requirement[],
+  reportRequirements: RequirementCoverage[],
+  phases: Phase[],
+): DeliveredCoverage {
+  // Takes the already-built cumulative report's requirement coverage (the caller
+  // builds it once via buildReport(..., "cumulative", ...) — reusing it here keeps
+  // verification consistent with `verifiedPctCumulative` without recomputing
+  // resolveStatuses()/buildReport() a second time on the same 5s SSE polling path.
+  const phaseById = new Map(phases.map((p) => [p.id, p]));
+  const reqById = new Map(requirements.map((r) => [r.id, r]));
+
+  // reportRequirements is already restricted to status="active" requirements in
+  // cumulative scope. Further restrict to the delivered phase scope.
+  const delivered = reportRequirements.filter((rc) => {
+    const phaseId = reqById.get(rc.id)?.phase;
+    if (!phaseId) return true; // unassigned → always delivered scope
+    const phase = phaseById.get(phaseId);
+    if (!phase) return true; // unknown phase → treat as unassigned
+    return DELIVERED_PHASE_STATUSES.has(phase.status);
+  });
+
+  const deliveredTotal = delivered.length;
+  const deliveredVerified = delivered.filter((r) => r.verified).length;
+  return {
+    deliveredTotal,
+    deliveredVerified,
+    deliveredVerifiedPct: pct(deliveredVerified, deliveredTotal),
+  };
+}
+
 export interface TrendPoint {
   phase: string;
   phaseName: string;

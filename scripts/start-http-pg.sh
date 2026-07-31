@@ -10,6 +10,24 @@ PID_FILE="${PID_FILE:-$PROJECT_DIR/.http-pg.pid}"
 # ---------------------------------------------------------------------------
 REQU_PORT="${REQU_PORT:-8788}"
 REQU_HOST="${REQU_HOST:-0.0.0.0}"
+# Multi-project auto-discovery (optional): set REQU_WORKSPACE_DIR to a
+# workspace directory and every child directory containing a .requ/ folder is
+# loaded as a project root. Set REQU_PROJECTS explicitly to skip discovery.
+if [ -z "${REQU_PROJECTS:-}" ] && [ -n "${REQU_WORKSPACE_DIR:-}" ]; then
+  if [ ! -d "$REQU_WORKSPACE_DIR" ]; then
+    echo "REQU_WORKSPACE_DIR does not exist: $REQU_WORKSPACE_DIR" >&2
+    exit 1
+  fi
+  discovered=$(find "$REQU_WORKSPACE_DIR" -maxdepth 2 -name ".requ" -type d \
+    -not -path "*/node_modules/*" \
+    -not -path "*/.git/*" \
+    2>/dev/null \
+    | sed 's|/\.requ$||' \
+    | tr '\n' ',')
+  REQU_PROJECTS="${discovered%,}"
+fi
+REQU_PROJECTS="${REQU_PROJECTS:-}"
+# REQU_ROOT is kept for single-project fallback (unused when REQU_PROJECTS is set)
 REQU_ROOT="${REQU_ROOT:-$PROJECT_DIR}"
 PG_USER="${PG_USER:-requ}"
 PG_PASSWORD="${PG_PASSWORD:-requ}"
@@ -46,6 +64,7 @@ start() {
   export REQU_PORT
   export REQU_HOST
   export REQU_ROOT
+  export REQU_PROJECTS
 
   nohup "$PROJECT_DIR/node_modules/.bin/tsx" "$PROJECT_DIR/src/index.ts" > /tmp/requ-mcp.log 2>&1 &
   echo $! > "$PID_FILE"
