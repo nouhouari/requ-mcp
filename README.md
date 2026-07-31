@@ -347,8 +347,12 @@ their **`key`**:
 
 ## Releasing (npm)
 
-Publishing is automated by `.github/workflows/publish.yml`, which runs on a
-GitHub Release and ships to npm with provenance.
+Publishing is automated by `.github/workflows/publish.yml`. It runs on every
+push to `main`: when the `package.json` version is **not yet on npm**, it
+builds, runs the smoke test, publishes with provenance, and then creates the
+matching `vX.Y.Z` git tag and GitHub release with generated notes. When the
+version is already published the run is a no-op, so ordinary pushes to `main`
+are safe.
 
 One-time setup:
 
@@ -359,15 +363,16 @@ One-time setup:
 To cut a release:
 
 ```bash
-# bump the version in package.json (e.g. 0.1.0), commit, then:
-git tag v0.1.0
-git push origin v0.1.0
-gh release create v0.1.0 --generate-notes
+# bump the version and update CHANGELOG.md, then land it on main:
+npm version 0.9.0 --no-git-tag-version
+git commit -am "chore(release): v0.9.0"
+git push   # (or merge via PR)
 ```
 
-The workflow verifies the tag matches `package.json`, builds, runs the smoke
-test, and publishes. The release tag (`vX.Y.Z`) must match the `package.json`
-version.
+That's it — the workflow publishes to npm and creates the tag + GitHub release
+automatically. Creating a GitHub Release by hand still works as a fallback
+trigger (the tag must match `package.json`), and the workflow can also be run
+manually via **Actions → Publish → Run workflow**.
 
 ## Coverage metrics (story-level)
 

@@ -1,13 +1,27 @@
 name: Publish
 
-# Publishes to npm when you create a GitHub Release (tag like v0.1.0).
+# Publishes to npm automatically whenever the version in package.json changes
+# on main (typical flow: merge a release PR that bumps the version). After a
+# successful publish, the workflow also creates the matching git tag and
+# GitHub release, so no manual release step is needed.
+#
+# The "release: published" trigger is kept as a manual fallback: creating a
+# GitHub release by hand still publishes, and the already-published guard
+# makes the two triggers idempotent — whichever runs second is a no-op.
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # create the git tag + GitHub release
   id-token: write # required for npm provenance
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -21,25 +35,61 @@ jobs:
           registry-url: https://registry.npmjs.org
           cache: npm
 
-      - name: Verify release tag matches package.json version
+      - name: Check whether this version is already on npm
+        id: check
         run: |
-          PKG=$(node -p "require('./package.json').version")
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "::notice::$PKG_NAME@$PKG_VERSION is already published — nothing to do."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify release tag matches package.json version
+        if: github.event_name == 'release'
+        run: |
           TAG=${GITHUB_REF_NAME#v}
-          if [ "$PKG" != "$TAG" ]; then
-            echo "::error::Release tag '$TAG' does not match package.json version '$PKG'"
+          if [ "${{ steps.check.outputs.version }}" != "$TAG" ]; then
+            echo "::error::Release tag '$TAG' does not match package.json version '${{ steps.check.outputs.version }}'"
             exit 1
           fi
 
       - name: Install dependencies
+        if: steps.check.outputs.published == 'false'
         run: npm ci
 
       - name: Build
+        if: steps.check.outputs.published == 'false'
         run: npm run build
 
       - name: Smoke test
+        if: steps.check.outputs.published == 'false'
         run: npm run smoke
 
       - name: Publish to npm
+        if: steps.check.outputs.published == 'false'
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Skipped when the run was triggered by a release (the tag/release
+      # already exist) or when the version was already published.
+      - name: Create git tag + GitHub release
+        if: steps.check.outputs.published == 'false' && github.event_name != 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.check.outputs.version }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists — skipping."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
