@@ -2,9 +2,36 @@
 
 All notable changes to this project will be documented here.
 
-## [Unreleased]
+## [0.8.0] – 2026-07-31
+
+### Added
+- **Allure report serving** — the HTTP dashboard serves the static Allure report
+  from `<project>/allure-report` (or the Conductor root) at `/allure/<slug>/`,
+  with `GET /api/allure-status` and a per-story "Allure" button in the Stories tab.
+- **Story detail modal** — `GET /api/story?id=US-…` returns the full story
+  enriched with linked scenarios and pass counts; the dashboard shows it in a
+  modal (description, acceptance criteria, requirements, scenario statuses).
+- **"Verified (livré)" delivered-scope metric** — `computeDeliveredCoverage()`
+  restricts the verified denominator to requirements whose target phase is
+  delivered (status `completed`/`active`), excluding planned phases. Exposed as
+  `deliveredVerifiedPct`/`deliveredVerified`/`deliveredTotal` in `/api/summary`
+  and `deliveredVerifiedPct` + `verifiedPctCumulative` in `/api/global`.
+- **Coverage Trend strict/cumulative toggle** on the Overview tab.
+- **`ingest-cucumber-pg`** CLI script — imports a cucumber-json execution report
+  directly into the Postgres store (replica of the `import_execution_report` MCP tool).
+- **`sync-yaml-to-pg`** CLI script — pushes the YAML store export into the
+  Postgres-backed HTTP store via `POST /api/import`.
+- Optional multi-project auto-discovery in `start-http-pg.sh` via `REQU_WORKSPACE_DIR`.
+- Dashboard favicon; extended static-file MIME map (fonts, images, csv, …).
 
 ### Fixed
+- **Overview charts no longer crash intermittently.** Chart.js instances now
+  live in a non-reactive registry (Alpine deep-proxying them caused "Maximum
+  call stack size exceeded"), init retries are bounded, and each chart registers
+  its `$watch` exactly once.
+- Overview Scenarios KPI reads passing/linked counts from a single consistent
+  source instead of mixing cumulative and strict scopes.
+- Removed a dead duplicate `GET /api/scenarios` handler.
 - **HTTP mode no longer overwrites projects.** `init_project` previously resolved
   the target project via filesystem path auto-detection (`REQU_ROOT` / cwd walk).
   In HTTP mode the server is the store, so auto-detection always landed on the
