@@ -25,7 +25,7 @@ document.addEventListener('alpine:init', function () {
         config: false, summary: false, requirements: false,
         stories: false, components: false, phases: false,
         vcs: false, coverage: false, trend: false, gaps: false,
-        global: false,
+        global: false, screens: false,
       },
 
       // ── Data ────────────────────────────────────────────────────────────────
@@ -39,6 +39,18 @@ document.addEventListener('alpine:init', function () {
       coverage: null,
       trend: null,
       gaps: null,
+      screens: [],
+      uiCoverage: null,
+
+      // ── Screens (UI specs) ───────────────────────────────────────────────────
+      screenSearch: '',
+      screenPlatformFilter: 'all',
+      screenStatusFilter: 'all',
+      screenStaleOnly: false,
+      screenDetailOpen: false,
+      screenDetail: null,
+      screenHtml: '',
+      screenHighlight: true,
 
       // ── Requirement filters ──────────────────────────────────────────────────
       reqSearch: '',
@@ -403,6 +415,108 @@ document.addEventListener('alpine:init', function () {
       },
 
       // =========================================================================
+      // Screens (UI specifications)
+      // =========================================================================
+
+      /** Screens + the UI consistency checks, both scoped to the active project. */
+      loadScreens: async function () {
+        this.loading.screens = true;
+        try {
+          var self = this;
+          var results = await Promise.all([
+            fetch(this.apiUrl('/api/screens')).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+            fetch(this.apiUrl('/api/ui-coverage')).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+          ]);
+          self.screens = (results[0] && results[0].screens) || [];
+          self.uiCoverage = results[1];
+        } finally {
+          this.loading.screens = false;
+        }
+      },
+
+      filteredScreens: function () {
+        var self = this;
+        var q = this.screenSearch.trim().toLowerCase();
+        return this.screens.filter(function (sc) {
+          if (self.screenPlatformFilter !== 'all' && sc.platform !== self.screenPlatformFilter) return false;
+          if (self.screenStatusFilter !== 'all' && sc.status !== self.screenStatusFilter) return false;
+          if (self.screenStaleOnly && !sc.stale) return false;
+          if (q && (sc.id + ' ' + sc.name + ' ' + (sc.description || '')).toLowerCase().indexOf(q) === -1) return false;
+          return true;
+        });
+      },
+
+      screenStatusBadge: function (status) {
+        if (status === 'validated_ops') return 'badge-green';
+        if (status === 'reviewed_qa')   return 'badge-blue';
+        if (status === 'obsolete')      return 'badge-slate';
+        return 'badge-amber';
+      },
+
+      /** Issues raised for one screen by the UI consistency checks. */
+      issuesForScreen: function (id) {
+        if (!this.uiCoverage) return [];
+        return (this.uiCoverage.issues || []).filter(function (i) { return i.screen === id; });
+      },
+
+      /**
+       * Open the mockup viewer. The HTML is fetched and rendered inside a fully
+       * sandboxed iframe via srcdoc (no scripts, no same-origin) — requ renders
+       * mockups, it never executes them.
+       */
+      openScreen: async function (id) {
+        this.screenDetailOpen = true;
+        this.screenDetail = null;
+        this.screenHtml = '';
+        try {
+          var detail = await fetch(this.apiUrl('/api/screens/' + encodeURIComponent(id))).then(function (r) { return r.ok ? r.json() : null; });
+          this.screenDetail = detail;
+          var html = await fetch(this.apiUrl('/api/screens/' + encodeURIComponent(id) + '/html')).then(function (r) { return r.ok ? r.text() : ''; });
+          this.screenHtml = html;
+        } catch (e) {
+          this.screenHtml = '';
+        }
+      },
+
+      closeScreen: function () {
+        this.screenDetailOpen = false;
+        this.screenDetail = null;
+        this.screenHtml = '';
+      },
+
+      /**
+       * The mockup as rendered in the viewer. Highlighting is pure CSS appended to
+       * the document (traced elements outlined and labelled with their
+       * `data-req-el`, untraced ones flagged red), so nothing script-based ever
+       * runs inside the frame.
+       */
+      screenSrcdoc: function () {
+        if (!this.screenHtml) return '';
+        if (!this.screenHighlight) return this.screenHtml;
+        // Ids show on hover so the labels never cover the mockup; only untraced
+        // elements (the ones the checks flag) are labelled permanently.
+        var css = [
+          '<style id="requ-highlight">',
+          '[data-req-el]{outline:2px dashed #6366f1!important;outline-offset:2px;position:relative!important;}',
+          '[data-req-el]:hover::after,[data-req-el]:not([data-req-stories])::after{',
+          'content:attr(data-req-el);position:absolute;top:-9px;left:0;z-index:2147483647;',
+          'background:#4f46e5;color:#fff;font:600 9px/1.4 ui-monospace,monospace;padding:1px 4px;border-radius:3px;',
+          'pointer-events:none;white-space:nowrap;}',
+          '[data-req-el]:not([data-req-stories]){outline-color:#ef4444!important;}',
+          '[data-req-el]:not([data-req-stories])::after{background:#dc2626;content:attr(data-req-el) " · no story";}',
+          '</style>',
+        ].join('');
+        return this.screenHtml + css;
+      },
+
+      /** Jump from a screen to one of the stories it materializes. */
+      goToStory: function (storyId) {
+        this.closeScreen();
+        this.storySearch = storyId;
+        this.navTo('stories');
+      },
+
+      // =========================================================================
       // Tab navigation
       // =========================================================================
 
@@ -410,6 +524,7 @@ document.addEventListener('alpine:init', function () {
         this.tab = id;
         if (id === 'global')     { this.loadGlobalSummary(); }
         if (id === 'scenarios')  { this.loadScenarios(); }
+        if (id === 'screens')    { this.loadScreens(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -433,8 +548,8 @@ document.addEventListener('alpine:init', function () {
        */
       shiftFocus(dir) {
         var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'stories', 'coverage', 'components', 'vcs', 'scenarios']
-          : ['overview', 'requirements', 'stories', 'coverage', 'components', 'vcs', 'scenarios'];
+          ? ['global', 'overview', 'requirements', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios']
+          : ['overview', 'requirements', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios'];
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }

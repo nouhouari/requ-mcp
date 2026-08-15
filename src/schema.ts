@@ -4,8 +4,8 @@ import { z } from "zod";
  * The requ-mcp data model.
  *
  * Traceability spine:
- *   Component ← Requirement → User Story → (acceptance criteria)
- *                                ↑
+ *   Component ← Requirement → User Story ─┬→ (acceptance criteria)
+ *                                ↑        └→ Screen (UI spec / HTML mockup)
  *   Phase → Execution (a scenario result for a run) ─── @US-xxx tag in feature files
  *
  * Component: a sub-system/module that maps to broker domain_tags.
@@ -114,6 +114,109 @@ export const AcceptanceCriterion = z.object({
 export type AcceptanceCriterion = z.infer<typeof AcceptanceCriterion>;
 
 // ---------------------------------------------------------------------------
+// Screen — a UI specification (static HTML mockup) that materializes stories.
+//
+//   Requirement → User Story ─┬→ Acceptance Criteria → Scenario → Execution
+//                             └→ Screen (mockup HTML)
+//
+// requ stores and traces mockups; it is not a UI editor. The mockup is a
+// self-contained static HTML file, regenerable by an agent from the specs, whose
+// significant elements carry `data-req-*` attributes (see screen-html.ts).
+// ---------------------------------------------------------------------------
+
+export const ScreenPlatform = z.enum(["mobile", "web", "desktop", "tablet"]);
+export type ScreenPlatform = z.infer<typeof ScreenPlatform>;
+
+export const ScreenStatus = z.enum(["draft", "reviewed_qa", "validated_ops", "obsolete"]);
+export type ScreenStatus = z.infer<typeof ScreenStatus>;
+
+/** A full screen, or a shared UI component embedded by screens. */
+export const ScreenKind = z.enum(["screen", "component"]);
+export type ScreenKind = z.infer<typeof ScreenKind>;
+
+/** What the screen does for the story it is linked to. */
+export const ScreenLinkRole = z.enum(["primary", "secondary", "entry", "confirmation"]);
+export type ScreenLinkRole = z.infer<typeof ScreenLinkRole>;
+
+/** Nature of a traced element — tells the test agent which assertion to write. */
+export const ElementRole = z.enum(["action", "input", "display", "feedback", "navigation"]);
+export type ElementRole = z.infer<typeof ElementRole>;
+
+/** Screen ids look like `SCR-BOOK-DETAIL-MOB`; shared components use `UIC-`. */
+export const SCREEN_ID_RE = /^(SCR|UIC)-[A-Z0-9][A-Z0-9_-]*$/;
+
+/** Kind implied by an id prefix (`UIC-` = shared component, else screen). */
+export function kindFromScreenId(id: string): ScreenKind {
+  return id.startsWith("UIC-") ? "component" : "screen";
+}
+
+/**
+ * One traced element of a mockup, extracted from its `data-req-*` attributes.
+ * Derived data: recomputed from the HTML on every write, never hand-edited.
+ */
+export const ScreenElement = z.object({
+  /** `data-req-el` — stable id, unique within the screen. The anchor step
+   *  definitions bind to, in place of a fragile CSS selector. */
+  el: z.string().min(1),
+  /** `data-req-role` — kept free-form; unknown roles are reported as warnings. */
+  role: z.string().default(""),
+  /** `data-req-stories` — story ids this element materializes. */
+  stories: z.array(z.string()).default([]),
+  /** `data-req-field` — data-model field this element renders/captures. */
+  field: z.string().optional(),
+  /** `data-req-target` — screen id this element navigates to. */
+  target: z.string().optional(),
+  /** HTML tag the attributes were found on, e.g. "button". */
+  tag: z.string().default(""),
+  /** Best-effort inner text, for review and for the error-feedback check. */
+  text: z.string().default(""),
+  /** Shared component id this element came from; absent when declared inline. */
+  from: z.string().optional(),
+});
+export type ScreenElement = z.infer<typeof ScreenElement>;
+
+/** Story ↔ screen edge. Many-to-many, stored on the screen row. */
+export const ScreenStoryLink = z.object({
+  id: z.string().regex(/^US-\d+$/, "id must look like US-001"),
+  role: ScreenLinkRole.default("primary"),
+});
+export type ScreenStoryLink = z.infer<typeof ScreenStoryLink>;
+
+export const Screen = z.object({
+  id: z.string().regex(SCREEN_ID_RE, "id must look like SCR-BOOK-DETAIL-MOB (or UIC-… for a shared component)"),
+  kind: ScreenKind.default("screen"),
+  name: z.string().min(1),
+  /** Optional for shared components, which may be platform-agnostic. */
+  platform: ScreenPlatform.optional(),
+  /** Delivery phase this screen belongs to (matches Phase.id). */
+  phase: z.string().optional(),
+  description: z.string().default(""),
+  /** Repo path of the static HTML mockup, when it lives as a file next to the
+   *  specs. `html` holds the content requ serves (a snapshot when both are set). */
+  mockupPath: z.string().optional(),
+  html: z.string().default(""),
+  /** Semver or content hash — defaults to a hash of `html` on write. */
+  version: z.string().default(""),
+  status: ScreenStatus.default("draft"),
+  /** Stories this screen materializes, with the role it plays for each. */
+  stories: z.array(ScreenStoryLink).default([]),
+  /** Shared component ids this screen embeds (explicit + `data-req-component`). */
+  uses: z.array(z.string()).default([]),
+  /** Screen ids reachable from here (explicit + `data-req-target`). */
+  exits: z.array(z.string()).default([]),
+  /** Marks an intentional end of a flow, exempt from the dead-end check. */
+  terminal: z.boolean().default(false),
+  /** Derived from `html` on every write. */
+  elements: z.array(ScreenElement).default([]),
+  /** storyId → that story's `updatedAt` when the screen was last generated.
+   *  A linked story whose current updatedAt differs has drifted → screen is stale. */
+  storyVersions: z.record(z.string()).default({}),
+  createdAt: Timestamp,
+  updatedAt: Timestamp,
+});
+export type Screen = z.infer<typeof Screen>;
+
+// ---------------------------------------------------------------------------
 // User Story — PO-authored, must trace to ≥1 requirement
 // ---------------------------------------------------------------------------
 
@@ -128,6 +231,12 @@ export const UserStory = z.object({
   requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1),
   acceptanceCriteria: z.array(AcceptanceCriterion).default([]),
   status: StoryStatus.default("draft"),
+  /** UI platforms this story must be materialized on. Drives the per-platform
+   *  screen coverage check; empty falls back to config.uiPlatforms. */
+  platforms: z.array(ScreenPlatform).default([]),
+  /** Data-model fields the story touches, e.g. ["guestCount","slotDate"]. Each one
+   *  must surface in at least one linked screen (structural UI check). */
+  dataFields: z.array(z.string()).default([]),
   /** NOTE: a story has no phase of its own. Its phase scope is derived from the
    *  phases of the requirements it traces to (see `storyInScope` in coverage.ts).
    *  This keeps requirement phase as the single source of truth — no drift. */
@@ -236,6 +345,9 @@ export const Config = z.object({
   /** Default branch name; treated as "main" when unset. */
   defaultBranch: z.string().optional(),
   vcsType: z.enum(["gitlab"]).optional(),
+  /** Platforms every story is expected to be materialized on, unless the story
+   *  overrides them. Drives the per-platform screen coverage check. */
+  uiPlatforms: z.array(ScreenPlatform).optional(),
 });
 export type Config = z.infer<typeof Config>;
 
@@ -287,6 +399,7 @@ export const ExportPayload = z.object({
     requirements: z.array(Requirement).default([]),
     stories:      z.array(UserStory).default([]),
     scenarios:    z.array(Scenario).default([]),
+    screens:      z.array(Screen).default([]),
     phases:       z.array(Phase).default([]),
     executions:   z.record(z.array(Execution)).default({}),
     vcsRefs:      z.array(VcsRef).default([]),

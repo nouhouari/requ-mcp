@@ -7,6 +7,7 @@ import {
   Phase,
   Requirement,
   Scenario,
+  Screen,
   UserStory,
   VcsRef,
   type Component as TComponent,
@@ -15,6 +16,7 @@ import {
   type Phase as TPhase,
   type Requirement as TRequirement,
   type Scenario as TScenario,
+  type Screen as TScreen,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
@@ -79,6 +81,12 @@ const SCHEMA_SQL = `
     PRIMARY KEY (project_id, id)
   );
   CREATE TABLE IF NOT EXISTS scenarios (
+    project_id TEXT  NOT NULL,
+    id         TEXT  NOT NULL,
+    data       JSONB NOT NULL,
+    PRIMARY KEY (project_id, id)
+  );
+  CREATE TABLE IF NOT EXISTS screens (
     project_id TEXT  NOT NULL,
     id         TEXT  NOT NULL,
     data       JSONB NOT NULL,
@@ -430,6 +438,45 @@ export class PostgresStore {
     const res = await pool.query(
       "DELETE FROM scenarios WHERE project_id = $1 AND id = $2",
       [this.projectId, testKey],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  // --- screens ---
+
+  async listScreens(): Promise<TScreen[]> {
+    const pool = await this.pool();
+    const { rows } = await pool.query(
+      "SELECT data FROM screens WHERE project_id = $1 ORDER BY id",
+      [this.projectId],
+    );
+    return rows.map((r) => Screen.parse(r.data));
+  }
+
+  async getScreen(id: string): Promise<TScreen | null> {
+    const pool = await this.pool();
+    const { rows } = await pool.query(
+      "SELECT data FROM screens WHERE project_id = $1 AND id = $2",
+      [this.projectId, id],
+    );
+    return rows.length ? Screen.parse(rows[0].data) : null;
+  }
+
+  async writeScreen(screen: TScreen): Promise<void> {
+    const pool = await this.pool();
+    const v = Screen.parse(screen);
+    await pool.query(
+      `INSERT INTO screens(project_id, id, data) VALUES($1, $2, $3)
+       ON CONFLICT (project_id, id) DO UPDATE SET data = EXCLUDED.data`,
+      [this.projectId, v.id, v],
+    );
+  }
+
+  async deleteScreen(id: string): Promise<boolean> {
+    const pool = await this.pool();
+    const res = await pool.query(
+      "DELETE FROM screens WHERE project_id = $1 AND id = $2",
+      [this.projectId, id],
     );
     return (res.rowCount ?? 0) > 0;
   }

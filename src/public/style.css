@@ -353,6 +353,7 @@ body {
 .chip-indigo { background: #e0e7ff; color: #4338ca; }
 .chip-green  { background: #dcfce7; color: #15803d; }
 .chip-amber  { background: #fef3c7; color: #b45309; }
+.chip-slate  { background: #f1f5f9; color: #475569; }
 
 /* ── Spinner ────────────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }

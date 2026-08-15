@@ -10,6 +10,7 @@ import {
   Phase,
   Requirement,
   Scenario,
+  Screen,
   UserStory,
   VcsRef,
   type Component as TComponent,
@@ -18,6 +19,7 @@ import {
   type Phase as TPhase,
   type Requirement as TRequirement,
   type Scenario as TScenario,
+  type Screen as TScreen,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
@@ -31,6 +33,7 @@ import {
  *   <root>/.requ/stories/US-001.yaml
  *   <root>/.requ/phases/P1.yaml
  *   <root>/.requ/executions/P1.yaml   (append-style run log)
+ *   <root>/.requ/screens/SCR-X.yaml   (metadata) + SCR-X.html (the mockup)
  */
 export class Store {
   readonly root: string;
@@ -48,6 +51,7 @@ export class Store {
   private get execDir()      { return path.join(this.baseDir, "executions"); }
   private get vcsDir()       { return path.join(this.baseDir, "vcs"); }
   private get scenarioDir()  { return path.join(this.baseDir, "scenarios"); }
+  private get screenDir()    { return path.join(this.baseDir, "screens"); }
   private get configPath()   { return path.join(this.baseDir, "config.yaml"); }
 
   async isInitialized(): Promise<boolean> {
@@ -62,6 +66,7 @@ export class Store {
     await fs.mkdir(this.execDir,      { recursive: true });
     await fs.mkdir(this.vcsDir,       { recursive: true });
     await fs.mkdir(this.scenarioDir,  { recursive: true });
+    await fs.mkdir(this.screenDir,    { recursive: true });
     await this.writeConfig(config);
   }
 
@@ -242,6 +247,74 @@ export class Store {
       return true;
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+      throw err;
+    }
+  }
+
+  // --- screens ---
+
+  /** Screen ids are already constrained to `[A-Z0-9_-]` by the schema; re-check
+   *  here so a hand-edited/imported id can never escape the screens directory. */
+  private screenBase(id: string): string {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`invalid screen id: ${id}`);
+    return path.join(this.screenDir, id);
+  }
+
+  /**
+   * The mockup is kept as a real `.html` file next to its metadata, so it stays
+   * reviewable in a PR and can be opened straight from the repo; the YAML holds
+   * everything else. The two are recombined on read.
+   */
+  async listScreens(): Promise<TScreen[]> {
+    let names: string[];
+    try {
+      names = await fs.readdir(this.screenDir);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+      throw err;
+    }
+    const out: TScreen[] = [];
+    for (const f of names.filter((n) => n.endsWith(".yaml") || n.endsWith(".yml")).sort()) {
+      const raw = await fs.readFile(path.join(this.screenDir, f), "utf8");
+      out.push(await this.withHtml(Screen.parse(YAML.parse(raw))));
+    }
+    return out;
+  }
+
+  async getScreen(id: string): Promise<TScreen | null> {
+    const sc = await this.readOne(`${this.screenBase(id)}.yaml`, Screen);
+    return sc ? this.withHtml(sc) : null;
+  }
+
+  async writeScreen(screen: TScreen): Promise<void> {
+    await fs.mkdir(this.screenDir, { recursive: true });
+    const v = Screen.parse(screen);
+    const base = this.screenBase(v.id);
+    const { html, ...meta } = v;
+    await fs.writeFile(`${base}.yaml`, YAML.stringify(meta), "utf8");
+    if (html) await fs.writeFile(`${base}.html`, html, "utf8");
+    else await fs.rm(`${base}.html`, { force: true });
+  }
+
+  async deleteScreen(id: string): Promise<boolean> {
+    const base = this.screenBase(id);
+    await fs.rm(`${base}.html`, { force: true });
+    try {
+      await fs.unlink(`${base}.yaml`);
+      return true;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+      throw err;
+    }
+  }
+
+  /** Re-attach the mockup stored in the sibling `.html` file. */
+  private async withHtml(screen: TScreen): Promise<TScreen> {
+    if (screen.html) return screen;
+    try {
+      return { ...screen, html: await fs.readFile(`${this.screenBase(screen.id)}.html`, "utf8") };
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return screen;
       throw err;
     }
   }

@@ -10,8 +10,8 @@ An MCP server that tracks **requirements coverage** for a project, and how it
 maintain a living traceability graph:
 
 ```
-Requirement → User Story → (descriptive acceptance criteria)
-                 ▲
+Requirement → User Story ─┬→ (descriptive acceptance criteria)
+                 ▲        └→ Screen (UI spec: a static HTML mockup)
                  │  link = an @US-xxx tag on a cucumber scenario
                  │
 Phase (v1.0, v1.1, …) → Execution (a scenario result for a run)
@@ -106,6 +106,7 @@ Or in your MCP client config:
 | **Overview** | KPI cards with project totals (requirements, stories, scenarios, verified %), a **counts-by-phase** table (requirements / stories / scenarios per phase, partitioned by earliest phase, with an Unassigned row and a Total), coverage trend chart, component breakdown, gaps summary, and phases strip |
 | **Requirements** | Sortable/filterable table of all requirements with inline expansion showing linked story IDs and tags |
 | **Stories** | User stories with status, acceptance criteria count, and coverage badge; expand to see acceptance criteria and linked scenarios with pass/fail/pending icons |
+| **Screens** | UI specs: filterable screen cards (platform, status, staleness), the UI consistency-check results, and a viewer that renders the mockup in a sandboxed frame with traced elements outlined, its element table, exits and linked stories — see [Screens](#screens--ui-specifications) |
 | **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs) linked to stories and requirements, with state badges and external links |
@@ -146,9 +147,11 @@ A typical flow, all driven through the agent:
 1. `init_project` — points at your Conductor project (`conductorPath`); it **verifies the folder exists and is a real Conductor project** (has `features/` or a cucumber config) and reports its name before creating `.requ/`. Pass `force:true` to override.
 2. `create_requirement` — import the requirements (with `components`).
 3. `create_user_story` — PO authors stories, each tracing to ≥1 requirement.
-4. **Tag scenarios** `@US-007` in your feature files — that *is* the test link.
-5. `import_execution_report` — ingest a Conductor cucumber-json run into the active phase.
-6. `coverage_report` / `find_gaps` / `coverage_trend` — see coverage now and how it evolves.
+4. `create_or_update_screen` + `link_story_screen` — a BA/design agent publishes the
+   UI specs (HTML mockups) for each story, then `check_ui_coverage` validates the graph.
+5. **Tag scenarios** `@US-007` in your feature files — that *is* the test link.
+6. `import_execution_report` — ingest a Conductor cucumber-json run into the active phase.
+7. `coverage_report` / `find_gaps` / `coverage_trend` — see coverage now and how it evolves.
 
 ## Why
 
@@ -228,6 +231,8 @@ reviewable in PRs:
   config.yaml                 # project name, Conductor path, active phase
   requirements/REQ-001.yaml
   stories/US-001.yaml         # story → criteria → linked tests
+  screens/SCR-BOOK-DETAIL-MOB.yaml   # UI spec metadata (links, elements, version)
+  screens/SCR-BOOK-DETAIL-MOB.html   # the mockup itself, reviewable in a PR
   phases/PHASE-001.yaml       # a phase / release
   executions/PHASE-001.yaml   # test results recorded against that phase
 ```
@@ -249,6 +254,10 @@ reviewable in PRs:
 | `import_scenarios_from_features` | tester | One-time migration: import `.feature` files into requ as stored scenarios |
 | `record_execution` | tester | Record one scenario result against a phase |
 | `import_execution_report` | tester | Ingest a Conductor cucumber-json file into a phase |
+| `create_or_update_screen` / `get_screen` / `get_screen_html` / `list_screens` / `delete_screen` | BA/design | Publish, read and regenerate UI specs (HTML mockups) — see [Screens](#screens--ui-specifications) |
+| `link_story_screen` / `unlink_story_screen` | BA/design | Establish the story ↔ screen traceability edge (with its role) |
+| `get_screens_for_story` / `get_stories_for_screen` | tester/BA | Reference screens for a story (grouped by platform), and reverse impact analysis |
+| `check_ui_coverage` / `get_stale_screens` | reporting | Run the UI consistency checks; list the screens to regenerate after a spec change |
 | `coverage_report` | reporting | Phase/mode rollup + per-component + summary % (json or markdown) |
 | `coverage_trend` | reporting | Coverage summary at each phase — the evolution view |
 | `find_gaps` | reporting | Requirements without stories, stories without scenarios, stories not covered (per phase) |
@@ -297,12 +306,114 @@ independently settable).
   [Scenario REST API](#scenario-rest-api) + OpenAPI contract expose stored
   scenarios to external tools (including the scenario runner).
 
+## Screens — UI specifications
+
+Without a UI artefact, the development agent and the test agent each invent their
+own reading of the acceptance criteria, and the gap only shows up after the code
+is written. A **Screen** closes that gap: a UI specification, generated by an
+agent from the specs, stored and versioned in requ, and consumed downstream to
+generate tests.
+
+```
+Requirement → User Story ─┬→ Acceptance Criteria → Scenarios → Execution → Results
+                          └→ Screen (HTML mockup) ──────────────↗
+```
+
+- The mockup is a **self-contained static HTML file** — inline CSS, no build. For
+  mobile it renders inside a CSS device frame: the point is to validate the
+  **flow**, not the pixel.
+- It is **regenerable**: never hand-edited without updating the source spec. requ
+  **stores and traces** mockups — it is not a UI editor, and does not replace Figma.
+- Mockups live beside the specs and are versioned with them. In YAML mode each
+  screen is a `.yaml` (metadata) plus a `.html` (the mockup) so both stay
+  reviewable in a PR; `mockupPath` instead points at a file already in the repo.
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Stable, readable — `SCR-BOOK-DETAIL-MOB`; `UIC-…` for a shared component |
+| `name` / `description` | Functional name, and the screen's intent + usage context |
+| `platform` | `mobile` \| `web` \| `desktop` \| `tablet` |
+| `phase` | Delivery phase the screen belongs to |
+| `version` | Semver, or a content hash of the HTML (the default) |
+| `status` | `draft` \| `reviewed_qa` \| `validated_ops` \| `obsolete` |
+| `stories` | The stories it materializes, each with a role: `primary` \| `secondary` \| `entry` \| `confirmation` |
+
+**Story ↔ screen is many-to-many**, and the link is made at the **story** level
+(acceptance criteria have no stable id): a story spans several platforms and
+several steps of a flow, and a shared detail screen serves several stories. Both
+directions are navigable — `get_screens_for_story` (grouped by platform) and
+`get_stories_for_screen` (impact analysis).
+
+### `data-req-*` — traceability inside the HTML
+
+Every significant element carries the attributes the downstream agents consume:
+
+```html
+<button
+  data-req-el="btn-confirm-booking"
+  data-req-stories="US-014,US-021"
+  data-req-role="action">
+  Confirmer la réservation
+</button>
+```
+
+| Attribute | Purpose |
+|-----------|---------|
+| `data-req-el` | **Stable element id**, unique per screen. This is what step definitions bind to — it replaces fragile CSS selectors, and is ideally kept in the production markup |
+| `data-req-stories` | Story ids the element materializes (many-to-many here too). An element without one is flagged as potential **gold plating** |
+| `data-req-role` | `action`, `input`, `display`, `feedback`, `navigation` — tells the test agent which assertion to write |
+| `data-req-field` | Data-model field the element renders or captures |
+| `data-req-target` | Screen id this element navigates to (the flow graph) |
+| `data-req-component` | Embeds a shared `UIC-…` component at this point |
+
+**Shared components** avoid duplicating traceability: a `UIC-…` component owns its
+own elements and stories, screens reference it, and updating it updates every
+screen that embeds it (its elements resolve into theirs).
+
+### Automatic checks — `check_ui_coverage`
+
+| Family | Checks |
+|--------|--------|
+| Platform coverage | A story targeting N platforms has ≥1 screen per platform (`platforms` on the story, else `uiPlatforms` on the project) |
+| Functional coverage | Every story of the phase has ≥1 screen; every screen references ≥1 story |
+| Structural | Element ids unique per screen; every element has a story and a valid role; every `dataFields` entry of the story surfaces in a screen; every error state described in the criteria has a `data-req-role="feedback"` element; no navigation dead end (unless `terminal`), no exit to an unknown screen |
+| Drift | A screen whose linked story changed since generation is **stale** and must be regenerated (`get_stale_screens`) |
+
+These checks are about **coherence**. Business **relevance** — does this flow match
+the real field work? — stays a human validation: QA, then Operations, before any
+code is written.
+
+### Generating tests from screens
+
+The test agent consumes **acceptance criteria + screen**: `get_screens_for_story`
+returns the reference screens with their elements, and `get_screen_html` the
+mockup to derive steps from. Steps target `data-req-el`, never a CSS selector or
+visible text, and the feature file records its reference screens as metadata:
+
+```gherkin
+@story:US-014 @screens:SCR-BOOK-DETAIL-MOB,SCR-BOOK-CONFIRM-MOB
+Feature: Réservation d'un créneau
+```
+
+Development agents and test agents **share only the spec and the screens** — never
+each other's artefacts — so the validation stays independent.
+
+### REST endpoints (HTTP mode)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/screens` | List/filter screens (`phase`, `platform`, `status`, `kind`, `story`, `q`), with resolved elements, exits and staleness |
+| `GET /api/screens/:id` | One screen with its elements, story details and the screens embedding it |
+| `GET /api/screens/:id/html` | The raw mockup, served with a restrictive CSP (the dashboard renders it in a sandboxed iframe) |
+| `GET /api/ui-coverage` | The checks above (`phase`, `mode`) |
+
 ## Develop
 
 ```bash
 npm install
 npm run build      # tsc -> dist/
 npm run smoke      # end-to-end test against the built server over stdio
+npm run smoke:screens # end-to-end test for the UI specification chain
 npm run dev        # run from source with tsx (stdio mode)
 npm run start:http # run from source in HTTP mode with dashboard
 ```
