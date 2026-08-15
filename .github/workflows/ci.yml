@@ -31,3 +31,6 @@ jobs:
 
       - name: Smoke test (drives the built server over stdio)
         run: npm run smoke
+
+      - name: Smoke test — screens (UI specification traceability)
+        run: npm run smoke:screens

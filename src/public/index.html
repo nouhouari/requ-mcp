@@ -141,6 +141,7 @@
         {id:'overview',     label:'Overview'},
         {id:'requirements', label:'Requirements'},
         {id:'stories',      label:'Stories'},
+        {id:'screens',      label:'Screens'},
         {id:'coverage',     label:'Coverage'},
         {id:'components',   label:'Components'},
         {id:'vcs',          label:'VCS'},
@@ -1372,6 +1373,125 @@
       </div>
 
       <!-- ══════════════════════════════════════════════════════
+           TAB: SCREENS (UI specifications)
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-screens" role="tabpanel" aria-labelledby="tab-screens" tabindex="0" x-show="tab === 'screens'" class="tab-panel space-y-4">
+
+        <!-- Filters -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+          <input type="search" x-model="screenSearch" placeholder="Search screens…"
+            class="flex-1 min-w-[200px] px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+            aria-label="Search screens">
+          <select x-model="screenPlatformFilter" class="px-3 py-2 text-sm border border-slate-200 rounded-lg" aria-label="Platform">
+            <option value="all">All platforms</option>
+            <option value="mobile">mobile</option>
+            <option value="web">web</option>
+            <option value="desktop">desktop</option>
+            <option value="tablet">tablet</option>
+          </select>
+          <select x-model="screenStatusFilter" class="px-3 py-2 text-sm border border-slate-200 rounded-lg" aria-label="Status">
+            <option value="all">All statuses</option>
+            <option value="draft">draft</option>
+            <option value="reviewed_qa">reviewed_qa</option>
+            <option value="validated_ops">validated_ops</option>
+            <option value="obsolete">obsolete</option>
+          </select>
+          <label class="flex items-center gap-2 text-sm text-slate-600">
+            <input type="checkbox" x-model="screenStaleOnly" class="rounded border-slate-300"> Stale only
+          </label>
+          <button @click="loadScreens()" class="px-3 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">Refresh</button>
+        </div>
+
+        <!-- UI consistency checks -->
+        <template x-if="uiCoverage">
+          <div class="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+            <div class="flex flex-wrap items-center gap-4">
+              <h3 class="font-semibold text-slate-800 text-sm">UI coverage checks</h3>
+              <span class="badge" :class="uiCoverage.ok ? 'badge-green' : 'badge-red'"
+                x-text="uiCoverage.ok ? 'no traceability hole' : uiCoverage.summary.errors + ' error(s)'"></span>
+              <span class="text-xs text-slate-500">
+                <span class="font-semibold text-slate-700" x-text="uiCoverage.summary.storiesWithScreen"></span>/<span x-text="uiCoverage.summary.storiesInScope"></span> stories with a screen ·
+                <span class="font-semibold text-slate-700" x-text="uiCoverage.summary.screens"></span> screens ·
+                <span class="font-semibold text-slate-700" x-text="uiCoverage.summary.components"></span> shared components ·
+                <span class="font-semibold text-slate-700" x-text="uiCoverage.summary.staleScreens"></span> stale ·
+                <span class="font-semibold text-slate-700" x-text="uiCoverage.summary.warnings"></span> warning(s)
+              </span>
+            </div>
+            <template x-if="(uiCoverage.issues || []).length > 0">
+              <div class="data-table-wrap max-h-72 overflow-y-auto">
+                <table class="data-table">
+                  <thead><tr><th>Severity</th><th>Check</th><th>Screen</th><th>Story</th><th>Detail</th></tr></thead>
+                  <tbody>
+                    <template x-for="(issue, i) in uiCoverage.issues" :key="i">
+                      <tr>
+                        <td><span class="badge" :class="issue.severity === 'error' ? 'badge-red' : 'badge-amber'" x-text="issue.severity"></span></td>
+                        <td><code class="text-xs" x-text="issue.code"></code></td>
+                        <td><code class="text-xs" x-text="issue.screen || '—'"></code></td>
+                        <td><code class="text-xs" x-text="issue.story || '—'"></code></td>
+                        <td class="text-xs text-slate-600" x-text="issue.message"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </template>
+          </div>
+        </template>
+
+        <template x-if="loading.screens">
+          <div class="flex items-center justify-center py-16"><div class="spinner"></div></div>
+        </template>
+
+        <template x-if="!loading.screens && screens.length === 0">
+          <div class="empty-state mt-16">
+            <svg width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            <h3>No screens yet</h3>
+            <p>Publish UI specs with the <code>create_or_update_screen</code> MCP tool — requ stores and traces mockups, it is not a UI editor.</p>
+          </div>
+        </template>
+
+        <!-- Screen cards -->
+        <template x-if="!loading.screens && screens.length > 0">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            <template x-for="sc in filteredScreens()" :key="sc.id">
+              <div class="component-card flex flex-col">
+                <div class="flex items-start justify-between gap-2 mb-2">
+                  <div class="min-w-0">
+                    <div class="font-semibold text-slate-900 text-sm truncate" x-text="sc.name"></div>
+                    <code class="chip chip-indigo mt-1 inline-block" x-text="sc.id"></code>
+                  </div>
+                  <span class="badge shrink-0" :class="screenStatusBadge(sc.status)" x-text="sc.status.replace('_',' ')"></span>
+                </div>
+                <div class="flex flex-wrap gap-1 mb-2">
+                  <span x-show="sc.platform" class="chip chip-amber" x-text="sc.platform"></span>
+                  <span x-show="sc.kind === 'component'" class="chip chip-slate">shared component</span>
+                  <span x-show="sc.phase" class="chip chip-indigo" x-text="sc.phase"></span>
+                  <span x-show="sc.terminal" class="chip chip-slate">terminal</span>
+                  <span x-show="sc.stale" class="badge badge-amber">stale</span>
+                </div>
+                <p class="text-xs text-slate-500 leading-relaxed mb-3 line-clamp-2" x-text="sc.description || 'No description.'"></p>
+                <div class="flex flex-wrap gap-1 mb-3">
+                  <template x-for="l in (sc.stories || [])" :key="l.id">
+                    <button @click="goToStory(l.id)" class="chip chip-green hover:underline" :title="l.role" x-text="l.id"></button>
+                  </template>
+                  <span x-show="(sc.stories || []).length === 0" class="chip chip-slate">no story</span>
+                </div>
+                <div class="mt-auto pt-3 border-t border-slate-100 flex items-center justify-between">
+                  <span class="text-xs text-slate-500">
+                    <span class="font-semibold text-slate-700" x-text="(sc.elements || []).length"></span> traced elements
+                    <template x-if="issuesForScreen(sc.id).length > 0">
+                      <span class="ml-2 text-amber-600" x-text="issuesForScreen(sc.id).length + ' issue(s)'"></span>
+                    </template>
+                  </span>
+                  <button @click="openScreen(sc.id)" class="text-xs font-medium text-indigo-600 hover:text-indigo-800">View →</button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
            TAB: VCS
       ══════════════════════════════════════════════════════════ -->
       <div id="panel-vcs" role="tabpanel" aria-labelledby="tab-vcs" tabindex="0" x-show="tab === 'vcs'" class="tab-panel space-y-4">
@@ -1706,6 +1826,134 @@
           class="btn-secondary text-xs">
           Close
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SCREEN VIEWER (mockup + traced elements)
+  ═══════════════════════════════════════════════════════════════ -->
+  <div
+    x-show="screenDetailOpen"
+    x-cloak
+    class="fixed inset-0 z-50 flex items-center justify-center p-4"
+    @keydown.escape.window="closeScreen()">
+    <div class="absolute inset-0 bg-black/50" @click="closeScreen()"></div>
+    <div class="relative bg-white rounded-xl shadow-2xl w-full max-w-6xl z-10 max-h-[88vh] flex flex-col"
+      role="dialog" aria-modal="true" aria-labelledby="screen-detail-title">
+
+      <div class="flex items-start justify-between gap-3 px-6 py-4 border-b border-slate-200 shrink-0">
+        <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-2 mb-1">
+            <code class="chip chip-indigo" x-text="screenDetail?.id"></code>
+            <span x-show="screenDetail?.platform" class="chip chip-amber" x-text="screenDetail?.platform"></span>
+            <span class="badge" :class="screenStatusBadge(screenDetail?.status)" x-text="screenDetail?.status?.replace('_',' ')"></span>
+            <span x-show="screenDetail?.stale" class="badge badge-amber">stale — regenerate</span>
+            <code class="text-xs text-slate-400" x-text="'v' + (screenDetail?.version || '')"></code>
+          </div>
+          <h2 id="screen-detail-title" class="font-semibold text-slate-800 text-base leading-snug" x-text="screenDetail?.name"></h2>
+        </div>
+        <div class="flex items-center gap-3 shrink-0">
+          <label class="flex items-center gap-2 text-xs text-slate-600">
+            <input type="checkbox" x-model="screenHighlight" class="rounded border-slate-300"> Highlight traced elements
+          </label>
+          <button @click="closeScreen()" class="p-2 text-slate-400 hover:text-slate-600" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+              <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-5 gap-0 overflow-hidden">
+        <!-- Mockup: rendered in a fully sandboxed frame (no scripts, no same-origin). -->
+        <div class="lg:col-span-3 bg-slate-100 p-4 overflow-auto max-h-[70vh]">
+          <template x-if="screenHtml">
+            <iframe :srcdoc="screenSrcdoc()" sandbox="" title="Mockup preview"
+              class="w-full bg-white rounded-lg border border-slate-200" style="height:64vh"></iframe>
+          </template>
+          <template x-if="!screenHtml">
+            <div class="flex items-center justify-center h-40 text-sm text-slate-400">No mockup stored for this screen.</div>
+          </template>
+        </div>
+
+        <!-- Traced elements + links -->
+        <div class="lg:col-span-2 px-6 py-5 overflow-y-auto max-h-[70vh] space-y-5">
+          <div>
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Stories</div>
+            <div class="space-y-1">
+              <template x-for="l in (screenDetail?.storyDetails || [])" :key="l.id">
+                <button @click="goToStory(l.id)" class="w-full text-left flex items-center gap-2 text-sm hover:bg-slate-50 rounded px-2 py-1">
+                  <code class="chip chip-green" x-text="l.id"></code>
+                  <span class="chip chip-slate" x-text="l.role"></span>
+                  <span class="truncate text-slate-600" x-text="l.title || '(unknown story)'"></span>
+                  <span x-show="l.drifted" class="badge badge-amber ml-auto">drifted</span>
+                </button>
+              </template>
+              <div x-show="(screenDetail?.storyDetails || []).length === 0" class="text-sm text-slate-400">No story linked.</div>
+            </div>
+          </div>
+
+          <div x-show="(screenDetail?.exits || []).length > 0">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Navigates to</div>
+            <div class="flex flex-wrap gap-1">
+              <template x-for="e in (screenDetail?.exits || [])" :key="e">
+                <button @click="openScreen(e)" class="chip chip-indigo hover:underline" x-text="e"></button>
+              </template>
+            </div>
+          </div>
+
+          <div x-show="(screenDetail?.uses || []).length > 0">
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Shared components</div>
+            <div class="flex flex-wrap gap-1">
+              <template x-for="u in (screenDetail?.uses || [])" :key="u">
+                <button @click="openScreen(u)" class="chip chip-slate hover:underline" x-text="u"></button>
+              </template>
+            </div>
+          </div>
+
+          <div>
+            <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+              Traced elements (<span x-text="(screenDetail?.elements || []).length"></span>)
+            </div>
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead><tr><th>data-req-el</th><th>Role</th><th>Stories</th></tr></thead>
+                <tbody>
+                  <template x-for="el in (screenDetail?.elements || [])" :key="el.el + (el.from || '')">
+                    <tr>
+                      <td>
+                        <code class="text-xs" x-text="el.el"></code>
+                        <span x-show="el.from" class="chip chip-slate ml-1" x-text="el.from"></span>
+                      </td>
+                      <td><span class="chip" :class="el.role ? 'chip-amber' : 'chip-slate'" x-text="el.role || '—'"></span></td>
+                      <td>
+                        <span x-show="(el.stories || []).length === 0" class="badge badge-amber">no story</span>
+                        <template x-for="sid in (el.stories || [])" :key="sid">
+                          <code class="chip chip-green" x-text="sid"></code>
+                        </template>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <template x-if="issuesForScreen(screenDetail?.id || '').length > 0">
+            <div>
+              <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Checks</div>
+              <ul class="space-y-1">
+                <template x-for="(issue, i) in issuesForScreen(screenDetail?.id || '')" :key="i">
+                  <li class="text-xs text-slate-600 flex gap-2">
+                    <span class="badge shrink-0" :class="issue.severity === 'error' ? 'badge-red' : 'badge-amber'" x-text="issue.severity"></span>
+                    <span x-text="issue.message"></span>
+                  </li>
+                </template>
+              </ul>
+            </div>
+          </template>
+        </div>
       </div>
     </div>
   </div>

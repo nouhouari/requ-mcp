@@ -9,13 +9,14 @@ import type { Execution, ExportPayload, ImportReport } from "./schema.js";
 type AnyStore = Store | SqliteStore | PostgresStore;
 
 export async function buildExport(store: AnyStore): Promise<ExportPayload> {
-  const [config, components, requirements, stories, scenarios, phases, vcsRefs, executionsByPhase] =
+  const [config, components, requirements, stories, scenarios, screens, phases, vcsRefs, executionsByPhase] =
     await Promise.all([
       store.readConfig().catch(() => null),
       store.listComponents(),
       store.listRequirements(),
       store.listStories(),
       store.listScenarios(),
+      store.listScreens(),
       store.listPhases(),
       store.listVcsRefs(),
       store.readAllExecutions(),
@@ -31,7 +32,7 @@ export async function buildExport(store: AnyStore): Promise<ExportPayload> {
     version: "1",
     exportedAt: new Date().toISOString(),
     source: config ? { name: config.name } : undefined,
-    data: { components, requirements, stories, scenarios, phases, executions, vcsRefs },
+    data: { components, requirements, stories, scenarios, screens, phases, executions, vcsRefs },
   };
 }
 
@@ -119,6 +120,19 @@ export async function applyImport(
     await store.writeScenario(sc);
     existingScenarioKeys.add(sc.testKey);
     inc("scenarios");
+  }
+
+  // --- Screens ---
+  const existingScreenIds = new Set((await store.listScreens()).map(x => x.id));
+  for (const screen of data.screens) {
+    if (existingScreenIds.has(screen.id)) { skip("screens", screen.id); continue; }
+    const unknown = screen.stories.map(l => l.id).filter(sid => !existingStoryIds.has(sid));
+    if (unknown.length > 0) {
+      report.errors.push(`Screen ${screen.id} references unknown story(ies): ${unknown.join(", ")}`);
+    }
+    await store.writeScreen(screen);
+    existingScreenIds.add(screen.id);
+    inc("screens");
   }
 
   // --- Phases ---

@@ -17,6 +17,12 @@ import {
   Priority,
   PhaseStatus,
   RequirementStatus,
+  SCREEN_ID_RE,
+  kindFromScreenId,
+  ScreenKind,
+  ScreenLinkRole,
+  ScreenPlatform,
+  ScreenStatus,
   StoryStatus,
   TestStatus,
   testKey,
@@ -29,6 +35,8 @@ import {
   type Phase,
   type Requirement,
   type Scenario as TScenario,
+  type Screen as TScreen,
+  type ScreenStoryLink,
   type UserStory,
   type VcsRef,
 } from "./schema.js";
@@ -55,6 +63,15 @@ import {
   type ScenarioFilter,
 } from "./coverage.js";
 import { validateGherkin } from "./gherkin.js";
+import { htmlVersion, parseScreenHtml } from "./screen-html.js";
+import {
+  checkUiCoverage,
+  isStale,
+  resolveElements,
+  screenExits,
+  screensForStory,
+  staleScreens,
+} from "./screen-coverage.js";
 import { parseCucumberJson } from "./ingest.js";
 import { buildExport, applyImport } from "./export-import.js";
 
@@ -507,6 +524,7 @@ tool(
         .optional()
         .describe("Default path to Conductor's cucumber-json result file, for import_execution_report."),
       initialPhase: z.string().optional().describe("If set, create and activate a first phase with this name."),
+      uiPlatforms: z.array(ScreenPlatform).optional().describe("Platforms every story is expected to be materialized on (mobile/web/desktop/tablet), unless the story overrides them. Drives the per-platform screen coverage check."),
       force: z.boolean().optional().describe("Initialize even if the Conductor folder is missing or not a Conductor project."),
     },
   },
@@ -535,6 +553,7 @@ tool(
       conductorName: conductor.isConductorProject ? conductor.name : existing?.conductorName,
       conductorReportPath: args.conductorReportPath ?? existing?.conductorReportPath,
       activePhase: existing?.activePhase,
+      uiPlatforms: args.uiPlatforms ?? existing?.uiPlatforms,
     };
     await store.init(config);
     let phase: Phase | undefined;
@@ -866,6 +885,8 @@ tool(
       requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1).describe("IDs of existing requirements this story implements."),
       description: z.string().optional(),
       acceptanceCriteria: z.array(z.string()).optional().describe("Descriptive criterion texts."),
+      platforms: z.array(ScreenPlatform).optional().describe("UI platforms this story must be materialized on (mobile/web/desktop/tablet). Drives the per-platform screen coverage check; defaults to config.uiPlatforms."),
+      dataFields: z.array(z.string()).optional().describe("Data-model fields the story touches, e.g. ['guestCount']. Each must surface in at least one linked screen."),
       id: z.string().regex(/^US-\d+$/).optional(),
     },
   },
@@ -890,6 +911,8 @@ tool(
       requirements: args.requirements,
       acceptanceCriteria,
       status: "draft",
+      platforms: args.platforms ?? [],
+      dataFields: args.dataFields ?? [],
       createdAt: now(),
       updatedAt: now(),
     };
@@ -975,9 +998,19 @@ tool(
     const [phases, execByPhase] = await Promise.all([store.listPhases(), store.readAllExecutions()]);
     const phaseId = await store.resolvePhaseId();
     const status = resolveStatuses(execByPhase, phases, phaseId, "cumulative");
+    const screens = screensForStory(await store.listScreens(), args.id);
     return json({
       ...story,
       statusPhase: phaseId,
+      screens: screens.map((sc) => ({
+        id: sc.id,
+        name: sc.name,
+        platform: sc.platform,
+        kind: sc.kind,
+        role: sc.stories.find((l) => l.id === args.id)?.role ?? "primary",
+        status: sc.status,
+        stale: isStale(sc, new Map([[story.id, story]])),
+      })),
       linkedScenarios: scs.map((sc) => ({
         feature: sc.feature,
         name: sc.name,
@@ -1001,6 +1034,8 @@ tool(
       description: z.string().optional(),
       status: StoryStatus.optional(),
       requirements: z.array(z.string().regex(/^REQ-\d+$/)).min(1).optional(),
+      platforms: z.array(ScreenPlatform).optional().describe("UI platforms this story must be materialized on."),
+      dataFields: z.array(z.string()).optional().describe("Data-model fields the story touches."),
     },
   },
   async (args, store) => {
@@ -1016,6 +1051,8 @@ tool(
     if (args.title !== undefined) story.title = args.title;
     if (args.description !== undefined) story.description = args.description;
     if (args.status !== undefined) story.status = args.status;
+    if (args.platforms !== undefined) story.platforms = args.platforms;
+    if (args.dataFields !== undefined) story.dataFields = args.dataFields;
     story.updatedAt = now();
     await store.writeStory(story);
     return json(story);
@@ -1525,6 +1562,489 @@ tool(
       imported.push(tk);
     }
     return json({ root, scenariosParsed: index.scenarios.length, imported: imported.length, skipped: skipped.length, invalid });
+  },
+);
+
+// ===========================================================================
+// Screens (UI specifications / HTML mockups)
+// ===========================================================================
+
+/** Read a mockup file from the repo, resolved against the project root. */
+async function readMockupFile(store: AnyStore, mockupPath: string): Promise<string | null> {
+  try {
+    return await fs.readFile(store.resolvePath(mockupPath), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Story ids referenced by a screen's links that don't exist. */
+async function unknownScreenStories(store: AnyStore, ids: string[]): Promise<string[]> {
+  const known = new Set((await store.listStories()).map((s) => s.id));
+  return ids.filter((id) => !known.has(id));
+}
+
+/** Screen view without the (potentially large) mockup body. */
+function screenSummary(sc: TScreen, storyById: Map<string, UserStory>, screenById: Map<string, TScreen>) {
+  const { html, elements, ...meta } = sc;
+  return {
+    ...meta,
+    elementCount: resolveElements(sc, screenById).length,
+    exits: screenExits(sc, screenById),
+    stale: isStale(sc, storyById),
+    hasHtml: html.length > 0,
+  };
+}
+
+tool(
+  "create_or_update_screen",
+  {
+    title: "Create / update a screen",
+    description:
+      "Publish or regenerate a UI specification: a self-contained static HTML mockup plus its metadata, linked to the " +
+      "user stories it materializes. Upserts by id (SCR-… for a screen, UIC-… for a shared component). Pass `html` " +
+      "inline, or `mockupPath` to read the file from the repo. The `data-req-*` attributes are parsed into traceable " +
+      "elements on every write, and the linked stories' versions are snapshotted so later spec changes mark the screen stale.",
+    inputSchema: {
+      id:          z.string().describe("Stable, readable id — e.g. 'SCR-BOOK-DETAIL-MOB' (screen) or 'UIC-BOOKING-CARD' (shared component)."),
+      name:        z.string().min(1).optional().describe("Functional name of the screen. Required on creation."),
+      kind:        ScreenKind.optional().describe("'screen' or 'component' (shared, referenced by screens). Defaults from the id prefix."),
+      platform:    ScreenPlatform.optional().describe("mobile | web | desktop | tablet. Required for a screen."),
+      phase:       z.string().optional().describe("Delivery phase (e.g. 'P1'). Defaults to the active phase; pass '' to leave unassigned."),
+      description: z.string().optional().describe("Intent of the screen and its usage context."),
+      html:        z.string().optional().describe("Full static HTML of the mockup (self-contained: inline CSS, no build)."),
+      mockupPath:  z.string().optional().describe("Repo path of the mockup file. Read at write time; re-read by get_screen_html."),
+      version:     z.string().optional().describe("Semver or hash. Defaults to a content hash of the HTML."),
+      status:      ScreenStatus.optional().describe("draft | reviewed_qa | validated_ops | obsolete."),
+      stories:     z.array(z.object({
+                     id:   z.string().regex(/^US-\d+$/),
+                     role: ScreenLinkRole.optional().describe("primary | secondary | entry | confirmation."),
+                   })).optional().describe("Stories this screen materializes. Replaces the existing link set."),
+      uses:        z.array(z.string()).optional().describe("Shared component ids embedded by this screen (merged with data-req-component refs)."),
+      exits:       z.array(z.string()).optional().describe("Screen ids reachable from here (merged with data-req-target refs)."),
+      terminal:    z.boolean().optional().describe("Marks an intentional end of flow, exempt from the dead-end check."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    if (!SCREEN_ID_RE.test(args.id)) {
+      return fail(
+        `Invalid screen id '${args.id}'. Use SCR-… for a screen or UIC-… for a shared component, uppercase, e.g. 'SCR-BOOK-DETAIL-MOB'.`,
+      );
+    }
+    const existing = await store.getScreen(args.id);
+    if (!existing && !args.name) return fail(`'name' is required when creating screen ${args.id}.`);
+
+    // Resolve the mockup body: inline html wins, else read the repo file.
+    let html = existing?.html ?? "";
+    let regenerated = false;
+    if (args.html !== undefined) {
+      html = args.html;
+      regenerated = true;
+    } else if (args.mockupPath !== undefined) {
+      const fromFile = await readMockupFile(store, args.mockupPath);
+      if (fromFile === null) {
+        if (!existing) return fail(`Cannot read mockup file '${args.mockupPath}' (resolved against ${store.root}). Pass \`html\` instead.`);
+      } else {
+        html = fromFile;
+        regenerated = true;
+      }
+    }
+
+    // undefined → active phase for a new screen, but an existing screen keeps what
+    // it has (including "unassigned", which must not drift onto the active phase).
+    const phaseInput = args.phase !== undefined ? args.phase : existing ? (existing.phase ?? "") : undefined;
+    const phase = await resolveAssignedPhase(store, phaseInput);
+    if (phase.error) return phase.error;
+
+    // Links: an explicit list replaces the set; otherwise keep what's stored.
+    const links: ScreenStoryLink[] = args.stories
+      ? args.stories.map((l: { id: string; role?: ScreenStoryLink["role"] }) => ({ id: l.id, role: l.role ?? "primary" }))
+      : (existing?.stories ?? []);
+    const unknown = await unknownScreenStories(store, links.map((l) => l.id));
+    if (unknown.length) {
+      return fail(`Unknown story/stories: ${unknown.join(", ")}. Create them first with create_user_story.`);
+    }
+
+    const parsed = parseScreenHtml(html);
+    const uses = [...new Set([...(args.uses ?? existing?.uses ?? []), ...parsed.componentRefs])];
+    const exits = [...new Set([...(args.exits ?? existing?.exits ?? []), ...parsed.targets])];
+
+    // Snapshot the linked stories' versions: a full snapshot when the mockup was
+    // (re)generated, otherwise only for links added by this call — so a metadata
+    // edit (e.g. a status change) never silently clears a real staleness flag.
+    const stories = await store.listStories();
+    const storyById = new Map(stories.map((s) => [s.id, s]));
+    const storyVersions: Record<string, string> = {};
+    for (const link of links) {
+      const previous = existing?.storyVersions?.[link.id];
+      storyVersions[link.id] =
+        (!regenerated && previous !== undefined ? previous : storyById.get(link.id)?.updatedAt) ?? "";
+    }
+
+    const ts = now();
+    const screen: TScreen = {
+      id: args.id,
+      kind: args.kind ?? existing?.kind ?? kindFromScreenId(args.id),
+      name: args.name ?? existing!.name,
+      platform: args.platform ?? existing?.platform,
+      phase: phase.value,
+      description: args.description ?? existing?.description ?? "",
+      mockupPath: args.mockupPath ?? existing?.mockupPath,
+      html,
+      version: args.version ?? (regenerated || !existing ? htmlVersion(html) : existing.version),
+      status: args.status ?? existing?.status ?? "draft",
+      stories: links,
+      uses,
+      exits,
+      terminal: args.terminal ?? existing?.terminal ?? false,
+      elements: parsed.elements,
+      storyVersions,
+      createdAt: existing?.createdAt ?? ts,
+      updatedAt: ts,
+    };
+    await store.writeScreen(screen);
+
+    const screenById = new Map((await store.listScreens()).map((s) => [s.id, s]));
+    return json({
+      screen: screenSummary(screen, storyById, screenById),
+      elements: parsed.elements,
+      warnings: {
+        duplicateElementIds: parsed.duplicates,
+        untracedElements: parsed.elements.filter((e) => e.stories.length === 0).map((e) => e.el),
+        unknownComponents: uses.filter((id) => !screenById.has(id)),
+        noElements: parsed.elements.length === 0,
+      },
+      hint: "Run check_ui_coverage to validate the UI traceability graph for this phase.",
+    });
+  },
+);
+
+tool(
+  "list_screens",
+  {
+    title: "List screens",
+    description:
+      "List screens and shared components with their linked stories, element counts and staleness. " +
+      "Filters combine with AND. The mockup body is omitted unless includeHtml=true.",
+    inputSchema: {
+      phase:    z.string().optional().describe("Phase id (exact match on the screen's own phase)."),
+      platform: ScreenPlatform.optional(),
+      status:   ScreenStatus.optional(),
+      kind:     ScreenKind.optional(),
+      story:    z.string().regex(/^US-\d+$/).optional().describe("Only screens linked to this story."),
+      stale:    z.boolean().optional().describe("Only screens whose linked stories changed since generation (or only fresh ones)."),
+      q:        z.string().optional().describe("Case-insensitive substring over id, name and description."),
+      includeHtml: z.boolean().optional(),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const [screens, stories] = await Promise.all([store.listScreens(), store.listStories()]);
+    const storyById = new Map(stories.map((s) => [s.id, s]));
+    const screenById = new Map(screens.map((s) => [s.id, s]));
+    const q = args.q?.toLowerCase();
+
+    const rows = screens
+      .filter((sc) => {
+        if (args.phase && sc.phase !== args.phase) return false;
+        if (args.platform && sc.platform !== args.platform) return false;
+        if (args.status && sc.status !== args.status) return false;
+        if (args.kind && sc.kind !== args.kind) return false;
+        if (args.story && !sc.stories.some((l) => l.id === args.story)) return false;
+        if (args.stale !== undefined && isStale(sc, storyById) !== args.stale) return false;
+        if (q && !`${sc.id}\n${sc.name}\n${sc.description}`.toLowerCase().includes(q)) return false;
+        return true;
+      })
+      .map((sc) => ({
+        ...screenSummary(sc, storyById, screenById),
+        ...(args.includeHtml ? { html: sc.html } : {}),
+      }));
+    return json(rows);
+  },
+);
+
+tool(
+  "get_screen",
+  {
+    title: "Get a screen",
+    description:
+      "Fetch one screen with its resolved elements (its own plus those of the shared components it embeds), its exits, " +
+      "the stories it materializes, and whether it has drifted from its specs. Use get_screen_html for the mockup body.",
+    inputSchema: {
+      id: z.string().describe("Screen id, e.g. 'SCR-BOOK-DETAIL-MOB'."),
+      includeHtml: z.boolean().optional(),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const sc = await store.getScreen(args.id);
+    if (!sc) return fail(`Screen ${args.id} not found.`);
+    const [screens, stories] = await Promise.all([store.listScreens(), store.listStories()]);
+    const storyById = new Map(stories.map((s) => [s.id, s]));
+    const screenById = new Map(screens.map((s) => [s.id, s]));
+    return json({
+      ...screenSummary(sc, storyById, screenById),
+      elements: resolveElements(sc, screenById),
+      stories: sc.stories.map((l) => ({
+        id: l.id,
+        role: l.role,
+        title: storyById.get(l.id)?.title ?? null,
+        exists: storyById.has(l.id),
+        drifted: storyById.get(l.id) ? sc.storyVersions[l.id] !== storyById.get(l.id)!.updatedAt : false,
+      })),
+      usedBy: screens.filter((s) => s.uses.includes(sc.id)).map((s) => s.id),
+      ...(args.includeHtml ? { html: sc.html } : {}),
+    });
+  },
+);
+
+tool(
+  "get_screen_html",
+  {
+    title: "Get a screen's mockup HTML",
+    description:
+      "Return the mockup body of a screen, for an agent to derive step definitions from (bind steps to `data-req-el`, " +
+      "never to CSS selectors or visible text). Re-reads the file when the screen has a mockupPath and it is readable, " +
+      "otherwise returns the copy stored in requ.",
+    inputSchema: { id: z.string(), elements: z.boolean().optional().describe("Also return the parsed traced elements.") },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const sc = await store.getScreen(args.id);
+    if (!sc) return fail(`Screen ${args.id} not found.`);
+    let html = sc.html;
+    let source: "file" | "stored" = "stored";
+    if (sc.mockupPath) {
+      const fromFile = await readMockupFile(store, sc.mockupPath);
+      if (fromFile !== null) { html = fromFile; source = "file"; }
+    }
+    const screenById = new Map((await store.listScreens()).map((s) => [s.id, s]));
+    return json({
+      id: sc.id,
+      name: sc.name,
+      platform: sc.platform,
+      version: sc.version,
+      status: sc.status,
+      source,
+      mockupPath: sc.mockupPath ?? null,
+      html,
+      ...(args.elements ? { elements: resolveElements(sc, screenById) } : {}),
+    });
+  },
+);
+
+tool(
+  "get_screens_for_story",
+  {
+    title: "Get the screens of a story",
+    description:
+      "The reference screens that materialize a story, grouped by platform — what a test agent reads alongside the " +
+      "acceptance criteria before generating scenarios and step definitions.",
+    inputSchema: {
+      story_id: z.string().regex(/^US-\d+$/),
+      includeHtml: z.boolean().optional(),
+      includeElements: z.boolean().optional().describe("Include each screen's traced elements (default true)."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const story = await store.getStory(args.story_id);
+    if (!story) return fail(`Story ${args.story_id} not found.`);
+    const screens = await store.listScreens();
+    const screenById = new Map(screens.map((s) => [s.id, s]));
+    const linked = screensForStory(screens, args.story_id);
+    const withElements = args.includeElements !== false;
+
+    const byPlatform: Record<string, unknown[]> = {};
+    for (const sc of linked) {
+      const key = sc.platform ?? "unspecified";
+      (byPlatform[key] ??= []).push({
+        id: sc.id,
+        name: sc.name,
+        kind: sc.kind,
+        role: sc.stories.find((l) => l.id === args.story_id)?.role ?? "primary",
+        version: sc.version,
+        status: sc.status,
+        phase: sc.phase ?? null,
+        exits: screenExits(sc, screenById),
+        stale: isStale(sc, new Map([[story.id, story]])),
+        ...(withElements ? { elements: resolveElements(sc, screenById) } : {}),
+        ...(args.includeHtml ? { html: sc.html } : {}),
+      });
+    }
+    return json({
+      story: { id: story.id, title: story.title, platforms: story.platforms, dataFields: story.dataFields },
+      total: linked.length,
+      byPlatform,
+      missingPlatforms: story.platforms.filter((p) => !linked.some((sc) => sc.platform === p)),
+    });
+  },
+);
+
+tool(
+  "get_stories_for_screen",
+  {
+    title: "Get the stories of a screen",
+    description:
+      "Reverse impact analysis: which stories a screen covers, with their requirements and the scenarios tagged to them. " +
+      "Use it before changing a screen to see what else it affects.",
+    inputSchema: { screen_id: z.string() },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const sc = await store.getScreen(args.screen_id);
+    if (!sc) return fail(`Screen ${args.screen_id} not found.`);
+    const byStory = await resolveScenariosByStory(store);
+    const stories = await store.listStories();
+    const storyById = new Map(stories.map((s) => [s.id, s]));
+    return json({
+      screen: { id: sc.id, name: sc.name, platform: sc.platform, kind: sc.kind, version: sc.version, status: sc.status },
+      stories: sc.stories.map((l) => {
+        const story = storyById.get(l.id);
+        return {
+          id: l.id,
+          role: l.role,
+          title: story?.title ?? null,
+          exists: !!story,
+          requirements: story?.requirements ?? [],
+          drifted: story ? sc.storyVersions[l.id] !== story.updatedAt : false,
+          scenarios: (byStory.get(l.id) ?? []).map((s) => testKey(s)),
+        };
+      }),
+      elementStories: [...new Set(sc.elements.flatMap((e) => e.stories))],
+    });
+  },
+);
+
+tool(
+  "link_story_screen",
+  {
+    title: "Link a story to a screen",
+    description:
+      "Establish (or re-role) the traceability edge between a user story and a screen. Many-to-many: a story can span " +
+      "several screens and platforms, a screen can serve several stories. Linking snapshots the story's current version, " +
+      "so later edits to the story mark the screen stale.",
+    inputSchema: {
+      story_id:  z.string().regex(/^US-\d+$/),
+      screen_id: z.string(),
+      role:      ScreenLinkRole.optional().describe("primary | secondary | entry | confirmation. Default primary."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const [story, screen] = await Promise.all([store.getStory(args.story_id), store.getScreen(args.screen_id)]);
+    if (!story) return fail(`Story ${args.story_id} not found.`);
+    if (!screen) return fail(`Screen ${args.screen_id} not found.`);
+
+    const role = args.role ?? "primary";
+    const link = screen.stories.find((l) => l.id === args.story_id);
+    if (link) link.role = role;
+    else screen.stories.push({ id: args.story_id, role });
+    screen.storyVersions[args.story_id] = story.updatedAt;
+    screen.updatedAt = now();
+    await store.writeScreen(screen);
+    return json({ linked: true, story: args.story_id, screen: args.screen_id, role, stories: screen.stories });
+  },
+);
+
+tool(
+  "unlink_story_screen",
+  {
+    title: "Unlink a story from a screen",
+    description: "Remove the traceability edge between a story and a screen.",
+    inputSchema: { story_id: z.string().regex(/^US-\d+$/), screen_id: z.string() },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const screen = await store.getScreen(args.screen_id);
+    if (!screen) return fail(`Screen ${args.screen_id} not found.`);
+    const before = screen.stories.length;
+    screen.stories = screen.stories.filter((l) => l.id !== args.story_id);
+    delete screen.storyVersions[args.story_id];
+    if (screen.stories.length === before) return json({ unlinked: false, reason: `${args.screen_id} was not linked to ${args.story_id}.` });
+    screen.updatedAt = now();
+    await store.writeScreen(screen);
+    return json({ unlinked: true, story: args.story_id, screen: args.screen_id, stories: screen.stories });
+  },
+);
+
+tool(
+  "check_ui_coverage",
+  {
+    title: "Check UI coverage",
+    description:
+      "Run the executable consistency checks over the screens ↔ stories graph for a phase: every in-scope story has a " +
+      "screen on every platform it targets, every screen traces to a story, element ids are unique and carry stories " +
+      "and roles, the story's data fields and error states surface somewhere, no navigation dead-end, and no screen has " +
+      "drifted from its specs. Errors are real traceability holes; warnings are heuristics for a human to confirm. " +
+      "Business relevance stays a human validation (QA then Operations).",
+    inputSchema: {
+      phase: z.string().optional().describe("Phase id. Defaults to the active phase; pass '' to check every phase."),
+      mode:  CoverageMode.optional().describe("Phase resolution mode (default cumulative)."),
+      severity: z.enum(["error", "warning"]).optional().describe("Only return issues of this severity."),
+      code: z.string().optional().describe("Only return issues with this code, e.g. 'story_without_screen'."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const phaseId = args.phase === "" ? null : await store.resolvePhaseId(args.phase);
+    if (phaseId) {
+      const error = await phaseError(store, phaseId);
+      if (error) return error;
+    }
+    const [screens, stories, requirements, phases, config] = await Promise.all([
+      store.listScreens(),
+      store.listStories(),
+      store.listRequirements(),
+      store.listPhases(),
+      store.readConfig(),
+    ]);
+    const report = checkUiCoverage({
+      screens,
+      stories,
+      requirements,
+      phases,
+      phase: phaseId,
+      mode: args.mode ?? "cumulative",
+      defaultPlatforms: config.uiPlatforms ?? [],
+    });
+    const issues = report.issues.filter(
+      (i) => (!args.severity || i.severity === args.severity) && (!args.code || i.code === args.code),
+    );
+    return json({ ...report, issues });
+  },
+);
+
+tool(
+  "get_stale_screens",
+  {
+    title: "Get stale screens",
+    description:
+      "Screens whose linked stories changed after the mockup was generated — the regeneration worklist after a spec " +
+      "update. Regenerate with create_or_update_screen to clear the flag.",
+    inputSchema: { phase: z.string().optional().describe("Restrict to screens assigned to this phase.") },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const [screens, stories] = await Promise.all([store.listScreens(), store.listStories()]);
+    const scoped = args.phase ? screens.filter((sc) => sc.phase === args.phase) : screens;
+    const stale = staleScreens(scoped, stories);
+    return json({ phase: args.phase ?? null, total: stale.length, screens: stale });
+  },
+);
+
+tool(
+  "delete_screen",
+  {
+    title: "Delete a screen",
+    description: "Remove a screen (or shared component) and its stored mockup.",
+    inputSchema: { id: z.string() },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const deleted = await store.deleteScreen(args.id);
+    return json({ deleted, id: args.id });
   },
 );
 

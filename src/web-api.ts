@@ -31,6 +31,7 @@ import {
 } from "./coverage.js";
 import { ExportPayload, testKey, type CoverageMode, type Scenario, type TestStatus, type UserStory } from "./schema.js";
 import { buildExport, applyImport } from "./export-import.js";
+import { checkUiCoverage, isStale, resolveElements, screenExits } from "./screen-coverage.js";
 import { buildOpenApiDocument } from "./openapi.js";
 
 // ---------------------------------------------------------------------------
@@ -990,6 +991,139 @@ export async function handleWebRequest(
           scenariosTotal: scenarios.length,
           scenariosPassing,
         });
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- GET /api/screens --- (UI specs; filterable, mockup body omitted)
+    if (matchRoute(pathname, method, "/api/screens", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const [screens, stories] = await Promise.all([r.store.listScreens(), r.store.listStories()]);
+        const storyById = new Map(stories.map((s) => [s.id, s]));
+        const screenById = new Map(screens.map((s) => [s.id, s]));
+        const phase    = searchParams.get("phase");
+        const platform = searchParams.get("platform");
+        const status   = searchParams.get("status");
+        const kind     = searchParams.get("kind");
+        const story    = searchParams.get("story");
+        const q        = searchParams.get("q")?.toLowerCase();
+        const list = screens
+          .filter((sc) => {
+            if (phase    && sc.phase    !== phase)    return false;
+            if (platform && sc.platform !== platform) return false;
+            if (status   && sc.status   !== status)   return false;
+            if (kind     && sc.kind     !== kind)     return false;
+            if (story    && !sc.stories.some((l) => l.id === story)) return false;
+            if (q && !`${sc.id}\n${sc.name}\n${sc.description}`.toLowerCase().includes(q)) return false;
+            return true;
+          })
+          .map((sc) => {
+            const { html, ...meta } = sc;
+            return {
+              ...meta,
+              elements: resolveElements(sc, screenById),
+              exits: screenExits(sc, screenById),
+              stale: isStale(sc, storyById),
+              hasHtml: html.length > 0,
+            };
+          });
+        jsonOk(res, { total: list.length, screens: list });
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- GET /api/screens/:id/html --- (raw mockup, rendered in the viewer)
+    {
+      const params = matchRoute(pathname, method, "/api/screens/:id/html", "GET");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const screen = await r.store.getScreen(params.id);
+          if (!screen) { jsonError(res, 404, `Screen ${params.id} not found`); return true; }
+          const body = screen.html;
+          res.writeHead(200, {
+            ...CORS_HEADERS,
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": Buffer.byteLength(body),
+            // The mockup is untrusted generated markup: render it sandboxed.
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:",
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(body);
+        } catch (err) {
+          jsonError(res, 500, String(err));
+        }
+        return true;
+      }
+    }
+
+    // --- GET /api/screens/:id --- (one screen with its resolved elements)
+    {
+      const params = matchRoute(pathname, method, "/api/screens/:id", "GET");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const screen = await r.store.getScreen(params.id);
+          if (!screen) { jsonError(res, 404, `Screen ${params.id} not found`); return true; }
+          const [screens, stories] = await Promise.all([r.store.listScreens(), r.store.listStories()]);
+          const storyById = new Map(stories.map((s) => [s.id, s]));
+          const screenById = new Map(screens.map((s) => [s.id, s]));
+          const { html, ...meta } = screen;
+          jsonOk(res, {
+            ...meta,
+            elements: resolveElements(screen, screenById),
+            exits: screenExits(screen, screenById),
+            stale: isStale(screen, storyById),
+            hasHtml: html.length > 0,
+            storyDetails: screen.stories.map((l) => ({
+              id: l.id,
+              role: l.role,
+              title: storyById.get(l.id)?.title ?? null,
+              drifted: storyById.has(l.id) ? screen.storyVersions[l.id] !== storyById.get(l.id)!.updatedAt : false,
+            })),
+            usedBy: screens.filter((s) => s.uses.includes(screen.id)).map((s) => s.id),
+          });
+        } catch (err) {
+          jsonError(res, 500, String(err));
+        }
+        return true;
+      }
+    }
+
+    // --- GET /api/ui-coverage --- (the section-4 consistency checks)
+    if (matchRoute(pathname, method, "/api/ui-coverage", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const parsedMode = parseCoverageMode(searchParams, res);
+        if (parsedMode === null) return true;
+        // Match the MCP `check_ui_coverage` default (cumulative) when unspecified.
+        const mode = searchParams.get("mode") ? parsedMode : ("cumulative" as CoverageMode);
+        const phaseParam = searchParams.get("phase");
+        const phase = phaseParam === null
+          ? await r.store.resolvePhaseId()
+          : phaseParam === "" || phaseParam === "all"
+            ? null
+            : phaseParam;
+        const [screens, stories, requirements, phases, config] = await Promise.all([
+          r.store.listScreens(),
+          r.store.listStories(),
+          r.store.listRequirements(),
+          r.store.listPhases(),
+          r.store.readConfig().catch(() => null),
+        ]);
+        jsonOk(res, checkUiCoverage({
+          screens, stories, requirements, phases, phase, mode,
+          defaultPlatforms: config?.uiPlatforms ?? [],
+        }));
       } catch (err) {
         jsonError(res, 500, String(err));
       }

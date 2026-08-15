@@ -8,6 +8,7 @@ import {
   Phase,
   Requirement,
   Scenario,
+  Screen,
   UserStory,
   VcsRef,
   type Component as TComponent,
@@ -16,6 +17,7 @@ import {
   type Phase as TPhase,
   type Requirement as TRequirement,
   type Scenario as TScenario,
+  type Screen as TScreen,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
@@ -60,6 +62,10 @@ const SCHEMA_SQL = `
     data TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS scenarios (
+    id   TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS screens (
     id   TEXT PRIMARY KEY,
     data TEXT NOT NULL
   );
@@ -283,6 +289,26 @@ export class SqliteStore {
 
   async deleteScenario(testKey: string): Promise<boolean> {
     const info = this.db.prepare("DELETE FROM scenarios WHERE id = ?").run(testKey);
+    return info.changes > 0;
+  }
+
+  // --- screens ---
+
+  async listScreens(): Promise<TScreen[]> {
+    return this.all("SELECT data FROM screens ORDER BY id", Screen);
+  }
+
+  async getScreen(id: string): Promise<TScreen | null> {
+    return this.get("SELECT data FROM screens WHERE id = ?", [id], Screen);
+  }
+
+  async writeScreen(screen: TScreen): Promise<void> {
+    const v = Screen.parse(screen);
+    this.put("screens", v.id, v);
+  }
+
+  async deleteScreen(id: string): Promise<boolean> {
+    const info = this.db.prepare("DELETE FROM screens WHERE id = ?").run(id);
     return info.changes > 0;
   }
 
