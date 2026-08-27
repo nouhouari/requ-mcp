@@ -34,3 +34,6 @@ jobs:
 
       - name: Smoke test — screens (UI specification traceability)
         run: npm run smoke:screens
+
+      - name: Smoke test — VCS references
+        run: npm run smoke:vcs

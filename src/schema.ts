@@ -331,6 +331,12 @@ export type Scenario = z.infer<typeof Scenario>;
 // Project config
 // ---------------------------------------------------------------------------
 
+/** VCS provider label. requ-mcp never calls the provider — this records which
+ *  one the project uses. "bitbucket" covers Bitbucket Cloud and Server/Data
+ *  Center alike (the distinction has no effect since no API is called). */
+export const VcsType = z.enum(["gitlab", "github", "bitbucket"]);
+export type VcsType = z.infer<typeof VcsType>;
+
 export const Config = z.object({
   name: z.string().default("requ project"),
   key:   z.string().optional(),
@@ -344,7 +350,8 @@ export const Config = z.object({
   repoUrl: z.string().optional(),
   /** Default branch name; treated as "main" when unset. */
   defaultBranch: z.string().optional(),
-  vcsType: z.enum(["gitlab"]).optional(),
+  /** VCS provider (gitlab | github | bitbucket). */
+  vcsType: VcsType.optional(),
   /** Platforms every story is expected to be materialized on, unless the story
    *  overrides them. Drives the per-platform screen coverage check. */
   uiPlatforms: z.array(ScreenPlatform).optional(),

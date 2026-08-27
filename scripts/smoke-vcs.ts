@@ -78,6 +78,23 @@ async function main() {
     const getRepo = await call("get_repo");
     check("get_repo returns repoUrl + branch + vcsType", getRepo.data.repoUrl === "https://gitlab.com/acme/app" && getRepo.data.defaultBranch === "develop" && getRepo.data.vcsType === "gitlab", getRepo.data);
 
+    // vcsType accepts the other supported providers (bitbucket / github)
+    await call("set_repo", { repoUrl: "https://bitbucket.org/acme/app", defaultBranch: "develop", vcsType: "bitbucket" });
+    const getBb = await call("get_repo");
+    check("set_repo/get_repo round-trip vcsType=bitbucket", getBb.data.vcsType === "bitbucket" && getBb.data.repoUrl === "https://bitbucket.org/acme/app", getBb.data);
+
+    await call("set_repo", { repoUrl: "https://github.com/acme/app", defaultBranch: "develop", vcsType: "github" });
+    const getGh = await call("get_repo");
+    check("set_repo/get_repo round-trip vcsType=github", getGh.data.vcsType === "github", getGh.data);
+
+    // unknown providers are still rejected by the enum
+    const badVcs = await call("set_repo", { repoUrl: "https://svn.example.com/acme/app", vcsType: "svn" });
+    check("set_repo rejects unknown vcsType", badVcs.isError === true, badVcs.data);
+
+    // restore the gitlab reference the rest of this smoke test assumes
+    const restored = await call("set_repo", { repoUrl: "https://gitlab.com/acme/app", defaultBranch: "develop", vcsType: "gitlab" });
+    check("set_repo restores gitlab reference", restored.data.vcsType === "gitlab" && restored.data.repoUrl === "https://gitlab.com/acme/app", restored.data);
+
     // --- link_branch ---
     const br = await call("link_branch", { branch: "feature/login", storyIds: ["US-001"], requirementIds: ["REQ-001"], component: "auth", url: "https://gitlab.com/acme/app/-/tree/feature/login" });
     check("link_branch creates BR-001 (kind=branch, opened)", br.data.id === "BR-001" && br.data.kind === "branch" && br.data.state === "opened", br.data);

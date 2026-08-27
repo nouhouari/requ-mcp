@@ -109,7 +109,7 @@ Or in your MCP client config:
 | **Screens** | UI specs: filterable screen cards (platform, status, staleness), the UI consistency-check results, and a viewer that renders the mockup in a sandboxed frame with traced elements outlined, its element table, exits and linked stories — see [Screens](#screens--ui-specifications) |
 | **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
-| **VCS** | Table of VCS refs (branches and MRs) linked to stories and requirements, with state badges and external links |
+| **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
 
 **Live updates:** The dashboard polls for KPI count changes every 5 seconds via Server-Sent Events (SSE) — no page refresh needed. The summary payload (`GET /api/summary` and the SSE feed) includes project totals plus `scenariosTotal` and a `byPhase[]` array of per-phase `{ requirements, stories, scenarios }` counts (partitioned by earliest phase, with an Unassigned bucket).
 
@@ -261,10 +261,39 @@ reviewable in PRs:
 | `coverage_report` | reporting | Phase/mode rollup + per-component + summary % (json or markdown) |
 | `coverage_trend` | reporting | Coverage summary at each phase — the evolution view |
 | `find_gaps` | reporting | Requirements without stories, stories without scenarios, stories not covered (per phase) |
+| `set_repo` / `get_repo` | dev | Record the project's repository reference — `repoUrl`, `defaultBranch`, `vcsType` (`gitlab` / `github` / `bitbucket`) |
+| `link_branch` / `link_merge_request` / `update_merge_request` / `list_vcs_refs` | dev | Link branches and merge/pull requests to stories and requirements — see [VCS references](#vcs-references) |
 
 Every tool also accepts an optional `projectPath` in **stdio mode**, or a `key`
 in **HTTP mode**, to select the target project (see
 [How it finds the project](#how-it-finds-the-project)).
+
+## VCS references
+
+requ-mcp records references to branches and merge/pull requests so a story can
+be traced to the code that implements it. **It never calls the VCS provider and
+holds no token** — the references are whatever an agent or CI job reports.
+
+`set_repo` accepts `vcsType: gitlab | github | bitbucket`. The value is a label
+only; no behaviour depends on it. `bitbucket` covers both Bitbucket Cloud and
+Bitbucket Server/Data Center.
+
+The vocabulary is provider-neutral and modelled on GitLab: a merge request
+reference has `kind: "mr"` and id `MR-<ref>`, where `ref` is the MR iid on
+GitLab or the PR number on GitHub and Bitbucket (numeric in all three). States
+are `opened` / `merged` / `closed` — Bitbucket's `DECLINED` and `SUPERSEDED`,
+and GitHub's closed-unmerged PRs, all map to `closed`.
+
+```jsonc
+// set_repo
+{ "repoUrl": "https://bitbucket.org/acme/app", "defaultBranch": "main", "vcsType": "bitbucket" }
+// link_merge_request — PR #42 implementing US-001
+{ "ref": "42", "url": "https://bitbucket.org/acme/app/pull-requests/42",
+  "branch": "feature/login", "targetBranch": "main", "storyIds": ["US-001"] }
+```
+
+A story whose MR/PR is `merged` is surfaced as such in `coverage_report`,
+separately from whether its scenarios pass.
 
 ## Linking tests — `@US-xxx` tags
 

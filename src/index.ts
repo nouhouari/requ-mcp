@@ -29,6 +29,7 @@ import {
   storiesFromTags,
   VcsRefKind,
   VcsRefState,
+  VcsType,
   type AcceptanceCriterion,
   type Component as TComponent,
   type Execution,
@@ -2262,10 +2263,12 @@ tool(
 );
 
 // ===========================================================================
-// VCS references (GitLab branches / merge requests)
+// VCS references (branches / merge or pull requests)
 //
 // requ-mcp NEVER calls the VCS provider and holds NO token. These tools only
-// record references that nodes report, for traceability.
+// record references that nodes report, for traceability. "Merge request" is
+// used as the provider-neutral term: GitLab MRs, GitHub PRs and Bitbucket PRs
+// are all recorded the same way.
 // ===========================================================================
 
 tool(
@@ -2275,9 +2278,9 @@ tool(
     description:
       "Record the project's VCS repository reference (repoUrl, defaultBranch, vcsType) in config. requ-mcp never calls the VCS provider — it only stores these references for traceability.",
     inputSchema: {
-      repoUrl:       z.string().describe("Repository URL, e.g. 'https://gitlab.com/group/project'."),
+      repoUrl:       z.string().describe("Repository URL, e.g. 'https://gitlab.com/group/project' or 'https://bitbucket.org/team/repo'."),
       defaultBranch: z.string().optional().describe("Default branch name. Defaults to 'main'."),
-      vcsType:       z.enum(["gitlab"]).optional().describe("VCS provider type."),
+      vcsType:       VcsType.optional().describe("VCS provider type. 'bitbucket' covers both Bitbucket Cloud and Server/Data Center."),
     },
   },
   async (args, store) => {
@@ -2367,11 +2370,11 @@ tool(
   {
     title: "Link a VCS merge request reference",
     description:
-      "Record (or upsert) a reference to a merge request (kind='mr'), keyed by `ref` (the MR iid), id 'MR-<ref>'. Referenced storyIds/requirementIds must exist (fails if unknown). requ-mcp does not call GitLab — it only records the reference.",
+      "Record (or upsert) a reference to a merge request (kind='mr'), keyed by `ref` (the MR iid / PR number), id 'MR-<ref>'. 'mr' is the provider-neutral kind: GitLab MRs, GitHub PRs and Bitbucket PRs all use it. Referenced storyIds/requirementIds must exist (fails if unknown). requ-mcp does not call the VCS provider — it only records the reference.",
     inputSchema: {
-      ref:            z.string().regex(/^\d+$/).describe("MR iid (numeric string)."),
-      url:            z.string().min(1).describe("MR URL."),
-      branch:         z.string().min(1).describe("Source branch of the MR."),
+      ref:            z.string().regex(/^\d+$/).describe("MR iid (GitLab) or PR number (GitHub, Bitbucket) — numeric string."),
+      url:            z.string().min(1).describe("MR/PR URL."),
+      branch:         z.string().min(1).describe("Source branch of the MR/PR."),
       storyIds:       z.array(z.string().regex(/^US-\d+$/)).optional().describe("User story ids (US-…) this MR implements."),
       requirementIds: z.array(z.string().regex(/^REQ-\d+$/)).optional().describe("Requirement ids (REQ-…) this MR relates to."),
       targetBranch:   z.string().optional().describe("Target branch of the MR."),
@@ -2414,10 +2417,10 @@ tool(
   {
     title: "Update a merge request reference state",
     description:
-      "Update the state (and optional mergeCommit) of a recorded MR reference, found by its `ref` (MR iid). Bumps updatedAt. Fails if no MR reference with that ref exists.",
+      "Update the state (and optional mergeCommit) of a recorded MR reference, found by its `ref` (MR iid / PR number). Bumps updatedAt. Fails if no MR reference with that ref exists. States are provider-neutral: Bitbucket DECLINED/SUPERSEDED and GitHub closed-unmerged PRs all map to 'closed'.",
     inputSchema: {
-      ref:         z.string().regex(/^\d+$/).describe("MR iid (numeric string)."),
-      state:       VcsRefState.describe("New MR state."),
+      ref:         z.string().regex(/^\d+$/).describe("MR iid (GitLab) or PR number (GitHub, Bitbucket) — numeric string."),
+      state:       VcsRefState.describe("New MR/PR state ('closed' covers Bitbucket DECLINED/SUPERSEDED)."),
       mergeCommit: z.string().optional().describe("Merge commit SHA (when merged)."),
     },
   },
@@ -2438,7 +2441,7 @@ tool(
   "list_vcs_refs",
   {
     title: "List VCS references",
-    description: "List recorded VCS references (branches and MRs), optionally filtered by kind, component, state, or linked storyId.",
+    description: "List recorded VCS references (branches and MRs/PRs), optionally filtered by kind, component, state, or linked storyId.",
     inputSchema: {
       kind:      VcsRefKind.optional(),
       component: z.string().optional(),
