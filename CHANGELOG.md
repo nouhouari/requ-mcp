@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.9.0] – 2026-08-27
+
 ### Added
 - **Bitbucket and GitHub as VCS types** — `set_repo`'s `vcsType` now accepts
   `gitlab | github | bitbucket` (previously `gitlab` only). The value is a label:
