@@ -11,3 +11,5 @@ dist/
 # Playwright MCP scratch output (snapshots, screenshots, console logs)
 .playwright-mcp/
 overview-counts.png
+# Local environment (credentials, workspace path) — never commit
+.env

@@ -6,6 +6,7 @@ import {
   Execution,
   Phase,
   Requirement,
+  Adr,
   Scenario,
   Screen,
   UserStory,
@@ -16,11 +17,12 @@ import {
   type Phase as TPhase,
   type Requirement as TRequirement,
   type Scenario as TScenario,
+  type Adr as TAdr,
   type Screen as TScreen,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
-import { Store } from "./storage.js";
+import { nextId } from "./ids.js";
 
 // ---------------------------------------------------------------------------
 // Module-level pool singleton
@@ -87,6 +89,12 @@ const SCHEMA_SQL = `
     PRIMARY KEY (project_id, id)
   );
   CREATE TABLE IF NOT EXISTS screens (
+    project_id TEXT  NOT NULL,
+    id         TEXT  NOT NULL,
+    data       JSONB NOT NULL,
+    PRIMARY KEY (project_id, id)
+  );
+  CREATE TABLE IF NOT EXISTS adrs (
     project_id TEXT  NOT NULL,
     id         TEXT  NOT NULL,
     data       JSONB NOT NULL,
@@ -481,6 +489,45 @@ export class PostgresStore {
     return (res.rowCount ?? 0) > 0;
   }
 
+  // --- architecture decisions ---
+
+  async listAdrs(): Promise<TAdr[]> {
+    const pool = await this.pool();
+    const { rows } = await pool.query(
+      "SELECT data FROM adrs WHERE project_id = $1 ORDER BY id",
+      [this.projectId],
+    );
+    return rows.map((r) => Adr.parse(r.data));
+  }
+
+  async getAdr(id: string): Promise<TAdr | null> {
+    const pool = await this.pool();
+    const { rows } = await pool.query(
+      "SELECT data FROM adrs WHERE project_id = $1 AND id = $2",
+      [this.projectId, id],
+    );
+    return rows.length ? Adr.parse(rows[0].data) : null;
+  }
+
+  async writeAdr(adr: TAdr): Promise<void> {
+    const pool = await this.pool();
+    const v = Adr.parse(adr);
+    await pool.query(
+      `INSERT INTO adrs(project_id, id, data) VALUES($1, $2, $3)
+       ON CONFLICT (project_id, id) DO UPDATE SET data = EXCLUDED.data`,
+      [this.projectId, v.id, v],
+    );
+  }
+
+  async deleteAdr(id: string): Promise<boolean> {
+    const pool = await this.pool();
+    const res = await pool.query(
+      "DELETE FROM adrs WHERE project_id = $1 AND id = $2",
+      [this.projectId, id],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
   /** Discover all project_ids that have a config row (DB-native project list). */
   static async listProjectIds(): Promise<string[]> {
     if (!_pool) throw new Error("PostgreSQL not configured. Set REQU_PG_URL.");
@@ -489,5 +536,5 @@ export class PostgresStore {
     return rows.map((r) => r.project_id as string);
   }
 
-  static nextId = Store.nextId;
+  static nextId = nextId;
 }

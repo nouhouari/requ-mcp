@@ -10,27 +10,15 @@ PID_FILE="${PID_FILE:-$PROJECT_DIR/.http-pg.pid}"
 # ---------------------------------------------------------------------------
 REQU_PORT="${REQU_PORT:-8788}"
 REQU_HOST="${REQU_HOST:-0.0.0.0}"
-# Multi-project auto-discovery (optional): set REQU_WORKSPACE_DIR to a
-# workspace directory and every child directory containing a .requ/ folder is
-# loaded as a project root. Set REQU_PROJECTS explicitly to skip discovery.
-if [ -z "${REQU_PROJECTS:-}" ] && [ -n "${REQU_WORKSPACE_DIR:-}" ]; then
-  if [ ! -d "$REQU_WORKSPACE_DIR" ]; then
-    echo "REQU_WORKSPACE_DIR does not exist: $REQU_WORKSPACE_DIR" >&2
-    exit 1
-  fi
-  discovered=$(find "$REQU_WORKSPACE_DIR" -maxdepth 2 -name ".requ" -type d \
-    -not -path "*/node_modules/*" \
-    -not -path "*/.git/*" \
-    2>/dev/null \
-    | sed 's|/\.requ$||' \
-    | tr '\n' ',')
-  REQU_PROJECTS="${discovered%,}"
-fi
+# Projects live in Postgres and are addressed by key; there is no filesystem
+# discovery any more (REQU_PROJECTS remains for SQLite-only deployments).
 REQU_PROJECTS="${REQU_PROJECTS:-}"
-# REQU_ROOT is kept for single-project fallback (unused when REQU_PROJECTS is set)
-REQU_ROOT="${REQU_ROOT:-$PROJECT_DIR}"
+REQU_ROOT="${REQU_ROOT:-}"
 PG_USER="${PG_USER:-requ}"
-PG_PASSWORD="${PG_PASSWORD:-requ}"
+if [ -z "${PG_PASSWORD:-}" ]; then
+  echo "PG_PASSWORD is not set. Export it (or put it in .env) — there is no default." >&2
+  exit 1
+fi
 PG_DB="${PG_DB:-requ}"
 PG_PORT="${PG_PORT:-5433}"
 PG_HOST="${PG_HOST:-127.0.0.1}"

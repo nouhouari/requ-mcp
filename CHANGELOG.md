@@ -4,7 +4,90 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [1.0.0] – 2026-08-28
+
+### Removed — BREAKING
+- **Local mode is gone.** requ-mcp is an HTTP server only. The stdio transport,
+  the YAML `.requ/` store and all filesystem project resolution (`REQU_ROOT`
+  auto-detection, MCP workspace roots, walking up from the cwd, and the
+  cwd-derived "legacy SQLite" fallback) have been deleted, along with the
+  `projectPath` argument on every tool.
+
+  *Why:* there were two ways to reach requ and no way for an agent to tell them
+  apart. A client wired as `npx -y requ-mcp` silently read and wrote a private
+  `.requ/` folder in whatever repo it happened to be in, while the team's data
+  sat on the server. Projects are now addressed by `key` and nothing else, so
+  landing on the wrong store is not possible.
+
+  *Migrating:* the migration tool ships in the git repo, not in the npm package
+  (`files` is `dist` only). From a checkout of the last release that still had
+  local mode — `git checkout v0.8.0` — run, for each `.requ/` project:
+
+  ```bash
+  # start a 1.0 server first, then create the target project with init_project
+  npx tsx scripts/sync-yaml-to-pg.ts <repo-root> <project-key> http://localhost:8788
+  ```
+
+  Then upgrade. Clients change from a `command`/`args` entry to
+  `{"type": "http", "url": "http://<host>:8788/mcp"}`, and every call that
+  passed `projectPath` passes `key` instead. `conductorPath` must become a path
+  the **server** can read (under Docker, below the mounted `/workspace`).
+
+### Added
+- **`assign_requirements_to_phase`** — move many requirements onto a phase in one
+  call, selected either by explicit `ids` or by filter (status / component / tag /
+  current phase), with `dryRun`. Unknown ids reject the whole batch rather than
+  half-applying it.
+- **Docker Compose runs the whole stack** (`docker compose up -d`): Postgres plus
+  the server, with your workspace mounted read-only at `/workspace`. Credentials
+  and the workspace path come from `.env` (see `.env.example`) instead of being
+  hardcoded.
+
+### Fixed
+- **Path-based tools failed silently when the server could not see the path.**
+  `search_tests` returned zero results and the `list_links` disk scan returned
+  nothing — indistinguishable from "there is nothing there", and the usual
+  outcome when running in a container with no mount. They now return an explicit
+  error naming the resolved path. `create_or_update_screen`'s mockup error names
+  the resolved path too, instead of just the store root.
+
+### Changed
+- The smoke suites drive the server over HTTP (SQLite-backed, so CI needs no
+  database service) through a shared harness in `scripts/lib/http-harness.ts`.
+  `smoke:search` now runs in CI.
+
+- **Architecture decisions (ADRs) as a first-class entity** — the decisions the
+  architect produces are now tracked next to the requirements they serve, not
+  left as loose files. `create_adr` / `update_adr` / `get_adr` / `list_adrs` /
+  `search_adrs` / `get_adr_content` / `delete_adr`, stored across all three
+  backends, with the decision body stored apart from its metadata so listings
+  stay small; included in export/import, and counted in `/api/summary` and the
+  SSE feed. Ids run `ADR-001`; status is `proposed` → `accepted` → `superseded`
+  with a `supersededBy` pointer, so decision history is superseded rather than
+  rewritten. Decisions link to requirements and components, and are deliberately
+  a separate dimension from coverage — the requirement → story → scenario
+  percentages are unchanged.
+- **`import_adrs_from_files`** — bulk-import an existing `docs/adr/` folder: id
+  from the filename's leading number (`0004-…` → `ADR-004`), title from the
+  first `# ` heading, status from a `Status` section or inline `Status:` line.
+  Records `sourcePath`, after which `get_adr_content` prefers the live file over
+  requ's snapshot. Idempotent, with a `dryRun` preview.
+- **Decisions tab in the dashboard** — decision cards with status badges and
+  their requirement/component links, and a reader that renders the markdown with
+  its ```mermaid diagrams (C4, sequence) drawn in place. `GET /api/adrs`,
+  `/api/adrs/:id` and `/api/adrs/:id/content`.
+- `npm run smoke:adrs` — end-to-end smoke test for the whole decision chain,
+  now run in CI.
+
+
+### Security
+- The dashboard now sanitizes rendered markdown with DOMPurify before inserting
+  it. The decision reader renders in the page rather than the screens viewer's
+  sandboxed iframe, because mermaid needs scripts that `sandbox=""` forbids.
+
 ## [0.9.0] – 2026-08-27
+
+_Never published to npm: the changes below shipped as part of 1.0.0._
 
 ### Added
 - **Bitbucket and GitHub as VCS types** — `set_repo`'s `vcsType` now accepts

@@ -5,7 +5,8 @@ import { z } from "zod";
  *
  * Traceability spine:
  *   Component ← Requirement → User Story ─┬→ (acceptance criteria)
- *                                ↑        └→ Screen (UI spec / HTML mockup)
+ *       ↑           ↑                     └→ Screen (UI spec / HTML mockup)
+ *       └───────────┴──── Adr (architecture decision — why the system is shaped so)
  *   Phase → Execution (a scenario result for a run) ─── @US-xxx tag in feature files
  *
  * Component: a sub-system/module that maps to broker domain_tags.
@@ -328,6 +329,40 @@ export const Scenario = z.object({
 export type Scenario = z.infer<typeof Scenario>;
 
 // ---------------------------------------------------------------------------
+// Adr — an Architecture Decision Record.
+// The durable answer to *why* the system is shaped the way it is. requ owns the
+// markdown (mermaid diagrams included); the body is stored inline on the record
+// and split to a sidecar `.md` by the YAML store alone, exactly like Screen.html.
+// ---------------------------------------------------------------------------
+
+/** proposed → accepted → superseded. A decision is never silently rewritten:
+ *  it is superseded by a newer one, so the history stays readable. */
+export const AdrStatus = z.enum(["proposed", "accepted", "superseded"]);
+export type AdrStatus = z.infer<typeof AdrStatus>;
+
+export const Adr = z.object({
+  id: z.string().regex(/^ADR-\d+$/, "id must look like ADR-001"),
+  title: z.string().min(1),
+  status: AdrStatus.default("proposed"),
+  /** The decision record itself: markdown, ```mermaid fences included. */
+  content: z.string().default(""),
+  /** Requirements this decision is driven by or constrains. */
+  requirements: z.array(z.string().regex(/^REQ-\d+$/)).default([]),
+  /** Components the decision applies to. */
+  components: z.array(z.string()).default([]),
+  /** The ADR that replaced this one — set when status becomes 'superseded'. */
+  supersededBy: z.string().optional(),
+  /** Origin path when imported from a repo file (e.g. docs/adr/0004-cqrs.md). */
+  sourcePath: z.string().optional(),
+  phase: z.string().optional(),
+  /** Content hash, refreshed whenever the body changes. */
+  version: z.string().default(""),
+  createdAt: Timestamp,
+  updatedAt: Timestamp,
+});
+export type Adr = z.infer<typeof Adr>;
+
+// ---------------------------------------------------------------------------
 // Project config
 // ---------------------------------------------------------------------------
 
@@ -407,6 +442,7 @@ export const ExportPayload = z.object({
     stories:      z.array(UserStory).default([]),
     scenarios:    z.array(Scenario).default([]),
     screens:      z.array(Screen).default([]),
+    adrs:         z.array(Adr).default([]),
     phases:       z.array(Phase).default([]),
     executions:   z.record(z.array(Execution)).default({}),
     vcsRefs:      z.array(VcsRef).default([]),

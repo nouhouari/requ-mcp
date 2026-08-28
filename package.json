@@ -1,6 +1,6 @@
 {
   "name": "requ-mcp",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "MCP server to track requirements coverage and its evolution across phases/releases. Pairs with Conductor for e2e tests; links scenarios to user stories via @US-xxx tags.",
   "type": "module",
   "bin": {
@@ -15,11 +15,12 @@
   "scripts": {
     "build": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\" && tsx scripts/gen-openapi.ts",
     "gen:openapi": "tsx scripts/gen-openapi.ts",
-    "dev": "tsx src/index.ts",
-    "start:http": "REQU_TRANSPORT=http tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "start:http": "tsx src/index.ts",
     "smoke": "tsx scripts/smoke.ts",
     "smoke:vcs": "tsx scripts/smoke-vcs.ts",
     "smoke:screens": "tsx scripts/smoke-screens.ts",
+    "smoke:adrs": "tsx scripts/smoke-adrs.ts",
     "smoke:search": "tsx scripts/smoke-search.ts",
     "smoke:pg": "tsx scripts/smoke-pg.ts",
     "prepare": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",

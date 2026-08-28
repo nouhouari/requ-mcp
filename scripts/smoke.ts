@@ -1,19 +1,14 @@
 /**
  * End-to-end smoke test for the tag-derived, story-level model. Spawns the
- * built MCP server over stdio and drives the full lifecycle: requirements (with
+ * built MCP server over HTTP and drives the full lifecycle: requirements (with
  * components), stories, @US-xxx tag discovery, manual + imported executions,
  * phase/mode-aware story-level coverage, and the trend across two releases
  * (including a regression).
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import url from "node:url";
-
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "..");
+import { startHarness, slugFor } from "./lib/http-harness.js";
 
 let passed = 0;
 let failed = 0;
@@ -77,25 +72,28 @@ async function main() {
     ].join("\n"),
   );
 
-  const client = new Client({ name: "smoke", version: "0.0.0" });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(repoRoot, "dist", "index.js")],
-    env: { ...process.env, REQU_ROOT: tmp },
-  });
-  await client.connect(transport);
+  // The import fixture is a second project. Projects are declared to the server
+  // at startup, so its folder has to exist before the harness boots.
+  const tmp2 = await fs.mkdtemp(path.join(os.tmpdir(), "requ-smoke-import-"));
+  await fs.mkdir(path.join(tmp2, "features"), { recursive: true });
+  await fs.writeFile(
+    path.join(tmp2, "features", "search.feature"),
+    [
+      "Feature: Search",
+      "",
+      "  Background:",
+      "    Given the catalog is loaded",
+      "",
+      "  @US-1",
+      "  Scenario: Find a product by name",
+      "    When I search for a product",
+      "    Then I see matching results",
+    ].join("\n"),
+  );
+  const key2 = slugFor(tmp2);
 
-  const call = async (name: string, args: Record<string, unknown> = {}) => {
-    const res: any = await client.callTool({ name, arguments: args });
-    const txt = res.content?.[0]?.text ?? "{}";
-    let parsed: any = txt;
-    try {
-      parsed = JSON.parse(txt);
-    } catch {
-      /* markdown */
-    }
-    return { isError: !!res.isError, data: parsed, raw: txt };
-  };
+  const h = await startHarness([tmp, tmp2], "smoke");
+  const call = h.call;
 
   try {
     // check_conductor inspects the folder without writing anything.
@@ -110,9 +108,13 @@ async function main() {
     check("init creates active phase v1.0", init.data.phase?.id === "P1", init.data);
     check("init reports the Conductor name + feature count", init.data.conductor?.featureFiles === 2 && typeof init.data.conductor?.name === "string", init.data.conductor);
 
-    // Explicit projectPath argument resolves the same project.
+    // The `key` selector resolves the same project; a filesystem path is refused.
+    const viaKey = await h.callOn(h.key, "list_phases");
+    check("explicit key resolves project", viaKey.data.activePhase === "P1", viaKey.data);
+    // projectPath was removed with local mode: it is not in any tool schema, so
+    // it is dropped rather than honoured — the key is what selects the project.
     const viaPath = await call("list_phases", { projectPath: tmp });
-    check("explicit projectPath resolves project", viaPath.data.activePhase === "P1", viaPath.data);
+    check("a stale projectPath argument is ignored, not honoured", viaPath.data.activePhase === "P1", viaPath.data);
 
     // Requirements with components.
     await call("create_requirement", { title: "User can log in", components: ["auth"], priority: "high" });
@@ -209,6 +211,38 @@ async function main() {
     const badPhase = await call("create_requirement", { title: "bad", phase: "NOPE" });
     check("create rejects an unknown phase", badPhase.isError === true, badPhase.data);
 
+    // --- bulk phase assignment ----------------------------------------------
+    // REQ-005 is the only unassigned one at this point.
+    const bulkDry = await call("assign_requirements_to_phase", { phase: "P2", fromPhase: "", dryRun: true });
+    check("bulk dryRun selects the unassigned requirement", bulkDry.data.selected === 1 && bulkDry.data.moved === 1, bulkDry.data);
+    const stillUnassigned = await call("list_requirements", { phase: "P2" });
+    check("bulk dryRun writes nothing", stillUnassigned.data.length === 1, stillUnassigned.data.map((r: any) => r.id));
+
+    const bulk = await call("assign_requirements_to_phase", { phase: "P2", fromPhase: "" });
+    check("bulk moves the unassigned requirement to P2", bulk.data.moved === 1 && bulk.data.movedIds.includes("REQ-005"), bulk.data);
+    const nowP2 = await call("list_requirements", { phase: "P2" });
+    check("P2 now holds both requirements", nowP2.data.length === 2, nowP2.data.map((r: any) => r.id));
+
+    const bulkAgain = await call("assign_requirements_to_phase", { phase: "P2", ids: ["REQ-005"] });
+    check("bulk is idempotent (already on the phase)", bulkAgain.data.moved === 0 && bulkAgain.data.unchanged === 1, bulkAgain.data);
+
+    const bulkBack = await call("assign_requirements_to_phase", { phase: "", ids: ["REQ-005"] });
+    check("bulk unassigns with phase ''", bulkBack.data.moved === 1 && bulkBack.data.phase === null, bulkBack.data);
+
+    const bulkByComponent = await call("assign_requirements_to_phase", { phase: "P1", component: "auth", dryRun: true });
+    check("bulk selects by component", bulkByComponent.data.selected === 1, bulkByComponent.data);
+
+    const bulkBadPhase = await call("assign_requirements_to_phase", { phase: "NOPE", ids: ["REQ-005"] });
+    check("bulk rejects an unknown phase", bulkBadPhase.isError === true, bulkBadPhase.data);
+    const bulkBadId = await call("assign_requirements_to_phase", { phase: "P1", ids: ["REQ-001", "REQ-999"] });
+    check("bulk refuses the whole batch on an unknown id", bulkBadId.isError === true, bulkBadId.data);
+    const untouched = await call("get_requirement", { id: "REQ-001" });
+    check("a refused batch changed nothing", untouched.data.phase === "P1", untouched.data.phase);
+    const bulkBoth = await call("assign_requirements_to_phase", { phase: "P1", ids: ["REQ-001"], component: "auth" });
+    check("bulk rejects ids + filter together", bulkBoth.isError === true, bulkBoth.data);
+    const bulkNone = await call("assign_requirements_to_phase", { phase: "P1" });
+    check("bulk requires a selection", bulkNone.isError === true, bulkNone.data);
+
     // A selected phase excludes both other-phase AND unassigned items.
     // strict P1: only the 3 P1 reqs (REQ-004=P2 and unassigned REQ-005 both excluded) => 3 total.
     const strictP1 = await call("coverage_report", { phase: "P1", mode: "strict" });
@@ -280,32 +314,16 @@ async function main() {
     check("coverage derives from stored scenarios (US-001 has 2)", repStore.data.stories.find((s: any) => s.id === "US-001")?.scenarios.length === 2, repStore.data.stories);
 
     // import_scenarios_from_features on a fresh project populates content from disk.
-    const tmp2 = await fs.mkdtemp(path.join(os.tmpdir(), "requ-smoke-import-"));
-    await fs.mkdir(path.join(tmp2, "features"), { recursive: true });
-    await fs.writeFile(
-      path.join(tmp2, "features", "search.feature"),
-      [
-        "Feature: Search",
-        "",
-        "  Background:",
-        "    Given the catalog is loaded",
-        "",
-        "  @US-1",
-        "  Scenario: Find a product by name",
-        "    When I search for a product",
-        "    Then I see matching results",
-      ].join("\n"),
-    );
-    await call("init_project", { projectPath: tmp2, name: "ImportSmoke", conductorPath: "." });
-    const importRes = await call("import_scenarios_from_features", { projectPath: tmp2 });
+    await h.callOn(key2, "init_project", { name: "ImportSmoke", conductorPath: "." });
+    const importRes = await h.callOn(key2, "import_scenarios_from_features");
     check("import_scenarios_from_features imports disk scenarios", importRes.data.scenariosParsed === 1 && importRes.data.imported === 1, importRes.data);
-    const imported = await call("list_scenarios", { projectPath: tmp2 });
+    const imported = await h.callOn(key2, "list_scenarios");
     check("imported scenario has content populated", imported.data.length === 1 && imported.data[0].content.includes("When I search for a product"), imported.data);
     check("imported scenario captures the Background block", imported.data[0].background.includes("Given the catalog is loaded"), imported.data[0].background);
-    await fs.rm(tmp2, { recursive: true, force: true });
   } finally {
-    await client.close();
+    await h.stop();
     await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(tmp2, { recursive: true, force: true });
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

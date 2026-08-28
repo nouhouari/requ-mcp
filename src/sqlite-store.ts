@@ -7,6 +7,7 @@ import {
   Execution,
   Phase,
   Requirement,
+  Adr,
   Scenario,
   Screen,
   UserStory,
@@ -17,11 +18,12 @@ import {
   type Phase as TPhase,
   type Requirement as TRequirement,
   type Scenario as TScenario,
+  type Adr as TAdr,
   type Screen as TScreen,
   type UserStory as TUserStory,
   type VcsRef as TVcsRef,
 } from "./schema.js";
-import { Store } from "./storage.js";
+import { nextId } from "./ids.js";
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS config (
@@ -66,6 +68,10 @@ const SCHEMA_SQL = `
     data TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS screens (
+    id   TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS adrs (
     id   TEXT PRIMARY KEY,
     data TEXT NOT NULL
   );
@@ -312,6 +318,25 @@ export class SqliteStore {
     return info.changes > 0;
   }
 
-  // Reuse static helper from Store
-  static nextId = Store.nextId;
+  // --- architecture decisions ---
+
+  async listAdrs(): Promise<TAdr[]> {
+    return this.all("SELECT data FROM adrs ORDER BY id", Adr);
+  }
+
+  async getAdr(id: string): Promise<TAdr | null> {
+    return this.get("SELECT data FROM adrs WHERE id = ?", [id], Adr);
+  }
+
+  async writeAdr(adr: TAdr): Promise<void> {
+    const v = Adr.parse(adr);
+    this.put("adrs", v.id, v);
+  }
+
+  async deleteAdr(id: string): Promise<boolean> {
+    const info = this.db.prepare("DELETE FROM adrs WHERE id = ?").run(id);
+    return info.changes > 0;
+  }
+
+  static nextId = nextId;
 }

@@ -4,15 +4,11 @@
  * verifies substring matching, case-insensitivity, filter combinations, empty
  * results, and the shape of each tool's response.
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import url from "node:url";
+import { startHarness } from "./lib/http-harness.js";
 
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "..");
 
 let passed = 0;
 let failed = 0;
@@ -60,21 +56,8 @@ async function main() {
     ].join("\n"),
   );
 
-  const client = new Client({ name: "smoke-search", version: "0.0.0" });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(repoRoot, "dist", "index.js")],
-    env: { ...process.env, REQU_ROOT: tmp },
-  });
-  await client.connect(transport);
-
-  const call = async (name: string, args: Record<string, unknown> = {}) => {
-    const res: any = await client.callTool({ name, arguments: args });
-    const txt = res.content?.[0]?.text ?? "{}";
-    let parsed: any = txt;
-    try { parsed = JSON.parse(txt); } catch { /* not JSON */ }
-    return { isError: !!res.isError, data: parsed };
-  };
+  const h = await startHarness([tmp], "smoke-search");
+  const call = h.call;
 
   try {
     await call("init_project", { name: "Search Smoke", conductorPath: ".", initialPhase: "v1" });
@@ -210,7 +193,7 @@ async function main() {
     );
     check("conductorRoot is present in search_tests response", typeof t1.data.conductorRoot === "string", t1.data);
   } finally {
-    await client.close();
+    await h.stop();
     await fs.rm(tmp, { recursive: true, force: true });
   }
 

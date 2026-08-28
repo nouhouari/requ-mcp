@@ -3,17 +3,13 @@
  * story ↔ screen link table, `data-req-*` element extraction, the executable UI
  * coverage checks, and drift detection after a spec change.
  *
- * Drives the built server over stdio, exactly like scripts/smoke.ts.
+ * Drives the built server over HTTP, exactly like scripts/smoke.ts.
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import url from "node:url";
+import { startHarness } from "./lib/http-harness.js";
 
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "..");
 
 let passed = 0;
 let failed = 0;
@@ -63,21 +59,8 @@ async function main() {
   // A mockup that lives as a file in the repo, published by path.
   await fs.writeFile(path.join(tmp, "mockups", "confirm.html"), confirmHtml);
 
-  const client = new Client({ name: "smoke-screens", version: "0.0.0" });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(repoRoot, "dist", "index.js")],
-    env: { ...process.env, REQU_ROOT: tmp },
-  });
-  await client.connect(transport);
-
-  const call = async (name: string, args: Record<string, unknown> = {}) => {
-    const res: any = await client.callTool({ name, arguments: args });
-    const txt = res.content?.[0]?.text ?? "{}";
-    let parsed: any = txt;
-    try { parsed = JSON.parse(txt); } catch { /* markdown */ }
-    return { isError: !!res.isError, data: parsed, raw: txt };
-  };
+  const h = await startHarness([tmp], "smoke-screens");
+  const call = h.call;
 
   try {
     await call("init_project", {
@@ -219,10 +202,16 @@ async function main() {
     check("list_screens filters by staleness", staleOnly.data.length === 2, staleOnly.data.map((s: any) => s.id));
     check("list omits the mockup body by default", mobiles.data[0].html === undefined && mobiles.data[0].hasHtml === true, mobiles.data[0]);
 
-    // --- YAML storage: metadata + reviewable .html side by side --------------
-    const files = await fs.readdir(path.join(tmp, ".requ", "screens"));
-    check("mockup stored as a reviewable .html next to its YAML",
-      files.includes("SCR-BOOK-DETAIL-MOB.yaml") && files.includes("SCR-BOOK-DETAIL-MOB.html"), files);
+    // --- storage round-trip: the body survives, separate from the metadata ---
+    // (This replaced an on-disk YAML+.html layout check when the YAML store was
+    //  removed; the property that matters is that the body round-trips intact
+    //  while list/detail responses keep omitting it.)
+    // The screen was regenerated above, so compare against that revision.
+    const expectedHtml = detailHtml.replace("</div>\n</body>", '<textarea data-req-el="field-note" data-req-stories="US-001" data-req-role="input"></textarea></div>\n</body>');
+    const body = await call("get_screen_html", { id: "SCR-BOOK-DETAIL-MOB" });
+    check("mockup body round-trips through the store", body.data.html === expectedHtml, { len: body.data.html?.length });
+    const meta = await call("get_screen", { id: "SCR-BOOK-DETAIL-MOB" });
+    check("get_screen omits the body but flags it present", meta.data.html === undefined && meta.data.hasHtml === true, meta.data);
 
     // --- export / import round-trip -----------------------------------------
     const exported = await call("export_project");
@@ -237,7 +226,7 @@ async function main() {
     const left = await call("list_screens");
     check("3 screens left after delete", left.data.length === 3, left.data.map((s: any) => s.id));
   } finally {
-    await client.close();
+    await h.stop();
     await fs.rm(tmp, { recursive: true, force: true });
   }
 

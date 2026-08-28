@@ -29,7 +29,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Smoke test (drives the built server over stdio)
+      - name: Smoke test (drives the built server over HTTP)
         run: npm run smoke
 
       - name: Smoke test — screens (UI specification traceability)
@@ -37,3 +37,9 @@ jobs:
 
       - name: Smoke test — VCS references
         run: npm run smoke:vcs
+
+      - name: Smoke test — architecture decisions
+        run: npm run smoke:adrs
+
+      - name: Smoke test — scenario search
+        run: npm run smoke:search

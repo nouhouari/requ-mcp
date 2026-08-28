@@ -140,6 +140,7 @@
       <template x-for="t in [
         {id:'overview',     label:'Overview'},
         {id:'requirements', label:'Requirements'},
+        {id:'adrs',         label:'Decisions'},
         {id:'stories',      label:'Stories'},
         {id:'screens',      label:'Screens'},
         {id:'coverage',     label:'Coverage'},
@@ -1746,9 +1747,120 @@
 
       </div>
 
+      <!-- ══════════════════════════════════════════════════════
+           TAB: DECISIONS (ADRs)
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-adrs" role="tabpanel" aria-labelledby="tab-adrs" tabindex="0" x-show="tab === 'adrs'" class="tab-panel space-y-4">
+
+        <!-- Filters -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+          <input type="search" x-model="adrSearch" placeholder="Search decisions…"
+            class="flex-1 min-w-[200px] px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+            aria-label="Search decisions">
+          <select x-model="adrStatusFilter" class="px-3 py-2 text-sm border border-slate-200 rounded-lg" aria-label="Status">
+            <option value="all">All statuses</option>
+            <option value="proposed">proposed</option>
+            <option value="accepted">accepted</option>
+            <option value="superseded">superseded</option>
+          </select>
+          <button @click="loadAdrs()" class="px-3 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">Refresh</button>
+          <div class="text-sm text-slate-500 ml-auto">
+            <span class="font-semibold text-slate-700" x-text="filteredAdrs().length"></span> of <span x-text="adrs.length"></span>
+          </div>
+        </div>
+
+        <template x-if="loading.adrs">
+          <div class="flex justify-center py-16"><div class="spinner"></div></div>
+        </template>
+
+        <template x-if="!loading.adrs && adrs.length === 0">
+          <div class="empty-state mt-20">
+            <svg width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>
+            <h3>No architecture decisions recorded yet</h3>
+            <p>Use <code class="bg-slate-100 px-1 rounded font-mono text-xs">create_adr</code> to record a decision, or <code class="bg-slate-100 px-1 rounded font-mono text-xs">import_adrs_from_files</code> to pull in an existing <code class="bg-slate-100 px-1 rounded font-mono text-xs">docs/adr/</code> folder.</p>
+          </div>
+        </template>
+
+        <template x-if="!loading.adrs && filteredAdrs().length > 0">
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <template x-for="adr in filteredAdrs()" :key="adr.id">
+              <div class="component-card cursor-pointer hover:border-indigo-300 transition" @click="openAdr(adr.id)">
+                <div class="flex items-start justify-between mb-3 gap-3">
+                  <div class="min-w-0">
+                    <div class="font-semibold text-slate-900 text-base" x-text="adr.title"></div>
+                    <code class="chip chip-indigo mt-1 inline-block" x-text="adr.id"></code>
+                  </div>
+                  <span class="badge shrink-0" :class="adrBadge(adr.status)" x-text="adr.status"></span>
+                </div>
+                <div x-show="adr.supersededBy" class="text-xs text-amber-700 mb-2">
+                  Superseded by <code class="font-mono" x-text="adr.supersededBy"></code>
+                </div>
+                <div class="flex flex-wrap gap-1 mb-3">
+                  <template x-for="rid in (adr.requirements || [])" :key="rid">
+                    <span class="chip chip-slate" x-text="rid"></span>
+                  </template>
+                  <template x-for="cid in (adr.components || [])" :key="cid">
+                    <span class="chip chip-amber" x-text="cid"></span>
+                  </template>
+                </div>
+                <div class="pt-3 border-t border-slate-100 flex items-center gap-3 text-xs text-slate-500">
+                  <span x-show="adr.phase" x-text="adr.phase"></span>
+                  <span x-show="!adr.hasContent" class="text-red-500">no decision body</span>
+                  <span class="ml-auto text-indigo-600 font-medium">Read →</span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+
       </div><!-- /tab panels -->
     </div><!-- /container -->
   </main>
+
+  <!-- ══════════════════════════════════════════════════════
+       ADR READER — markdown + mermaid, rendered in the page.
+       Unlike the screen viewer this is NOT an iframe: mermaid needs
+       scripts, which `sandbox=""` forbids. The markdown is sanitized
+       before it is inserted instead.
+  ══════════════════════════════════════════════════════════ -->
+  <div x-show="adrDetailOpen" x-cloak class="fixed inset-0 z-50 flex items-center justify-center p-4"
+       role="dialog" aria-modal="true" aria-labelledby="adr-viewer-title" @keydown.escape.window="closeAdr()">
+    <div class="absolute inset-0 bg-slate-900/50" @click="closeAdr()"></div>
+    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[88vh] flex flex-col overflow-hidden">
+      <div class="flex items-start justify-between gap-4 px-6 py-4 border-b border-slate-200">
+        <div class="min-w-0">
+          <h2 id="adr-viewer-title" class="font-semibold text-slate-900 text-lg truncate"
+              x-text="adrDetail ? adrDetail.title : 'Loading…'"></h2>
+          <div class="flex items-center gap-2 mt-1" x-show="adrDetail">
+            <code class="chip chip-indigo" x-text="adrDetail && adrDetail.id"></code>
+            <span class="badge" :class="adrDetail && adrBadge(adrDetail.status)" x-text="adrDetail && adrDetail.status"></span>
+            <span x-show="adrDetail && adrDetail.supersededBy" class="text-xs text-amber-700">
+              superseded by <code class="font-mono" x-text="adrDetail && adrDetail.supersededBy"></code>
+            </span>
+          </div>
+        </div>
+        <button @click="closeAdr()" class="shrink-0 text-slate-400 hover:text-slate-600 p-1" aria-label="Close">
+          <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <div class="overflow-auto px-6 py-5">
+        <template x-if="adrDetail && (adrDetail.requirementDetails || []).length > 0">
+          <div class="mb-4 flex flex-wrap gap-1 items-center">
+            <span class="text-xs text-slate-500 mr-1">Drives:</span>
+            <template x-for="rd in adrDetail.requirementDetails" :key="rd.id">
+              <span class="chip" :class="rd.exists ? 'chip-slate' : 'chip-red'"
+                    :title="rd.title || 'unknown requirement'" x-text="rd.id"></span>
+            </template>
+          </div>
+        </template>
+        <div class="brief-content adr-content" x-html="adrHtml"></div>
+        <template x-if="adrDetail && !adrLoading && !adrHtml">
+          <p class="text-sm text-slate-400 italic">This decision has no body yet.</p>
+        </template>
+      </div>
+    </div>
+  </div>
 
   <!--
     Script load order — DO NOT REORDER:
@@ -2100,10 +2212,18 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked@14/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/languages/gherkin.min.js"></script>
   <script src="/public/app.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <!-- mermaid 11 ships ESM only (no UMD entry), so import it and park it on window.
+       It resolves after Alpine boots; every caller guards on window.mermaid. -->
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'neutral' });
+    window.mermaid = mermaid;
+  </script>
 </body>
 </html>

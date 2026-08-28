@@ -1,15 +1,14 @@
 /**
  * Shared export/import logic — used by both MCP tools and REST routes.
  */
-import type { Store } from "./storage.js";
 import type { SqliteStore } from "./sqlite-store.js";
 import type { PostgresStore } from "./postgres-store.js";
 import type { Execution, ExportPayload, ImportReport } from "./schema.js";
 
-type AnyStore = Store | SqliteStore | PostgresStore;
+type AnyStore = SqliteStore | PostgresStore;
 
 export async function buildExport(store: AnyStore): Promise<ExportPayload> {
-  const [config, components, requirements, stories, scenarios, screens, phases, vcsRefs, executionsByPhase] =
+  const [config, components, requirements, stories, scenarios, screens, adrs, phases, vcsRefs, executionsByPhase] =
     await Promise.all([
       store.readConfig().catch(() => null),
       store.listComponents(),
@@ -17,6 +16,7 @@ export async function buildExport(store: AnyStore): Promise<ExportPayload> {
       store.listStories(),
       store.listScenarios(),
       store.listScreens(),
+      store.listAdrs(),
       store.listPhases(),
       store.listVcsRefs(),
       store.readAllExecutions(),
@@ -32,7 +32,7 @@ export async function buildExport(store: AnyStore): Promise<ExportPayload> {
     version: "1",
     exportedAt: new Date().toISOString(),
     source: config ? { name: config.name } : undefined,
-    data: { components, requirements, stories, scenarios, screens, phases, executions, vcsRefs },
+    data: { components, requirements, stories, scenarios, screens, adrs, phases, executions, vcsRefs },
   };
 }
 
@@ -133,6 +133,19 @@ export async function applyImport(
     await store.writeScreen(screen);
     existingScreenIds.add(screen.id);
     inc("screens");
+  }
+
+  // --- Architecture decisions ---
+  const existingAdrIds = new Set((await store.listAdrs()).map(x => x.id));
+  for (const adr of data.adrs) {
+    if (existingAdrIds.has(adr.id)) { skip("adrs", adr.id); continue; }
+    const unknown = adr.requirements.filter(rid => !existingRequirementIds.has(rid));
+    if (unknown.length > 0) {
+      report.errors.push(`Adr ${adr.id} references unknown requirement(s): ${unknown.join(", ")}`);
+    }
+    await store.writeAdr(adr);
+    existingAdrIds.add(adr.id);
+    inc("adrs");
   }
 
   // --- Phases ---

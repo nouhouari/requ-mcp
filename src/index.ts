@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import url from "node:url";
-import { Store } from "./storage.js";
+import { nextId } from "./ids.js";
 import { SqliteStore } from "./sqlite-store.js";
 import { PostgresStore, initPgPool } from "./postgres-store.js";
 import {
@@ -27,10 +26,12 @@ import {
   TestStatus,
   testKey,
   storiesFromTags,
+  AdrStatus,
   VcsRefKind,
   VcsRefState,
   VcsType,
   type AcceptanceCriterion,
+  type Adr as TAdr,
   type Component as TComponent,
   type Execution,
   type Phase,
@@ -91,6 +92,11 @@ function fail(message: string, extra?: Record<string, unknown>) {
   };
 }
 
+/** Server version, read from package.json so it cannot drift. */
+const PKG_VERSION: string = (JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+) as { version: string }).version;
+
 /** Store instances for HTTP mode, keyed by URL-safe slug. */
 const _stores: Map<string, SqliteStore | PostgresStore> = new Map();
 
@@ -134,50 +140,17 @@ function loadProjectsFromEnv(): void {
   }
 }
 
-type AnyStore = Store | SqliteStore | PostgresStore;
+type AnyStore = SqliteStore | PostgresStore;
 
 // ===========================================================================
 // Project resolution
 // ===========================================================================
 
-let cachedRoots: string[] | null = null;
-async function workspaceRoots(server: McpServer): Promise<string[]> {
-  if (cachedRoots) return cachedRoots;
-  try {
-    const res = await server.server.listRoots();
-    cachedRoots = (res.roots ?? [])
-      .map((r) => r.uri)
-      .filter((u) => u.startsWith("file://"))
-      .map((u) => url.fileURLToPath(u));
-  } catch {
-    cachedRoots = [];
-  }
-  return cachedRoots;
-}
-
-async function hasRequ(dir: string): Promise<boolean> {
-  try { await fs.access(path.join(dir, ".requ")); return true; } catch { return false; }
-}
-
-async function findUp(start: string): Promise<string | null> {
-  let dir = path.resolve(start);
-  for (;;) {
-    if (await hasRequ(dir)) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-}
-
-async function resolveRoot(server: McpServer, explicit?: string): Promise<string> {
-  if (explicit) return path.resolve(explicit);
-  if (process.env.REQU_ROOT) return path.resolve(process.env.REQU_ROOT);
-  const roots = await workspaceRoots(server);
-  for (const r of roots) if (await hasRequ(r)) return r;
-  const found = await findUp(process.cwd());
-  if (found) return found;
-  return roots[0] ?? process.cwd();
-}
+/**
+ * Projects are addressed by `key` only. There is deliberately no filesystem
+ * resolution: requ-mcp is a server, and guessing a project from the server's
+ * cwd or workspace roots is how a caller silently ends up on the wrong store.
+ */
 
 /** Synthetic root for DB-native projects (no filesystem .requ/). */
 function synthRoot(slug: string): string {
@@ -210,8 +183,8 @@ async function resolveLoadedBySlugOrKey(sel: string): Promise<AnyStore | null> {
   return null;
 }
 
-async function getStore(server: McpServer, explicit?: string, allowCreate = false): Promise<AnyStore> {
-  if (process.env.REQU_TRANSPORT === "http") {
+async function getStore(_server: McpServer, explicit?: string, allowCreate = false): Promise<AnyStore> {
+  {
     const usePg = !!process.env.REQU_PG_URL;
 
     if (explicit) {
@@ -253,23 +226,19 @@ async function getStore(server: McpServer, explicit?: string, allowCreate = fals
     if (usePg) await attachAllDbProjects();
     if (_stores.size === 1) return [..._stores.values()][0];
     if (_stores.size === 0) {
-      // HTTP mode never derives a project_id from cwd/workspace root — that mints
-      // a phantom project named after the server's directory. Require an explicit key.
-      if (usePg) {
-        throw new Error("No requ project exists; run init_project with an explicit `key`.");
-      }
-      // Legacy local SQLite dev: fall back to filesystem resolution (cwd/workspace root).
-      const root = await resolveRoot(server, explicit);
-      const slug = slugify(root);
-      const store = new SqliteStore(root);
-      _stores.set(slug, store);
-      return store;
+      // Never derive a project from cwd or a workspace root — that mints a
+      // phantom project named after the server's directory. Require a key.
+      throw new Error(
+        usePg
+          ? "No requ project exists; run init_project with an explicit `key`."
+          : "No projects configured. Set REQU_PROJECTS to the project root(s), or use Postgres (REQU_PG_URL) for key-based projects.",
+      );
     }
     throw new Error(
-      `Multiple projects loaded; pass \`key\` to select one. Known: [${[..._stores.keys()].join(", ")}]`,
+      `Multiple projects loaded; pass \`key\` to select one. Known: [${[..._stores.keys()].join(", ")}]. ` +
+        "(`projectPath` was removed in 1.0 — projects are addressed by key.)",
     );
   }
-  return new Store(await resolveRoot(server, explicit));
 }
 
 async function getStoreByKey(key: string, server: McpServer): Promise<AnyStore | null> {
@@ -281,29 +250,8 @@ async function getStoreByKey(key: string, server: McpServer): Promise<AnyStore |
       if (cfg.key === key) return store;
     } catch { /* skip uninitialized */ }
   }
-  // stdio fallback: check the single auto-resolved store.
-  if (_stores.size === 0) {
-    try {
-      const store = await getStore(server, undefined);
-      const cfg = await store.readConfig();
-      if (cfg.key === key) return store;
-    } catch { /* no match */ }
-  }
   return null;
 }
-
-/** True when the server is running as an HTTP service (the store is the server, not the filesystem). */
-function isHttpMode(): boolean {
-  return process.env.REQU_TRANSPORT === "http";
-}
-
-const projectPathSchema = z
-  .string()
-  .optional()
-  .describe(
-    "Absolute path to the project root (the dir containing .requ/). Omit to auto-detect: REQU_ROOT, else a workspace root or ancestor of the cwd that contains .requ/. " +
-      "Ignored in HTTP mode — projects are addressed by `key` there, not by a filesystem path.",
-  );
 
 const keySchema = z
   .string()
@@ -315,21 +263,15 @@ const keySchema = z
 /**
  * Resolve the project selector to pass to getStore for a given tool call.
  *
- * In HTTP mode there is no meaningful local filesystem: the project is identified
- * by its `key`, never by an auto-detected path. Passing `projectPath` in HTTP mode
- * is rejected so a stale/auto-detected path can never silently clobber a project.
- * In stdio mode the selector remains the (optional) `projectPath`.
+ * There is no local filesystem to resolve against: the project is identified by
+ * its `key`, never by a path, so a stale or auto-detected path can never
+ * silently clobber the wrong project.
  */
 function selectorFor(toolName: string, args: any): string | undefined {
-  if (!isHttpMode()) return args.projectPath;
-  if (args.projectPath) {
-    throw new Error(
-      "projectPath is not supported in HTTP mode. Identify the project by its `key` instead.",
-    );
-  }
   if (toolName === "init_project" && !args.key) {
     throw new Error(
-      "In HTTP mode, init_project requires a `key` to identify the project (no filesystem path is used).",
+      "init_project requires a `key` to identify the project. " +
+        "(`projectPath` was removed in 1.0 — requ-mcp is an HTTP server and never resolves projects from the filesystem.)",
     );
   }
   return args.key;
@@ -350,7 +292,7 @@ type ToolDef = {
  */
 const toolDefs: ToolDef[] = [];
 
-/** Collect a tool definition that auto-injects `projectPath` and resolves the Store. */
+/** Collect a tool definition that auto-injects `key` and resolves the store. */
 function tool(
   name: string,
   config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> },
@@ -361,10 +303,10 @@ function tool(
 
 /** Build a fresh McpServer with every collected tool registered on it. */
 function createServer(): McpServer {
-  const server = new McpServer({ name: "requ-mcp", version: "0.7.1" });
+  const server = new McpServer({ name: "requ-mcp", version: PKG_VERSION });
   for (const { name, config, handler } of toolDefs) {
     const base = config.inputSchema ?? {};
-    const inputSchema: Record<string, z.ZodTypeAny> = { ...base, projectPath: projectPathSchema };
+    const inputSchema: Record<string, z.ZodTypeAny> = { ...base };
     // Every tool accepts `key` as the HTTP-mode project identifier. Tools that
     // already declare their own `key` (e.g. init_project) keep their definition.
     if (!("key" in inputSchema)) inputSchema.key = keySchema;
@@ -457,7 +399,7 @@ function createServer(): McpServer {
 async function ensureInit(store: AnyStore) {
   if (!(await store.isInitialized())) {
     throw new Error(
-      `requ project not initialized at ${store.root}. Run \`init_project\` first (pass projectPath to target a specific directory).`,
+      `requ project not initialized. Run \`init_project\` first with the project's \`key\`.`,
     );
   }
 }
@@ -490,6 +432,24 @@ async function resolveAssignedPhase(store: AnyStore, input: string | undefined) 
 async function loadConductorIndex(store: AnyStore): Promise<{ root: string; index: ConductorIndex }> {
   const root = await store.conductorRoot();
   return { root, index: await indexConductor(root) };
+}
+
+/**
+ * The server reads feature files, mockups and reports from its OWN disk, so a
+ * path the server cannot see must fail loudly. Returning an empty result reads
+ * as "there is nothing there", which is indistinguishable from a missing mount
+ * and is exactly the kind of silence that sends callers down the wrong path.
+ */
+async function unreadablePath(p: string, what: string) {
+  try {
+    await fs.access(p);
+    return null;
+  } catch {
+    return fail(`${what} is not readable by the server at '${p}'.`, {
+      resolvedPath: p,
+      hint: "requ-mcp reads this from its own filesystem. Check the path is correct and, when running in a container, that the workspace is mounted and the configured path is the one the container sees.",
+    });
+  }
 }
 
 /** testKeys of scenarios linked to a story: stored scenarios win, else disk tags. */
@@ -534,7 +494,7 @@ tool(
     const conductorPath = args.conductorPath ?? existing?.conductorPath ?? ".";
 
     // DB-native HTTP projects have no filesystem Conductor folder; skip the hard check.
-    const isHttpPg = process.env.REQU_TRANSPORT === "http" && !!process.env.REQU_PG_URL;
+    const isHttpPg = !!process.env.REQU_PG_URL;
     const conductorAbs = store.resolvePath(conductorPath);
     const conductor = await inspectConductorProject(conductorAbs);
     if (!conductor.isConductorProject && !args.force && !isHttpPg) {
@@ -742,7 +702,7 @@ tool(
     }
 
     const existing = await store.listRequirements();
-    const id = args.id ?? Store.nextId("REQ", existing.map((r) => r.id));
+    const id = args.id ?? nextId("REQ", existing.map((r) => r.id));
     if (existing.some((r) => r.id === id)) return fail(`Requirement ${id} already exists.`);
     const req: Requirement = {
       id,
@@ -871,6 +831,85 @@ tool(
   },
 );
 
+tool(
+  "assign_requirements_to_phase",
+  {
+    title: "Assign requirements to a phase in bulk",
+    description:
+      "Move many requirements onto one phase in a single call. Select them either explicitly by `ids`, or by a filter (status / component / tag / current phase) — exactly one of the two. Pass phase '' to clear the assignment. Reports what moved and what was already there; nothing is written when any explicit id is unknown.",
+    inputSchema: {
+      phase: z.string().describe("Target phase id (e.g. 'P1'). Pass '' to unassign."),
+      ids: z.array(z.string().regex(/^REQ-\d+$/)).optional()
+        .describe("Explicit requirement ids. Mutually exclusive with the filter fields."),
+      status: RequirementStatus.optional().describe("Filter: only requirements with this status."),
+      component: z.string().optional().describe("Filter: only requirements listing this component."),
+      tag: z.string().optional().describe("Filter: only requirements carrying this tag."),
+      fromPhase: z.string().optional()
+        .describe("Filter: only requirements currently on this phase. Pass '' for the unassigned ones."),
+      dryRun: z.boolean().optional().describe("Report what would change without writing."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+
+    const hasFilter = args.status !== undefined || args.component !== undefined
+      || args.tag !== undefined || args.fromPhase !== undefined;
+    if (args.ids && hasFilter) {
+      return fail("Pass either `ids` or the filter fields, not both.");
+    }
+    if (!args.ids && !hasFilter) {
+      return fail("Nothing selected. Pass `ids`, or at least one of status / component / tag / fromPhase.", {
+        hint: "To sweep up the unassigned requirements, pass fromPhase: ''.",
+      });
+    }
+
+    // Validate the target phase once, up front.
+    if (args.phase !== "") {
+      const error = await phaseError(store, args.phase);
+      if (error) return error;
+    }
+
+    const all = await store.listRequirements();
+    let targets: Requirement[];
+    if (args.ids) {
+      const byId = new Map(all.map((r) => [r.id, r]));
+      const missing = args.ids.filter((id: string) => !byId.has(id));
+      // All-or-nothing on explicit ids: a typo should not half-apply a bulk move.
+      if (missing.length) return fail(`Unknown requirement id(s): ${missing.join(", ")}`);
+      targets = args.ids.map((id: string) => byId.get(id)!);
+    } else {
+      targets = all.filter((r) => {
+        if (args.status    !== undefined && r.status !== args.status) return false;
+        if (args.component !== undefined && !r.components.includes(args.component)) return false;
+        if (args.tag       !== undefined && !r.tags.includes(args.tag)) return false;
+        if (args.fromPhase !== undefined && (r.phase ?? "") !== args.fromPhase) return false;
+        return true;
+      });
+    }
+
+    const next = args.phase === "" ? undefined : args.phase;
+    const moved: string[] = [];
+    let unchanged = 0;
+    for (const req of targets) {
+      if ((req.phase ?? undefined) === next) { unchanged++; continue; }
+      moved.push(req.id);
+      if (args.dryRun) continue;
+      req.phase = next;
+      req.updatedAt = now();
+      await store.writeRequirement(req);
+    }
+
+    return json({
+      phase: next ?? null,
+      selected: targets.length,
+      moved: moved.length,
+      unchanged,
+      movedIds: moved,
+      dryRun: !!args.dryRun,
+    });
+  },
+);
+
 // ===========================================================================
 // User Stories (PO agent)
 // ===========================================================================
@@ -898,7 +937,7 @@ tool(
     if (missing.length) return fail(`Unknown requirement(s): ${missing.join(", ")}`);
 
     const existing = await store.listStories();
-    const id = args.id ?? Store.nextId("US", existing.map((s) => s.id));
+    const id = args.id ?? nextId("US", existing.map((s) => s.id));
     if (existing.some((s) => s.id === id)) return fail(`Story ${id} already exists.`);
 
     const acceptanceCriteria: AcceptanceCriterion[] = (args.acceptanceCriteria ?? []).map((t: string, i: number) => ({
@@ -1214,7 +1253,11 @@ tool(
       });
     }
 
-    // Legacy: scan feature files on disk.
+    // Legacy: scan feature files on disk. Reached only when no scenarios are
+    // stored, so an unreadable folder here is the whole answer — say so.
+    const conductorRoot = await store.conductorRoot();
+    const unreadable = await unreadablePath(conductorRoot, "The Conductor folder");
+    if (unreadable) return unreadable;
     const { root, index } = await loadConductorIndex(store);
     const byStory = scenariosByStory(index);
     const links = stories.map((s) => ({
@@ -1249,6 +1292,9 @@ tool(
   async (args, store) => {
     await ensureInit(store);
     const q = args.query.toLowerCase();
+    const conductorRoot = await store.conductorRoot();
+    const unreadable = await unreadablePath(conductorRoot, "The Conductor folder");
+    if (unreadable) return unreadable;
     const { root, index } = await loadConductorIndex(store);
     let scenarios = index.scenarios;
     if (args.storyId) scenarios = scenarios.filter((sc) => sc.stories.includes(args.storyId));
@@ -1645,7 +1691,12 @@ tool(
     } else if (args.mockupPath !== undefined) {
       const fromFile = await readMockupFile(store, args.mockupPath);
       if (fromFile === null) {
-        if (!existing) return fail(`Cannot read mockup file '${args.mockupPath}' (resolved against ${store.root}). Pass \`html\` instead.`);
+        if (!existing) {
+          return fail(`Cannot read mockup file '${args.mockupPath}' — the server resolved it to '${store.resolvePath(args.mockupPath)}' and cannot read it.`, {
+            resolvedPath: store.resolvePath(args.mockupPath),
+            hint: "requ-mcp reads this from its own filesystem (check the container mount), or pass `html` inline instead.",
+          });
+        }
       } else {
         html = fromFile;
         regenerated = true;
@@ -2050,6 +2101,341 @@ tool(
 );
 
 // ===========================================================================
+// Architecture decisions (ADRs)
+//
+// The durable record of *why* the system is shaped the way it is. requ owns the
+// markdown — mermaid diagrams included — so decisions are queryable, linked to
+// the requirements that drove them, and readable without repo access.
+// ===========================================================================
+
+/** Adr view without the (potentially large) decision body. */
+function adrSummary(adr: TAdr) {
+  const { content, ...meta } = adr;
+  return { ...meta, hasContent: content.length > 0 };
+}
+
+/** Validate the requirement/component ids an ADR links to; fail on unknown. */
+async function validateAdrLinks(store: AnyStore, requirements: string[], components: string[]) {
+  const missingReqs: string[] = [];
+  for (const id of requirements) if (!(await store.getRequirement(id))) missingReqs.push(id);
+  if (missingReqs.length) {
+    return fail(`Unknown requirement id(s): ${missingReqs.join(", ")}`, {
+      hint: "Create them with create_requirement, or drop them from `requirements`.",
+    });
+  }
+  const known = await store.listComponents();
+  if (known.length) {
+    const ids = new Set(known.map((c) => c.id));
+    const missing = components.filter((c) => !ids.has(c));
+    if (missing.length) {
+      return fail(`Unknown component(s): ${missing.join(", ")}`, { knownComponents: known.map((c) => c.id) });
+    }
+  }
+  return null;
+}
+
+/** Pull the title and status out of an ADR markdown file. */
+function parseAdrMarkdown(md: string): { title: string | null; status: TAdr["status"] } {
+  const lines = md.split(/\r?\n/);
+  let title: string | null = null;
+  for (const line of lines) {
+    const m = line.match(/^#\s+(.+?)\s*$/);
+    // Strip a leading "0004." / "4 -" numbering so the title reads cleanly.
+    if (m) { title = m[1].replace(/^\d+[.)\-]?\s+/, "").trim(); break; }
+  }
+  let status: TAdr["status"] = "proposed";
+  for (let i = 0; i < lines.length; i++) {
+    const inline = lines[i].match(/^\s*(?:\*\*)?Status(?:\*\*)?\s*[:\-]\s*(.+?)\s*$/i);
+    let raw = inline?.[1];
+    if (!raw && /^#{2,}\s+Status\s*$/i.test(lines[i])) {
+      raw = lines.slice(i + 1).find((l) => l.trim())?.trim();
+    }
+    if (!raw) continue;
+    const word = raw.toLowerCase().replace(/[^a-z]/g, "");
+    const hit = AdrStatus.options.find((o) => word.startsWith(o));
+    if (hit) { status = hit; break; }
+  }
+  return { title, status };
+}
+
+tool(
+  "create_adr",
+  {
+    title: "Create an architecture decision record",
+    description:
+      "Record an architecture decision (ADR) — markdown, mermaid diagrams included — linked to the requirements it is driven by and the components it applies to. Auto-ids 'ADR-001' unless `id` is given. Referenced requirement/component ids must exist.",
+    inputSchema: {
+      id:           z.string().regex(/^ADR-\d+$/).optional().describe("Explicit id (ADR-…). Auto-assigned when omitted."),
+      title:        z.string().min(1).describe("Short decision title, e.g. 'Use a modular monolith'."),
+      content:      z.string().optional().describe("The decision record in markdown: Context · Decision · Consequences · Alternatives. ```mermaid fences render as diagrams in the dashboard."),
+      status:       AdrStatus.optional().describe("Defaults to 'proposed'."),
+      requirements: z.array(z.string().regex(/^REQ-\d+$/)).optional().describe("Requirement ids (REQ-…) this decision is driven by or constrains."),
+      components:   z.array(z.string()).optional().describe("Component ids this decision applies to."),
+      supersededBy: z.string().regex(/^ADR-\d+$/).optional().describe("The ADR that replaced this one."),
+      sourcePath:   z.string().optional().describe("Origin file path, when the decision came from a repo file."),
+      phase:        z.string().optional().describe("Phase id. Defaults to the active phase; pass '' to leave unassigned."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const requirements: string[] = args.requirements ?? [];
+    const components: string[] = args.components ?? [];
+    const bad = await validateAdrLinks(store, requirements, components);
+    if (bad) return bad;
+
+    const phase = await resolveAssignedPhase(store, args.phase);
+    if (phase.error) return phase.error;
+
+    const existing = await store.listAdrs();
+    const id = args.id ?? nextId("ADR", existing.map((a) => a.id));
+    if (existing.some((a) => a.id === id)) return fail(`Adr ${id} already exists. Use update_adr.`);
+
+    const content = args.content ?? "";
+    const ts = now();
+    const adr: TAdr = {
+      id,
+      title: args.title,
+      status: args.status ?? "proposed",
+      content,
+      requirements,
+      components,
+      supersededBy: args.supersededBy,
+      sourcePath: args.sourcePath,
+      phase: phase.value,
+      version: htmlVersion(content),
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    await store.writeAdr(adr);
+    return json({ ...adrSummary(adr), hint: "Fetch the body with get_adr_content." });
+  },
+);
+
+tool(
+  "list_adrs",
+  {
+    title: "List architecture decisions",
+    description:
+      "List recorded ADRs, optionally filtered by status, linked requirement, component, or phase. The decision body is omitted unless `includeContent` is true.",
+    inputSchema: {
+      status:         AdrStatus.optional(),
+      requirement:    z.string().optional().describe("Only ADRs linked to this requirement id."),
+      component:      z.string().optional().describe("Only ADRs linked to this component id."),
+      phase:          z.string().optional().describe("Only ADRs assigned to this phase."),
+      q:              z.string().optional().describe("Substring match over id, title and content."),
+      includeContent: z.boolean().optional().describe("Include the markdown body. Off by default."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    let adrs = await store.listAdrs();
+    if (args.status)      adrs = adrs.filter((a) => a.status === args.status);
+    if (args.requirement) adrs = adrs.filter((a) => a.requirements.includes(args.requirement));
+    if (args.component)   adrs = adrs.filter((a) => a.components.includes(args.component));
+    if (args.phase)       adrs = adrs.filter((a) => a.phase === args.phase);
+    if (args.q) {
+      const q = args.q.toLowerCase();
+      adrs = adrs.filter((a) => `${a.id}\n${a.title}\n${a.content}`.toLowerCase().includes(q));
+    }
+    return json({
+      total: adrs.length,
+      adrs: adrs.map((a) => ({ ...adrSummary(a), ...(args.includeContent ? { content: a.content } : {}) })),
+    });
+  },
+);
+
+tool(
+  "get_adr",
+  {
+    title: "Get an architecture decision",
+    description:
+      "Return one ADR with its linked requirement titles and the decisions it supersedes. Use get_adr_content for the markdown body.",
+    inputSchema: { id: z.string().describe("Adr id (ADR-…).") },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const adr = await store.getAdr(args.id);
+    if (!adr) return fail(`Adr ${args.id} not found.`);
+    const requirements = [];
+    for (const rid of adr.requirements) {
+      const req = await store.getRequirement(rid);
+      requirements.push({ id: rid, title: req?.title ?? null, exists: !!req });
+    }
+    // Reverse edge: the decisions this one replaced.
+    const supersedes = (await store.listAdrs()).filter((a) => a.supersededBy === adr.id).map((a) => a.id);
+    return json({ ...adrSummary(adr), requirements, supersedes });
+  },
+);
+
+tool(
+  "get_adr_content",
+  {
+    title: "Get an architecture decision's markdown",
+    description:
+      "Return the decision body. When the ADR records a `sourcePath` the live file is preferred over requ's snapshot; `source` says which you got.",
+    inputSchema: { id: z.string().describe("Adr id (ADR-…).") },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const adr = await store.getAdr(args.id);
+    if (!adr) return fail(`Adr ${args.id} not found.`);
+    let content = adr.content;
+    let source: "file" | "stored" = "stored";
+    if (adr.sourcePath) {
+      try {
+        content = await fs.readFile(store.resolvePath(adr.sourcePath), "utf8");
+        source = "file";
+      } catch { /* fall back to the stored snapshot */ }
+    }
+    return json({ id: adr.id, title: adr.title, status: adr.status, version: adr.version, source, sourcePath: adr.sourcePath, content });
+  },
+);
+
+tool(
+  "update_adr",
+  {
+    title: "Update an architecture decision",
+    description:
+      "Update an ADR's fields. Only what you pass changes. Bumps updatedAt, and refreshes the content hash when the body changes. A decision is normally superseded rather than rewritten: set status='superseded' and supersededBy to the replacement.",
+    inputSchema: {
+      id:           z.string().describe("Adr id (ADR-…)."),
+      title:        z.string().min(1).optional(),
+      content:      z.string().optional(),
+      status:       AdrStatus.optional(),
+      requirements: z.array(z.string().regex(/^REQ-\d+$/)).optional().describe("Replaces the existing set."),
+      components:   z.array(z.string()).optional().describe("Replaces the existing set."),
+      supersededBy: z.string().regex(/^ADR-\d+$/).optional(),
+      sourcePath:   z.string().optional(),
+      phase:        z.string().optional().describe("Pass '' to clear the phase assignment."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const adr = await store.getAdr(args.id);
+    if (!adr) return fail(`Adr ${args.id} not found.`);
+
+    if (args.requirements !== undefined || args.components !== undefined) {
+      const bad = await validateAdrLinks(store, args.requirements ?? adr.requirements, args.components ?? adr.components);
+      if (bad) return bad;
+    }
+    if (args.supersededBy !== undefined && !(await store.getAdr(args.supersededBy))) {
+      return fail(`Unknown adr id: ${args.supersededBy}`);
+    }
+    if (args.phase !== undefined) {
+      const phase = await resolveAssignedPhase(store, args.phase);
+      if (phase.error) return phase.error;
+      adr.phase = phase.value;
+    }
+    for (const k of ["title", "status", "requirements", "components", "supersededBy", "sourcePath"] as const) {
+      if (args[k] !== undefined) (adr as Record<string, unknown>)[k] = args[k];
+    }
+    if (args.content !== undefined && args.content !== adr.content) {
+      adr.content = args.content;
+      adr.version = htmlVersion(args.content);
+    }
+    adr.updatedAt = now();
+    await store.writeAdr(adr);
+    return json(adrSummary(adr));
+  },
+);
+
+tool(
+  "search_adrs",
+  {
+    title: "Search architecture decisions",
+    description: "Substring search over ADR ids, titles and decision bodies.",
+    inputSchema: {
+      query:  z.string().min(1).describe("Search text (case-insensitive)."),
+      status: AdrStatus.optional(),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const q = args.query.toLowerCase();
+    let adrs = await store.listAdrs();
+    if (args.status) adrs = adrs.filter((a) => a.status === args.status);
+    adrs = adrs.filter((a) => `${a.id}\n${a.title}\n${a.content}`.toLowerCase().includes(q));
+    return json({ query: args.query, total: adrs.length, adrs: adrs.map(adrSummary) });
+  },
+);
+
+tool(
+  "import_adrs_from_files",
+  {
+    title: "Import ADRs from repo markdown files",
+    description:
+      "Scan a folder of ADR markdown files (default 'docs/adr') and import each as an ADR: id from the filename's leading number (0004-… → ADR-004), title from the first '# ' heading, status from a 'Status' section. Existing ids are skipped, never overwritten.",
+    inputSchema: {
+      dir:     z.string().optional().describe("Folder to scan, relative to the project root. Defaults to 'docs/adr'."),
+      dryRun:  z.boolean().optional().describe("Report what would be imported without writing."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const rel = args.dir ?? "docs/adr";
+    const dir = store.resolvePath(rel);
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch {
+      return fail(`Folder not found: ${rel}`, { hint: "Pass `dir` to point at the project's ADR folder." });
+    }
+    const files = names.filter((n) => n.toLowerCase().endsWith(".md")).sort();
+    const existing = await store.listAdrs();
+    const takenIds = new Set(existing.map((a) => a.id));
+    const bySourcePath = new Map(existing.filter((a) => a.sourcePath).map((a) => [a.sourcePath as string, a.id]));
+
+    const imported: string[] = [];
+    const skipped: { file: string; reason: string }[] = [];
+    for (const file of files) {
+      const sourcePath = path.posix.join(rel, file);
+      if (bySourcePath.has(sourcePath)) { skipped.push({ file, reason: `already imported as ${bySourcePath.get(sourcePath)}` }); continue; }
+      const md = await fs.readFile(path.join(dir, file), "utf8");
+      const { title, status } = parseAdrMarkdown(md);
+      const num = file.match(/^(\d+)/)?.[1];
+      const id = num ? `ADR-${String(parseInt(num, 10)).padStart(3, "0")}` : nextId("ADR", [...takenIds]);
+      if (takenIds.has(id)) { skipped.push({ file, reason: `${id} already exists` }); continue; }
+      takenIds.add(id);
+      if (!args.dryRun) {
+        const ts = now();
+        await store.writeAdr({
+          id,
+          title: title || file.replace(/\.md$/i, ""),
+          status,
+          content: md,
+          requirements: [],
+          components: [],
+          sourcePath,
+          version: htmlVersion(md),
+          createdAt: ts,
+          updatedAt: ts,
+        } as TAdr);
+      }
+      imported.push(id);
+    }
+    return json({
+      dir: rel, scanned: files.length, imported: imported.length, ids: imported, skipped,
+      dryRun: !!args.dryRun,
+      hint: imported.length ? "Link them to requirements with update_adr." : undefined,
+    });
+  },
+);
+
+tool(
+  "delete_adr",
+  {
+    title: "Delete an architecture decision",
+    description: "Remove an ADR and its stored markdown. Prefer superseding a decision over deleting it — deletion loses the history.",
+    inputSchema: { id: z.string() },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const deleted = await store.deleteAdr(args.id);
+    return json({ deleted, id: args.id });
+  },
+);
+
+// ===========================================================================
 // Executions (test results per phase)
 // ===========================================================================
 
@@ -2345,7 +2731,7 @@ tool(
 
     const existing = await store.listVcsRefs();
     const dup = existing.find((r) => r.kind === "branch" && r.ref === args.branch);
-    const id = dup?.id ?? Store.nextId("BR", existing.map((r) => r.id));
+    const id = dup?.id ?? nextId("BR", existing.map((r) => r.id));
     const ts = now();
     const ref: VcsRef = {
       id,
@@ -2469,7 +2855,7 @@ tool(
   {
     title: "Export project",
     description:
-      "Export all project data (requirements, stories, phases, executions, components, VCS refs) as a JSON string. Pass the result to import_project on another instance to migrate or copy data.",
+      "Export all project data (components, requirements, stories, scenarios, screens, architecture decisions, phases, executions, VCS refs) as a JSON string. Pass the result to import_project on another instance to migrate or copy data.",
     inputSchema: {},
   },
   async (_args, store) => {
@@ -2550,7 +2936,7 @@ function renderMarkdown(report: ReturnType<typeof buildReport> & { byComponent: 
 }
 
 // ===========================================================================
-// HTTP server (REQU_TRANSPORT=http)
+// HTTP server — the only transport
 // ===========================================================================
 
 function readBody(req: import("node:http").IncomingMessage): Promise<string> {
@@ -2620,7 +3006,7 @@ async function startHttpServer(): Promise<void> {
       ? `postgres=yes  projects=${loadedCount}`
       : loadedCount > 0
         ? `projects=${loadedCount}`
-        : `db=${process.env.REQU_ROOT ?? process.cwd()}/.requ/requ.db`;
+        : "no projects configured (set REQU_PROJECTS or REQU_PG_URL)";
     console.error(`requ-mcp HTTP → http://${host}:${port}/mcp  ${dbInfo}`);
   });
 }
@@ -2630,14 +3016,7 @@ async function startHttpServer(): Promise<void> {
 // ===========================================================================
 
 async function main() {
-  if (process.env.REQU_TRANSPORT === "http") {
-    await startHttpServer();
-  } else {
-    const server = createServer();
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("requ-mcp running (stdio, YAML storage, per-call project resolution).");
-  }
+  await startHttpServer();
 }
 
 main().catch((err) => {

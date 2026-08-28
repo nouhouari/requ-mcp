@@ -354,6 +354,7 @@ body {
 .chip-green  { background: #dcfce7; color: #15803d; }
 .chip-amber  { background: #fef3c7; color: #b45309; }
 .chip-slate  { background: #f1f5f9; color: #475569; }
+.chip-red    { background: #fee2e2; color: #b91c1c; }
 
 /* ── Spinner ────────────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -510,3 +511,34 @@ body {
   overflow-y: auto;
 }
 .gherkin-block code { background: none; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* ── ADR reader ────────────────────────────────────────────────────────────
+   Reuses .brief-content for prose; this adds the bits a full decision record
+   needs — headings that breathe, tables, and centred mermaid figures. */
+.adr-content h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .75rem; }
+.adr-content h2 { font-size: 1.1rem;  font-weight: 600; margin: 1.5rem 0 .5rem; padding-bottom: .25rem; border-bottom: 1px solid #e2e8f0; }
+.adr-content h3 { font-size: .95rem;  font-weight: 600; margin: 1.15rem 0 .4rem; }
+.adr-content blockquote { margin: .75rem 0; padding: .25rem 0 .25rem .9rem; border-left: 3px solid #e2e8f0; color: #64748b; }
+.adr-content table { width: 100%; border-collapse: collapse; margin: .9rem 0; font-size: .875rem; }
+.adr-content th, .adr-content td { border: 1px solid #e2e8f0; padding: .4rem .6rem; text-align: left; }
+.adr-content th { background: #f8fafc; font-weight: 600; }
+.adr-content hr { border: 0; border-top: 1px solid #e2e8f0; margin: 1.5rem 0; }
+.adr-content pre.mermaid {
+  display: flex;
+  justify-content: center;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: .75rem;
+  padding: 1rem;
+  margin: 1rem 0;
+  overflow-x: auto;
+  /* Pre-render the fence is plain text; keep it readable if mermaid never loads. */
+  white-space: pre-wrap;
+  font-size: .8rem;
+  color: #64748b;
+}
+.adr-content pre.mermaid[data-processed] {
+  white-space: normal;
+  color: inherit;
+}
+.adr-content pre.mermaid svg { max-width: 100%; height: auto; }

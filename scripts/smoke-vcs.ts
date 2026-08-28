@@ -1,22 +1,18 @@
 /**
  * Smoke test for the VCS-reference tools. Spawns the built MCP server over
- * stdio against a TEMP REQU_ROOT and drives: set_repo/get_repo, link_branch,
+ * HTTP against a TEMP project root and drives: set_repo/get_repo, link_branch,
  * link_merge_request (opened), list_vcs_refs, update_merge_request (merged),
  * and asserts the state transitions + merged-MR surfacing in coverage_report.
  *
  * requ-mcp never calls a VCS provider — these tools only record references.
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import url from "node:url";
+import { startHarness } from "./lib/http-harness.js";
 import { SqliteStore } from "../src/sqlite-store.js";
 import type { VcsRef } from "../src/schema.js";
 
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "..");
 
 let passed = 0;
 let failed = 0;
@@ -46,21 +42,8 @@ async function main() {
     ].join("\n"),
   );
 
-  const client = new Client({ name: "smoke-vcs", version: "0.0.0" });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(repoRoot, "dist", "index.js")],
-    env: { ...process.env, REQU_ROOT: tmp },
-  });
-  await client.connect(transport);
-
-  const call = async (name: string, args: Record<string, unknown> = {}) => {
-    const res: any = await client.callTool({ name, arguments: args });
-    const txt = res.content?.[0]?.text ?? "{}";
-    let parsed: any = txt;
-    try { parsed = JSON.parse(txt); } catch { /* markdown */ }
-    return { isError: !!res.isError, data: parsed, raw: txt };
-  };
+  const h = await startHarness([tmp], "smoke-vcs");
+  const call = h.call;
 
   try {
     await call("init_project", { name: "VCS Smoke", conductorPath: ".", initialPhase: "v1.0" });
@@ -162,7 +145,7 @@ async function main() {
     const md = await call("coverage_report", { mode: "cumulative", format: "markdown" });
     check("markdown surfaces 'verified + merged'", md.raw.includes("verified + merged"), md.raw);
   } finally {
-    await client.close();
+    await h.stop();
     await fs.rm(tmp, { recursive: true, force: true });
   }
 

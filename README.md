@@ -25,79 +25,67 @@ that visualizes coverage and requirements in 6 interactive tabs.
 
 ## Quickstart
 
-It's on npm — no clone or build needed. Register it with your MCP client
-(e.g. Claude Code) once, globally, via `npx`:
-
-```json
-{
-  "mcpServers": {
-    "requ": {
-      "command": "npx",
-      "args": ["-y", "requ-mcp"]
-    }
-  }
-}
-```
-
-Or install it globally and point at the binary:
-
-```bash
-npm install -g requ-mcp
-```
-
-```json
-{
-  "mcpServers": {
-    "requ": { "command": "requ-mcp" }
-  }
-}
-```
-
-<details>
-<summary>From source instead</summary>
+requ-mcp is an HTTP server: you run it once, and every client and agent talks to
+the same store. There is no per-repo mode — that is deliberate, see
+[How it finds the project](#how-it-finds-the-project).
 
 ```bash
 git clone https://github.com/nouhouari/requ-mcp.git
 cd requ-mcp
-npm install
-npm run build      # compiles to dist/
-npm run smoke      # optional: end-to-end self-test
+cp .env.example .env      # set REQU_WORKSPACE_DIR and a PG_PASSWORD
+docker compose up -d      # Postgres + the requ-mcp server on :8788
 ```
+
+Then register the endpoint with your MCP client (e.g. Claude Code) once,
+globally:
 
 ```json
 {
   "mcpServers": {
-    "requ": { "command": "node", "args": ["/absolute/path/to/requ-mcp/dist/index.js"] }
+    "requ": { "type": "http", "url": "http://localhost:8788/mcp" }
   }
 }
 ```
+
+Create a project and start working — every tool takes a `key` to say which
+project it means:
+
+```jsonc
+// init_project
+{ "key": "my-app", "name": "My App", "conductorPath": "/workspace/my-app/e2e", "initialPhase": "v1.0" }
+```
+
+> **`conductorPath` is a path the *server* sees.** The container mounts
+> `REQU_WORKSPACE_DIR` read-only at `/workspace`, so a repo at
+> `$REQU_WORKSPACE_DIR/my-app` is `/workspace/my-app` to requ. Paths the server
+> cannot read now fail with an explicit error rather than looking empty.
+
+<details>
+<summary>Running from source instead of Docker</summary>
+
+```bash
+npm install
+npm run build
+REQU_PG_URL=postgresql://… REQU_PORT=8788 npm start
+```
+
+Without `REQU_PG_URL` the server uses SQLite and takes its projects from
+`REQU_PROJECTS` (a comma-separated list of project roots). Key-based project
+*creation* requires Postgres.
 </details>
 
 ## Web Dashboard
 
-The server ships an optional **HTTP transport mode** that serves a professional web dashboard alongside the MCP endpoint. Launch with the `REQU_TRANSPORT=http` environment variable:
+The same server that answers MCP calls also serves a web dashboard, so there is
+nothing extra to launch:
 
-```bash
-REQU_TRANSPORT=http npx requ-mcp
-# → Dashboard: http://localhost:8788/
-# → MCP endpoint: http://localhost:8788/mcp
+```
+Dashboard:    http://localhost:8788/
+MCP endpoint: http://localhost:8788/mcp
 ```
 
-Or in your MCP client config:
-
-```json
-{
-  "mcpServers": {
-    "requ": {
-      "command": "npx",
-      "args": ["-y", "requ-mcp"],
-      "env": { "REQU_TRANSPORT": "http" }
-    }
-  }
-}
-```
-
-**Default port:** `8788`. Override it with `REQU_PORT=9000 REQU_TRANSPORT=http npx requ-mcp`.
+**Default port:** `8788`. Override with `REQU_PORT` (or `REQU_PORT` in `.env`
+when running under Docker Compose).
 
 ### Dashboard tabs
 
@@ -110,6 +98,7 @@ Or in your MCP client config:
 | **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
+| **Decisions** | Architecture decisions (ADRs) with status badges and their requirement/component links; open one to read the record with its mermaid diagrams rendered |
 
 **Live updates:** The dashboard polls for KPI count changes every 5 seconds via Server-Sent Events (SSE) — no page refresh needed. The summary payload (`GET /api/summary` and the SSE feed) includes project totals plus `scenariosTotal` and a `byPhase[]` array of per-phase `{ requirements, stories, scenarios }` counts (partitioned by earliest phase, with an Unassigned bucket).
 
@@ -144,7 +133,7 @@ curl 'http://localhost:8788/api/scenarios?requirement=REQ-001&content=true'
 A typical flow, all driven through the agent:
 
 0. `check_conductor` *(optional)* — confirm the Conductor folder exists and see its detected name before initializing.
-1. `init_project` — points at your Conductor project (`conductorPath`); it **verifies the folder exists and is a real Conductor project** (has `features/` or a cucumber config) and reports its name before creating `.requ/`. Pass `force:true` to override.
+1. `init_project` — points at your Conductor project (`conductorPath`); it **verifies the folder exists and is a real Conductor project** (has `features/` or a cucumber config) and reports its name before creating the project. Pass `force:true` to override.
 2. `create_requirement` — import the requirements (with `components`).
 3. `create_user_story` — PO authors stories, each tracing to ≥1 requirement.
 4. `create_or_update_screen` + `link_story_screen` — a BA/design agent publishes the
@@ -223,27 +212,25 @@ servers.
 
 ## Storage
 
-Everything is flat YAML under `.requ/`, so coverage is version-controlled and
-reviewable in PRs:
+Projects live in the server's database, not in your repo:
 
-```
-.requ/
-  config.yaml                 # project name, Conductor path, active phase
-  requirements/REQ-001.yaml
-  stories/US-001.yaml         # story → criteria → linked tests
-  screens/SCR-BOOK-DETAIL-MOB.yaml   # UI spec metadata (links, elements, version)
-  screens/SCR-BOOK-DETAIL-MOB.html   # the mockup itself, reviewable in a PR
-  phases/PHASE-001.yaml       # a phase / release
-  executions/PHASE-001.yaml   # test results recorded against that phase
-```
+- **PostgreSQL** (recommended, and required for key-based project creation) —
+  all projects share one database, each row scoped by `project_id`.
+- **SQLite** — a single-node alternative; project roots are declared up front in
+  `REQU_PROJECTS` and each gets a `.requ/requ.db`.
+
+Both hold the same entities: components, requirements, stories, scenarios,
+screens, architecture decisions, phases, executions and VCS refs. Move data
+between servers with `export_project` / `import_project`.
 
 ## Tools
 
 | Tool | Actor | Purpose |
 |------|-------|---------|
-| `init_project` | setup | Verify the Conductor folder exists & is valid, then create `.requ/`, record Conductor + report path, optional first phase |
+| `init_project` | setup | Verify the Conductor folder exists & is valid, then create the project (requires a `key`), record Conductor + report path, optional first phase |
 | `check_conductor` | setup | Inspect the Conductor folder (exists? valid? name? feature count?) without writing anything |
 | `create_requirement` / `list_requirements` / `get_requirement` / `update_requirement` | server | Manage imported requirements (with `components`) |
+| `assign_requirements_to_phase` | release | Move many requirements onto a phase at once — by explicit `ids` or by filter (status / component / tag / current phase); `dryRun` previews |
 | `create_user_story` | PO | Author a story (rejects unless it links ≥1 existing requirement) |
 | `update_user_story` / `add_acceptance_criterion` / `list_user_stories` / `get_user_story` | PO | Edit stories & criteria |
 | `create_phase` / `list_phases` / `update_phase` / `set_active_phase` | release | Manage phases/releases |
@@ -261,12 +248,52 @@ reviewable in PRs:
 | `coverage_report` | reporting | Phase/mode rollup + per-component + summary % (json or markdown) |
 | `coverage_trend` | reporting | Coverage summary at each phase — the evolution view |
 | `find_gaps` | reporting | Requirements without stories, stories without scenarios, stories not covered (per phase) |
+| `create_adr` / `update_adr` / `get_adr` / `list_adrs` / `search_adrs` / `delete_adr` | architect | Record and evolve architecture decisions — see [Architecture decisions](#architecture-decisions--adrs) |
+| `get_adr_content` / `import_adrs_from_files` | architect | Read a decision's markdown; bulk-import an existing `docs/adr/` folder |
 | `set_repo` / `get_repo` | dev | Record the project's repository reference — `repoUrl`, `defaultBranch`, `vcsType` (`gitlab` / `github` / `bitbucket`) |
 | `link_branch` / `link_merge_request` / `update_merge_request` / `list_vcs_refs` | dev | Link branches and merge/pull requests to stories and requirements — see [VCS references](#vcs-references) |
 
-Every tool also accepts an optional `projectPath` in **stdio mode**, or a `key`
-in **HTTP mode**, to select the target project (see
+Every tool also accepts an optional `key` selecting the target project (see
 [How it finds the project](#how-it-finds-the-project)).
+
+## Architecture decisions — ADRs
+
+An **ADR** records *why* the system is shaped the way it is: the decision, the
+context that forced it, the consequences accepted, and the alternatives
+rejected. requ owns the markdown, so decisions are queryable, linked to the
+requirements that drove them, and readable without repo access.
+
+```jsonc
+// create_adr
+{ "title": "Use a modular monolith", "status": "accepted",
+  "requirements": ["REQ-001"], "components": ["booking"],
+  "content": "# Use a modular monolith\n\n## Context\n…" }
+```
+
+- **Ids** are `ADR-001`, assigned in sequence like `REQ-`/`US-`.
+- **Status** is `proposed` → `accepted` → `superseded`. A decision is never
+  silently rewritten: supersede it and point `supersededBy` at the replacement,
+  so the history stays readable. `get_adr` reports the reverse edge
+  (`supersedes`) too.
+- **Links** are to requirements (what drove the decision) and components (what
+  it applies to). ADRs are a separate dimension from test coverage — they never
+  affect the requirement → story → scenario percentages.
+- **The body is markdown**, and ` ```mermaid ` fences render as diagrams in the
+  dashboard — C4 context/container views and sequence diagrams travel with the
+  decision instead of living in a separate tool. The body is omitted from
+  `list_adrs`/`get_adr` (they report `hasContent`); fetch it with
+  `get_adr_content`.
+
+**Already have `docs/adr/`?** `import_adrs_from_files` scans a folder of ADR
+markdown, taking the id from the filename's leading number
+(`0004-cqrs.md` → `ADR-004`), the title from the first `# ` heading, and the
+status from a `Status` section or an inline `Status:` line. It records the
+origin as `sourcePath`, and thereafter `get_adr_content` prefers the live file
+over requ's snapshot (the response's `source` says which you got). Existing ids
+are skipped, never overwritten; pass `dryRun` to preview.
+
+The decision body is stored separately from its metadata, so list and detail
+responses stay small; fetch it with `get_adr_content`.
 
 ## VCS references
 
@@ -329,7 +356,7 @@ independently settable).
 - **Source precedence (backward compatible):** if a project has **any** stored
   scenario, coverage is derived from stored scenarios; otherwise it falls back to
   scanning `features/**/*.feature` on disk exactly as before. Legacy projects and
-  stdio/YAML mode are unaffected until you import.
+  projects are unaffected until you import.
 - **HTTP/DB mode:** with `REQU_PG_URL` set, projects live entirely in Postgres —
   no filesystem root is needed; select a project by its `key` or slug. The
   [Scenario REST API](#scenario-rest-api) + OpenAPI contract expose stored
@@ -353,9 +380,10 @@ Requirement → User Story ─┬→ Acceptance Criteria → Scenarios → Execu
   **flow**, not the pixel.
 - It is **regenerable**: never hand-edited without updating the source spec. requ
   **stores and traces** mockups — it is not a UI editor, and does not replace Figma.
-- Mockups live beside the specs and are versioned with them. In YAML mode each
-  screen is a `.yaml` (metadata) plus a `.html` (the mockup) so both stay
-  reviewable in a PR; `mockupPath` instead points at a file already in the repo.
+- Mockups are versioned with the specs they serve. The body is stored apart from
+  the metadata so listings stay small (fetch it with `get_screen_html`);
+  `mockupPath` instead points at a file the **server** can read — under Docker
+  that means a path beneath the mounted `/workspace`.
 
 | Field | Meaning |
 |-------|---------|
@@ -441,49 +469,29 @@ each other's artefacts — so the validation stays independent.
 ```bash
 npm install
 npm run build      # tsc -> dist/
-npm run smoke      # end-to-end test against the built server over stdio
-npm run smoke:screens # end-to-end test for the UI specification chain
-npm run dev        # run from source with tsx (stdio mode)
-npm run start:http # run from source in HTTP mode with dashboard
+npm run smoke      # end-to-end test against the built server over HTTP
+npm run smoke:screens # UI specification chain
+npm run smoke:adrs # architecture decisions
+npm run smoke:pg   # Postgres backend (needs a live PG; see docker-compose.yml)
+npm start          # run from source with tsx
 ```
 
 ## How it finds the project
 
-The server talks stdio and can be installed **once at the user level**
-(see [Quickstart](#quickstart)) to serve any project — it resolves the target
-project per call.
+**By `key`, and only by `key`.** requ-mcp is a server, so there is no "current
+project" to infer — it never looks at a working directory, a workspace root or a
+`.requ/` folder. Every tool takes an optional `key`; REST endpoints take
+`?project=<slug>`.
 
-For each tool call, the project root (the directory containing `.requ/`) is
-resolved in this order (pass `REQU_ROOT` via an `env` block in the MCP config to
-pin one explicitly):
+- With **one** project loaded, `key` may be omitted.
+- With several, omitting it is an error listing the known keys, rather than a
+  guess.
+- `init_project` **requires** a `key` — that is how a project is created.
+- `list_projects` returns everything the server holds.
 
-1. The tool's explicit **`projectPath`** argument, if given (use this in monorepos).
-2. The **`REQU_ROOT`** env var, if set at launch (a hard pin).
-3. A **workspace root** advertised by the client (MCP `roots`) that contains `.requ/`.
-4. The nearest **ancestor of the cwd** that contains `.requ/`.
-5. Otherwise the first workspace root, else the cwd (used by `init_project`).
-
-So a single global server works across projects: most clients (Claude Code, IDEs)
-advertise the open workspace as a root, and you can always pass `projectPath`
-explicitly. The Conductor `features/` location is read from `.requ/config.yaml`
-relative to that resolved root.
-
-### HTTP mode: projects are keyed, not path-based
-
-When the server runs as an HTTP service (`REQU_TRANSPORT=http`, typically with
-`REQU_PG_URL`), **there is no meaningful local filesystem — the server _is_ the
-store.** Path auto-detection is therefore disabled and projects are addressed by
-their **`key`**:
-
-- **`init_project` requires a `key`** and creates a new, independent project
-  identified by it (no `projectPath` needed). Calling it again with the same
-  `key` updates that project; a different `key` creates a separate one — it never
-  clobbers another project.
-- **Every tool accepts `key`** as the project selector (the HTTP-mode equivalent
-  of `projectPath`).
-- **`projectPath` is rejected** in HTTP mode with a clear error, so a stale or
-  auto-detected path can never silently overwrite a project.
-- **`list_projects`** returns every project registered in the server's database.
+This is the point: an agent working in a repo cannot silently read or write a
+different store than the rest of the team. Local (stdio + YAML) mode was removed
+in 1.0 for exactly this reason — see the CHANGELOG for the migration path.
 
 ## Releasing (npm)
 

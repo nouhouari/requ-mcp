@@ -25,7 +25,7 @@ document.addEventListener('alpine:init', function () {
         config: false, summary: false, requirements: false,
         stories: false, components: false, phases: false,
         vcs: false, coverage: false, trend: false, gaps: false,
-        global: false, screens: false,
+        global: false, screens: false, adrs: false,
       },
 
       // ── Data ────────────────────────────────────────────────────────────────
@@ -41,6 +41,7 @@ document.addEventListener('alpine:init', function () {
       gaps: null,
       screens: [],
       uiCoverage: null,
+      adrs: [],
 
       // ── Screens (UI specs) ───────────────────────────────────────────────────
       screenSearch: '',
@@ -74,6 +75,14 @@ document.addEventListener('alpine:init', function () {
 
       // ── Allure report status (per active project) ────────────────────────────
       allureStatus: { available: false, url: '/allure/' },
+
+      // ── Decisions (ADRs) ─────────────────────────────────────────────────────
+      adrSearch: '',
+      adrStatusFilter: 'all',
+      adrDetailOpen: false,
+      adrDetail: null,
+      adrHtml: '',
+      adrLoading: false,
 
       // ── VCS filters ──────────────────────────────────────────────────────────
       vcsKindFilter: 'all',
@@ -173,6 +182,7 @@ document.addEventListener('alpine:init', function () {
           this.loadComponents(),
           this.loadPhases(),
           this.loadVcsRefs(),
+          this.loadAdrs(),
           this.loadCoverage(),
           this.loadTrend(),
           this.loadGaps(),
@@ -399,6 +409,7 @@ document.addEventListener('alpine:init', function () {
                 if (!prev || d.components !== prev.components) self.loadComponents();
                 if (!prev || d.phases !== prev.phases) self.loadPhases();
                 if (!prev || d.vcsRefs !== prev.vcsRefs) self.loadVcsRefs();
+                if (!prev || d.adrs !== prev.adrs) self.loadAdrs();
                 var coverageChanged = !prev ||
                   d.verifiedPct !== prev.verifiedPct ||
                   d.verifiedPctCumulative !== prev.verifiedPctCumulative ||
@@ -457,6 +468,109 @@ document.addEventListener('alpine:init', function () {
       issuesForScreen: function (id) {
         if (!this.uiCoverage) return [];
         return (this.uiCoverage.issues || []).filter(function (i) { return i.screen === id; });
+      },
+
+      async loadAdrs() {
+        this.loading.adrs = true;
+        var d = await this._fetch(this.apiUrl('/api/adrs'));
+        if (d) this.adrs = d.adrs || [];
+        this.loading.adrs = false;
+      },
+
+      filteredAdrs() {
+        var self = this;
+        var q = (this.adrSearch || '').toLowerCase();
+        return this.adrs.filter(function (a) {
+          if (self.adrStatusFilter !== 'all' && a.status !== self.adrStatusFilter) return false;
+          if (q && (a.id + '\n' + a.title).toLowerCase().indexOf(q) === -1) return false;
+          return true;
+        });
+      },
+
+      adrBadge: function (status) {
+        if (status === 'accepted')   return 'badge-green';
+        if (status === 'superseded') return 'badge-slate';
+        return 'badge-amber';
+      },
+
+      /**
+       * Open the decision reader. Unlike the mockup viewer this renders in the
+       * page rather than a sandboxed iframe: mermaid needs scripts to draw, and
+       * `sandbox=""` forbids them. The markdown is sanitized before insertion,
+       * then mermaid draws the fenced diagrams in place.
+       */
+      openAdr: async function (id) {
+        this.adrDetailOpen = true;
+        this.adrDetail = null;
+        this.adrHtml = '';
+        this.adrLoading = true;
+        try {
+          this.adrDetail = await fetch(this.apiUrl('/api/adrs/' + encodeURIComponent(id)))
+            .then(function (r) { return r.ok ? r.json() : null; });
+          var md = await fetch(this.apiUrl('/api/adrs/' + encodeURIComponent(id) + '/content'))
+            .then(function (r) { return r.ok ? r.text() : ''; });
+          this.adrHtml = this.renderMarkdownWithDiagrams(md);
+        } catch (e) {
+          this.adrHtml = '';
+        }
+        this.adrLoading = false;
+        this.runMermaid();
+      },
+
+      closeAdr: function () {
+        this.adrDetailOpen = false;
+        this.adrDetail = null;
+        this.adrHtml = '';
+      },
+
+      /**
+       * Markdown → sanitized HTML, with ```mermaid fences turned into
+       * <pre class="mermaid"> blocks for runMermaid() to draw. The fence bodies
+       * are held back from the sanitizer and re-inserted as text afterwards, so
+       * diagram source survives intact without widening what HTML is allowed.
+       */
+      renderMarkdownWithDiagrams: function (md) {
+        if (!md) return '';
+        var blocks = [];
+        var stripped = md.replace(/```mermaid\r?\n([\s\S]*?)```/g, function (_m, body) {
+          blocks.push(body);
+          return '\n\nREQU_MERMAID_' + (blocks.length - 1) + '_END\n\n';
+        });
+        var html = this.renderMarkdown(stripped);
+        if (window.DOMPurify) html = window.DOMPurify.sanitize(html);
+        return html.replace(/REQU_MERMAID_(\d+)_END/g, function (_m, i) {
+          var src = blocks[Number(i)] || '';
+          var escaped = src
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+          return '<pre class="mermaid">' + escaped + '</pre>';
+        });
+      },
+
+      /**
+       * Draw any mermaid blocks now in the DOM. mermaid is an ES module loaded
+       * from a CDN, so it can still be in flight when a decision is opened —
+       * retry on a bounded schedule rather than leaving the diagrams as text
+       * forever (same bounded-retry shape as initTrendChart). Until it lands the
+       * fence is displayed as readable source, so nothing is lost either way.
+       */
+      runMermaid: function (attempt) {
+        var self = this;
+        var tries = attempt || 0;
+        this.$nextTick(function () {
+          var nodes = document.querySelectorAll('.adr-content pre.mermaid:not([data-processed])');
+          if (!nodes.length) return;
+          if (!window.mermaid) {
+            if (tries < 20) setTimeout(function () { self.runMermaid(tries + 1); }, 150);
+            return;
+          }
+          try {
+            window.mermaid.run({ nodes: Array.prototype.slice.call(nodes) });
+          } catch (e) {
+            /* a malformed diagram must not take the reader down */
+          }
+        });
       },
 
       /**
@@ -525,6 +639,7 @@ document.addEventListener('alpine:init', function () {
         if (id === 'global')     { this.loadGlobalSummary(); }
         if (id === 'scenarios')  { this.loadScenarios(); }
         if (id === 'screens')    { this.loadScreens(); }
+        if (id === 'adrs')       { this.loadAdrs(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -548,8 +663,8 @@ document.addEventListener('alpine:init', function () {
        */
       shiftFocus(dir) {
         var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios']
-          : ['overview', 'requirements', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios'];
+          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios']
+          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios'];
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }

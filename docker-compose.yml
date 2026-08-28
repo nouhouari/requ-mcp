@@ -4,18 +4,42 @@ services:
     container_name: requ-mcp-pg
     restart: unless-stopped
     ports:
-      - "5433:5432"
+      - "${PG_PORT:-5433}:5432"
     environment:
-      POSTGRES_USER: requ
-      POSTGRES_PASSWORD: requ
-      POSTGRES_DB: requ
+      POSTGRES_USER: ${PG_USER:?set PG_USER in .env}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?set PG_PASSWORD in .env}
+      POSTGRES_DB: ${PG_DB:?set PG_DB in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U requ -d requ"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 3s
       timeout: 3s
       retries: 5
+
+  requ-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.requ
+    image: requ-mcp:local
+    container_name: requ-mcp-http
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${REQU_PORT:-8788}:8788"
+    environment:
+      REQU_HOST: 0.0.0.0
+      REQU_PORT: 8788
+      REQU_PG_URL: postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
+    volumes:
+      # requ-mcp reads Conductor feature files, mockups and reports from its OWN
+      # filesystem. Without this the server cannot see any project's files and
+      # every path-based tool fails. Projects must store paths as the CONTAINER
+      # sees them (/workspace/...), not host paths. Read-only: requ never writes
+      # back into your repos.
+      - ${REQU_WORKSPACE_DIR:?set REQU_WORKSPACE_DIR to the directory holding your repos}:/workspace:ro
 
 volumes:
   pgdata:

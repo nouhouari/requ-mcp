@@ -310,6 +310,7 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
   const storyMap: ScenariosByStory = await resolveScenariosByStory(store);
 
   const vcsRefs = await store.listVcsRefs();
+  const adrs = await store.listAdrs();
 
   const statusStrict = resolveStatuses(executionsByPhase, phases, activePhase, "strict");
   const reportStrict = buildReport(requirements, stories, storyMap, statusStrict, activePhase, "strict", vcsRefs, phases);
@@ -335,6 +336,7 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     components: components.length,
     phases: phases.length,
     vcsRefs: vcsRefs.length,
+    adrs: adrs.length,
     scenariosTotal: scenarios.length,
     // Raw counts partitioned across phases (each item counted once, earliest phase).
     byPhase: countsByPhase(requirements, stories, scenarios, phases).map((row) => {
@@ -995,6 +997,86 @@ export async function handleWebRequest(
         jsonError(res, 500, String(err));
       }
       return true;
+    }
+
+    // --- GET /api/adrs --- (architecture decisions; body omitted)
+    if (matchRoute(pathname, method, "/api/adrs", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const adrs = await r.store.listAdrs();
+        const status      = searchParams.get("status");
+        const requirement = searchParams.get("requirement");
+        const component   = searchParams.get("component");
+        const phase       = searchParams.get("phase");
+        const q           = searchParams.get("q")?.toLowerCase();
+        const list = adrs
+          .filter((a) => {
+            if (status      && a.status !== status) return false;
+            if (requirement && !a.requirements.includes(requirement)) return false;
+            if (component   && !a.components.includes(component)) return false;
+            if (phase       && a.phase !== phase) return false;
+            if (q && !`${a.id}\n${a.title}\n${a.content}`.toLowerCase().includes(q)) return false;
+            return true;
+          })
+          .map((a) => {
+            const { content, ...meta } = a;
+            return { ...meta, hasContent: content.length > 0 };
+          });
+        jsonOk(res, { total: list.length, adrs: list });
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- GET /api/adrs/:id/content --- (raw markdown, rendered in the Decisions tab)
+    {
+      const params = matchRoute(pathname, method, "/api/adrs/:id/content", "GET");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const adr = await r.store.getAdr(params.id);
+          if (!adr) { jsonError(res, 404, `Adr ${params.id} not found`); return true; }
+          const body = adr.content;
+          res.writeHead(200, {
+            ...CORS_HEADERS,
+            "Content-Type": "text/markdown; charset=utf-8",
+            "Content-Length": Buffer.byteLength(body),
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(body);
+        } catch (err) {
+          jsonError(res, 500, String(err));
+        }
+        return true;
+      }
+    }
+
+    // --- GET /api/adrs/:id ---
+    {
+      const params = matchRoute(pathname, method, "/api/adrs/:id", "GET");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const adr = await r.store.getAdr(params.id);
+          if (!adr) { jsonError(res, 404, `Adr ${params.id} not found`); return true; }
+          const [requirements, adrs] = await Promise.all([r.store.listRequirements(), r.store.listAdrs()]);
+          const reqById = new Map(requirements.map((x) => [x.id, x]));
+          const { content, ...meta } = adr;
+          jsonOk(res, {
+            ...meta,
+            hasContent: content.length > 0,
+            requirementDetails: adr.requirements.map((id) => ({ id, title: reqById.get(id)?.title ?? null, exists: reqById.has(id) })),
+            supersedes: adrs.filter((a) => a.supersededBy === adr.id).map((a) => a.id),
+          });
+        } catch (err) {
+          jsonError(res, 500, String(err));
+        }
+        return true;
+      }
     }
 
     // --- GET /api/screens --- (UI specs; filterable, mockup body omitted)
