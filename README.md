@@ -232,7 +232,7 @@ between servers with `export_project` / `import_project`.
 | `create_requirement` / `list_requirements` / `get_requirement` / `update_requirement` | server | Manage imported requirements (with `components`) |
 | `assign_requirements_to_phase` | release | Move many requirements onto a phase at once — by explicit `ids` or by filter (status / component / tag / current phase); `dryRun` previews |
 | `create_user_story` | PO | Author a story (rejects unless it links ≥1 existing requirement) |
-| `update_user_story` / `add_acceptance_criterion` / `list_user_stories` / `get_user_story` | PO | Edit stories & criteria |
+| `update_user_story` / `add_acceptance_criterion` / `delete_acceptance_criterion` / `list_user_stories` / `get_user_story` | PO | Edit stories & criteria (deleting a criterion never renumbers the others) |
 | `create_phase` / `list_phases` / `update_phase` / `set_active_phase` | release | Manage phases/releases |
 | `list_links` | tester | Show which scenarios are tagged to which story; flag dangling `@US-xxx` tags and stories with no scenario |
 | `create_scenario` / `update_scenario` / `get_scenario` / `delete_scenario` | tester/PO | Manage requ-owned cucumber scenarios (gherkin content, tags, story links) — see [Scenarios](#scenarios) |
@@ -410,7 +410,7 @@ Every significant element carries the attributes the downstream agents consume:
   data-req-el="btn-confirm-booking"
   data-req-stories="US-014,US-021"
   data-req-role="action">
-  Confirmer la réservation
+  Confirm booking
 </button>
 ```
 
@@ -449,7 +449,7 @@ visible text, and the feature file records its reference screens as metadata:
 
 ```gherkin
 @story:US-014 @screens:SCR-BOOK-DETAIL-MOB,SCR-BOOK-CONFIRM-MOB
-Feature: Réservation d'un créneau
+Feature: Booking a slot
 ```
 
 Development agents and test agents **share only the spec and the screens** — never

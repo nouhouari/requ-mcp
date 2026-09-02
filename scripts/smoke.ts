@@ -126,6 +126,19 @@ async function main() {
     await call("create_user_story", { title: "Mobile checkout", requirements: ["REQ-002"] });
     await call("create_user_story", { title: "Reports dashboard", requirements: ["REQ-003"] }); // no tagged scenarios
 
+    // --- acceptance criteria: add / delete (ids are stable, never renumbered) ---
+    await call("add_acceptance_criterion", { storyId: "US-001", text: "Locked account is refused" });
+    let acStory = await call("get_user_story", { id: "US-001" });
+    check("US-001 has 3 criteria after add", acStory.data.acceptanceCriteria.length === 3, acStory.data.acceptanceCriteria);
+    const delAc = await call("delete_acceptance_criterion", { storyId: "US-001", criterionId: "AC-2" });
+    check("AC-2 deleted", delAc.data.deleted === true && delAc.data.criterion.id === "AC-2", delAc.data);
+    check("remaining criteria keep their ids", delAc.data.remaining.map((c: any) => c.id).join(",") === "AC-1,AC-3", delAc.data.remaining);
+    const delMissing = await call("delete_acceptance_criterion", { storyId: "US-001", criterionId: "AC-2" });
+    check("deleting an unknown criterion fails", delMissing.isError === true, delMissing);
+    await call("add_acceptance_criterion", { storyId: "US-001", text: "Session expires after 30 min" });
+    acStory = await call("get_user_story", { id: "US-001" });
+    check("next criterion id continues past deleted one", acStory.data.acceptanceCriteria.at(-1).id === "AC-4", acStory.data.acceptanceCriteria);
+
     // --- links are derived from feature-file tags ---
     const links = await call("list_links");
     const us001 = links.data.links.find((l: any) => l.story === "US-001");
