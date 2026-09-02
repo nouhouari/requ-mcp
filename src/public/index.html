@@ -1615,6 +1615,29 @@
             <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
             <input type="text" class="search-input" placeholder="Filter by tag (e.g. manual)…" x-model="scenariosTag" aria-label="Filter by tag">
           </div>
+          <div class="flex items-center gap-2">
+            <label for="scenarios-phase" class="text-sm font-medium text-slate-600">Phase:</label>
+            <select id="scenarios-phase" class="filter-select" x-model="scenariosPhase" aria-label="Filter scenarios by phase">
+              <option value="">All phases</option>
+              <template x-for="ph in [...phases].sort((a,b) => a.order - b.order)" :key="ph.id">
+                <option :value="ph.id" x-text="ph.name || ph.id"></option>
+              </template>
+            </select>
+          </div>
+          <!-- Only meaningful once a phase is picked: 'All phases' has no scope to widen. -->
+          <div class="flex items-center gap-2" x-show="scenariosPhase">
+            <span class="text-sm font-medium text-slate-600" aria-hidden="true">Mode:</span>
+            <div class="toggle-group" role="group" aria-label="Phase scope mode">
+              <button class="toggle-btn" :class="scenariosMode === 'cumulative' ? 'active' : ''"
+                :aria-pressed="scenariosMode === 'cumulative'"
+                @click="scenariosMode = 'cumulative'"
+                title="Include the scenarios of every phase up to and including this one">Cumulative</button>
+              <button class="toggle-btn" :class="scenariosMode === 'strict' ? 'active' : ''"
+                :aria-pressed="scenariosMode === 'strict'"
+                @click="scenariosMode = 'strict'"
+                title="Only the scenarios whose stories belong to this phase">Strict</button>
+            </div>
+          </div>
           <div class="ml-auto text-sm text-slate-500">
             <span class="font-semibold text-slate-700" x-text="scenariosTotal"></span> scenario<span x-show="scenariosTotal !== 1">s</span>
           </div>
