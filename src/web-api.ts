@@ -683,7 +683,7 @@ export async function handleWebRequest(
     // --- GET /api/allure-status ---
     // Reports whether an Allure report exists for the active project, plus the
     // URL prefix the dashboard should link to. Used to enable/disable the
-    // "Rapport Allure" button per story.
+    // "Allure report" button per story.
     if (matchRoute(pathname, method, "/api/allure-status", "GET") !== null) {
       const r = resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;

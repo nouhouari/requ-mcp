@@ -25,15 +25,15 @@ function check(label: string, cond: boolean, detail?: unknown) {
 
 /** A booking detail mockup: traced elements, a navigation exit, an error feedback. */
 const detailHtml = `<!doctype html>
-<html lang="fr"><head><meta charset="utf-8"><style>body{font-family:sans-serif}</style></head>
+<html lang="en"><head><meta charset="utf-8"><style>body{font-family:sans-serif}</style></head>
 <body>
   <div class="device">
-    <h1 data-req-el="title-booking" data-req-stories="US-001" data-req-role="display">Réserver un créneau</h1>
+    <h1 data-req-el="title-booking" data-req-stories="US-001" data-req-role="display">Book a slot</h1>
     <input data-req-el="field-guest-count" data-req-stories="US-001" data-req-role="input" data-req-field="guestCount" />
     <div data-req-component="UIC-SLOT-PICKER"></div>
-    <div data-req-el="msg-slot-unavailable" data-req-stories="US-001" data-req-role="feedback">Ce créneau n'est plus disponible</div>
+    <div data-req-el="msg-slot-unavailable" data-req-stories="US-001" data-req-role="feedback">This slot is no longer available</div>
     <button data-req-el="btn-confirm-booking" data-req-stories="US-001" data-req-role="action"
-            data-req-target="SCR-BOOK-CONFIRM-MOB">Confirmer la réservation</button>
+            data-req-target="SCR-BOOK-CONFIRM-MOB">Confirm booking</button>
     <span data-req-el="badge-promo" data-req-role="display">Promo</span>
   </div>
 </body></html>`;
@@ -45,7 +45,7 @@ const pickerHtml = `<div class="slot-picker">
 
 /** The confirmation screen — an explicit end of flow. */
 const confirmHtml = `<!doctype html><html><body>
-  <p data-req-el="msg-booking-confirmed" data-req-stories="US-001" data-req-role="display">Réservation confirmée</p>
+  <p data-req-el="msg-booking-confirmed" data-req-stories="US-001" data-req-role="display">Booking confirmed</p>
 </body></html>`;
 
 async function main() {
@@ -110,7 +110,7 @@ async function main() {
 
     const el = detail.data.elements?.find((e: any) => e.el === "btn-confirm-booking");
     check("element attributes parsed (role/stories/tag/text)",
-      el?.role === "action" && el?.stories?.[0] === "US-001" && el?.tag === "button" && el?.text?.includes("Confirmer"), el);
+      el?.role === "action" && el?.stories?.[0] === "US-001" && el?.tag === "button" && el?.text?.includes("Confirm"), el);
     const field = detail.data.elements?.find((e: any) => e.el === "field-guest-count");
     check("data-req-field parsed on a void element", field?.field === "guestCount" && field?.text === "", field);
 
