@@ -95,6 +95,12 @@ document.addEventListener('alpine:init', function () {
       scenariosPageSize: 25,
       scenariosSearch: '',
       scenariosTag: '',
+      // Phase scope for the Scenarios tab. '' = every scenario, whatever phase.
+      // A scenario belongs to a phase through the stories it is tagged to, so
+      // `scenariosMode` decides whether earlier phases count (cumulative) or
+      // only the selected one (strict) — same semantics as the Coverage tab.
+      scenariosPhase: '',
+      scenariosMode: 'cumulative',
       scenariosLoading: false,
       scenariosExpanded: null,
       scenariosNote: '',
@@ -193,6 +199,8 @@ document.addEventListener('alpine:init', function () {
 
         this.$watch('scenariosSearch', function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
         this.$watch('scenariosTag',    function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
+        this.$watch('scenariosPhase',  function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
+        this.$watch('scenariosMode',   function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
 
         // Coverage phase/mode require a server round-trip (unlike the client-side
         // requirement/story filters), so re-fetch whenever either selection changes.
@@ -260,6 +268,9 @@ document.addEventListener('alpine:init', function () {
         // loadCoverage() for the new project, returning 0 passing scenarios
         // because that phase does not exist in the new project.
         this.coveragePhase = null;
+        // Same for the Scenarios tab: a phase id from the previous project would
+        // match nothing here and silently empty the list.
+        this.scenariosPhase = '';
         // Reconnect SSE for the new project.
         if (this._sse) { this._sse.close(); this._sse = null; }
         this.setupSSE();
@@ -336,6 +347,35 @@ document.addEventListener('alpine:init', function () {
         var d = await this._fetch(this.apiUrl('/api/phases'));
         if (d) this.phases = d;
         this.loading.phases = false;
+        this.syncCoveragePhaseSelect();
+      },
+
+      /**
+       * Re-assert the Coverage phase <select> against `coveragePhase`.
+       *
+       * The options come from `phases` via x-for, but `coveragePhase` is set
+       * earlier — loadSummary() seeds it from the project's active phase before
+       * /api/phases has answered. At that moment the only option in the DOM is
+       * "All phases", so the browser silently drops the assignment and the
+       * control reads "All phases" while the data below it is phase-filtered.
+       * Alpine never re-runs x-model just because x-for added options, so the
+       * value has to be re-applied once they exist.
+       *
+       * Also drops a phase id this project does not have (e.g. left over from
+       * the previously selected project), which would otherwise filter
+       * everything down to zero against a phase that cannot match.
+       */
+      syncCoveragePhaseSelect() {
+        var want = this.coveragePhase;
+        if (want && !this.phases.some(function (p) { return p.id === want; })) {
+          this.coveragePhase = null;
+          return;
+        }
+        var self = this;
+        this.$nextTick(function () {
+          var el = document.getElementById('coverage-phase');
+          if (el && el.value !== (self.coveragePhase || '')) el.value = self.coveragePhase || '';
+        });
       },
 
       async loadVcsRefs() {
@@ -1517,6 +1557,14 @@ document.addEventListener('alpine:init', function () {
           q:      this.scenariosSearch,
           tags:   this.scenariosTag,
         });
+        // Phase scope is server-side: it resolves each scenario's stories to their
+        // requirements' phases. Sent only when a phase is chosen — the endpoint
+        // treats an absent `phase` as "all phases", and it is what makes the
+        // Status column report the result for that phase.
+        if (this.scenariosPhase) {
+          params.set('phase', this.scenariosPhase);
+          params.set('mode', this.scenariosMode);
+        }
         if (this.projects.length > 1 && this.activeProject) {
           params.set('project', this.activeProject.slug);
         }

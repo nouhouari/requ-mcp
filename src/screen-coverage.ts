@@ -69,7 +69,11 @@ export interface UiCoverageReport {
   issues: UiIssue[];
 }
 
-/** Words that mark an acceptance criterion as describing an error/edge state. */
+/**
+ * Words that mark an acceptance criterion as describing an error/edge state.
+ * Deliberately bilingual (en/fr): these match the project's own criterion text,
+ * which authors may write in either language — they are not UI copy.
+ */
 const ERROR_HINTS =
   /\b(erreur|erreurs|invalide|invalides|indisponible|indisponibles|refus\w*|échec|echec|impossible|interdit|expiré|expire[er]?|error|errors|invalid|unavailable|reject\w*|denied|fail\w*|forbidden|expired|not found|introuvable)\b/i;
 

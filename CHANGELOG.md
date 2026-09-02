@@ -143,7 +143,7 @@ _Never published to npm: the changes below shipped as part of 1.0.0._
 - **Story detail modal** — `GET /api/story?id=US-…` returns the full story
   enriched with linked scenarios and pass counts; the dashboard shows it in a
   modal (description, acceptance criteria, requirements, scenario statuses).
-- **"Verified (livré)" delivered-scope metric** — `computeDeliveredCoverage()`
+- **"Verified (delivered)" delivered-scope metric** — `computeDeliveredCoverage()`
   restricts the verified denominator to requirements whose target phase is
   delivered (status `completed`/`active`), excluding planned phases. Exposed as
   `deliveredVerifiedPct`/`deliveredVerified`/`deliveredTotal` in `/api/summary`

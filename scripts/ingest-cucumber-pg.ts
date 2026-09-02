@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Réplique CLI du tool MCP `import_execution_report` (voir src/index.ts) pour ingérer un
-// rapport cucumber-json dans le store Postgres quand le canal MCP n'est pas disponible.
-// Si la logique du tool MCP évolue, répercuter le changement ici (mêmes étapes).
-// Même parseur, même forme d'exécution (source: "cucumber-json"), mêmes compteurs.
+// CLI counterpart of the `import_execution_report` MCP tool (see src/index.ts), for
+// ingesting a cucumber-json report into the Postgres store when the MCP channel is
+// unavailable. If the MCP tool's logic changes, mirror the change here (same steps).
+// Same parser, same execution shape (source: "cucumber-json"), same counters.
 //
 // Usage: REQU_PG_URL=postgresql://... tsx scripts/ingest-cucumber-pg.ts <root> <projectId> <filePath> <phase> <runId>
 import { promises as fs } from "node:fs";

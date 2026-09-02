@@ -1122,6 +1122,36 @@ tool(
   },
 );
 
+tool(
+  "delete_acceptance_criterion",
+  {
+    title: "Delete acceptance criterion",
+    description:
+      "Remove an acceptance criterion from a story by its criterion id (e.g. 'AC-2'). " +
+      "Remaining criteria keep their ids — they are never renumbered — so a later " +
+      "`add_acceptance_criterion` still allocates the next unused number.",
+    inputSchema: {
+      storyId: z.string().regex(/^US-\d+$/),
+      criterionId: z.string().regex(/^AC-\d+$/).describe("Criterion id to remove, e.g. 'AC-2'."),
+    },
+  },
+  async (args, store) => {
+    await ensureInit(store);
+    const story = await store.getStory(args.storyId);
+    if (!story) return fail(`Story ${args.storyId} not found.`);
+    const idx = story.acceptanceCriteria.findIndex((c) => c.id === args.criterionId);
+    if (idx === -1) {
+      return fail(`Criterion ${args.criterionId} not found on ${args.storyId}.`, {
+        knownCriteria: story.acceptanceCriteria.map((c) => c.id),
+      });
+    }
+    const [removed] = story.acceptanceCriteria.splice(idx, 1);
+    story.updatedAt = now();
+    await store.writeStory(story);
+    return json({ deleted: true, storyId: args.storyId, criterion: removed, remaining: story.acceptanceCriteria });
+  },
+);
+
 // ===========================================================================
 // Phases / Releases
 // ===========================================================================
