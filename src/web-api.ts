@@ -793,6 +793,7 @@ export async function handleWebRequest(
             order: 1,
             status: "active" as const,
             description: "",
+            removed: false,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };

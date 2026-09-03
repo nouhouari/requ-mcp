@@ -25,6 +25,65 @@ export type Priority = z.infer<typeof Priority>;
 export const Timestamp = z.string();
 
 // ---------------------------------------------------------------------------
+// Versioning — a project's specification is captured in named, lockable versions
+// ---------------------------------------------------------------------------
+
+/**
+ * A version is either an editable `draft` or a `locked` baseline. Locking freezes
+ * the *specification* fields of every entity in the version while leaving
+ * *progress* fields (statuses, executions, VCS links) writable, so a delivery team
+ * can keep working against a stable scope while the BA prepares the next one.
+ */
+export const VersionStatus = z.enum(["draft", "locked"]);
+export type VersionStatus = z.infer<typeof VersionStatus>;
+
+/** Versions are semver so a locked baseline can receive patch releases. */
+export const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+
+/** The version every pre-versioning project is migrated into. */
+export const INITIAL_VERSION = "1.0.0";
+
+/**
+ * Entity types copied when a new version is created ("in scope"). Executions,
+ * scenarios and VCS refs are deliberately excluded: they are progress, not
+ * specification, and are merely *tagged* with the version they were produced
+ * against.
+ */
+export const VERSIONED_ENTITIES = [
+  "components",
+  "requirements",
+  "stories",
+  "phases",
+  "screens",
+  "adrs",
+] as const;
+export type VersionedEntity = (typeof VERSIONED_ENTITIES)[number];
+
+export const ProjectVersion = z.object({
+  /** Semver identifier, unique within the project. */
+  version: z.string().regex(SEMVER_RE, "version must look like 1.2.0"),
+  status: VersionStatus.default("draft"),
+  /** Optional human label, e.g. "Q3 scope". */
+  label: z.string().default(""),
+  /** Version this one was branched from; absent for the first version. */
+  parent: z.string().optional(),
+  createdAt: Timestamp,
+  lockedAt: Timestamp.optional(),
+  unlockedAt: Timestamp.optional(),
+  /** Caller-supplied, for traceability only — requ-mcp has no authentication. */
+  actor: z.string().optional(),
+  reason: z.string().optional(),
+});
+export type ProjectVersion = z.infer<typeof ProjectVersion>;
+
+/**
+ * Soft-delete marker carried by every versioned entity. Removing an entity in a
+ * draft leaves a tombstone so `diff_versions` can report it, rather than making
+ * the row silently vanish.
+ */
+const tombstone = { removed: z.boolean().default(false) };
+
+// ---------------------------------------------------------------------------
 // Component — sub-system/module; maps to broker domain_tags
 // ---------------------------------------------------------------------------
 
@@ -39,6 +98,7 @@ export const Component = z.object({
   /** Broker routing tags this component maps to. E.g. ["auth","security"]. */
   domainTags: z.array(z.string()).default([]),
   status: ComponentStatus.default("active"),
+  ...tombstone,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -65,6 +125,7 @@ export const Requirement = z.object({
   /** Target phase this requirement is planned for (matches Phase.id). Optional;
    *  unassigned requirements are always in scope for every phase report. */
   phase: z.string().optional(),
+  ...tombstone,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -212,6 +273,7 @@ export const Screen = z.object({
   /** storyId → that story's `updatedAt` when the screen was last generated.
    *  A linked story whose current updatedAt differs has drifted → screen is stale. */
   storyVersions: z.record(z.string()).default({}),
+  ...tombstone,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -241,6 +303,7 @@ export const UserStory = z.object({
   /** NOTE: a story has no phase of its own. Its phase scope is derived from the
    *  phases of the requirements it traces to (see `storyInScope` in coverage.ts).
    *  This keeps requirement phase as the single source of truth — no drift. */
+  ...tombstone,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -265,6 +328,7 @@ export const Phase = z.object({
   order: z.number().int(),
   status: PhaseStatus.default("planned"),
   description: z.string().default(""),
+  ...tombstone,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -285,6 +349,9 @@ export const Execution = z.object({
   runId: z.string().optional(),
   source: ExecutionSource.default("manual"),
   note: z.string().optional(),
+  /** Project version this run was produced against. Absent on pre-versioning
+   *  rows, which are treated as belonging to every version. */
+  version: z.string().optional(),
 });
 export type Execution = z.infer<typeof Execution>;
 
@@ -357,6 +424,7 @@ export const Adr = z.object({
   phase: z.string().optional(),
   /** Content hash, refreshed whenever the body changes. */
   version: z.string().default(""),
+  ...tombstone,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -390,6 +458,12 @@ export const Config = z.object({
   /** Platforms every story is expected to be materialized on, unless the story
    *  overrides them. Drives the per-platform screen coverage check. */
   uiPlatforms: z.array(ScreenPlatform).optional(),
+  /** Default version for *reads* — the baseline a delivery team builds against.
+   *  Usually the most recently locked version. */
+  currentVersion: z.string().optional(),
+  /** Default version for *writes* — the open draft the BA is editing. At most one
+   *  draft exists per project. */
+  draftVersion: z.string().optional(),
 });
 export type Config = z.infer<typeof Config>;
 
@@ -432,21 +506,34 @@ export type CoverageMode = z.infer<typeof CoverageMode>;
 // Export / Import
 // ---------------------------------------------------------------------------
 
+export const ExportData = z.object({
+  components:   z.array(Component).default([]),
+  requirements: z.array(Requirement).default([]),
+  stories:      z.array(UserStory).default([]),
+  scenarios:    z.array(Scenario).default([]),
+  screens:      z.array(Screen).default([]),
+  adrs:         z.array(Adr).default([]),
+  phases:       z.array(Phase).default([]),
+  executions:   z.record(z.array(Execution)).default({}),
+  vcsRefs:      z.array(VcsRef).default([]),
+});
+export type ExportData = z.infer<typeof ExportData>;
+
 export const ExportPayload = z.object({
-  version: z.literal("1"),
+  /** Payload *format* version — unrelated to the project version below.
+   *  "1" is the pre-versioning flat shape; "2" adds the version envelope. */
+  version: z.enum(["1", "2"]).default("1"),
   exportedAt: z.string(),
   source: z.object({ name: z.string() }).optional(),
-  data: z.object({
-    components:   z.array(Component).default([]),
-    requirements: z.array(Requirement).default([]),
-    stories:      z.array(UserStory).default([]),
-    scenarios:    z.array(Scenario).default([]),
-    screens:      z.array(Screen).default([]),
-    adrs:         z.array(Adr).default([]),
-    phases:       z.array(Phase).default([]),
-    executions:   z.record(z.array(Execution)).default({}),
-    vcsRefs:      z.array(VcsRef).default([]),
-  }),
+  /** Project version `data` was taken from (format "2"). */
+  projectVersion: z.string().optional(),
+  /** Version registry included with an `allVersions` export (format "2"). */
+  versions: z.array(ProjectVersion).default([]),
+  /** The primary snapshot. Always populated, so a format-"1" consumer still works. */
+  data: ExportData,
+  /** Remaining versions of an `allVersions` export, keyed by version id.
+   *  Excludes `projectVersion`, which lives in `data`. */
+  versionedData: z.record(ExportData).default({}),
 });
 export type ExportPayload = z.infer<typeof ExportPayload>;
 

@@ -525,6 +525,7 @@ tool(
         order: 1,
         status: "active",
         description: "",
+        removed: false,
         createdAt: now(),
         updatedAt: now(),
       };
@@ -595,6 +596,7 @@ tool(
       description: args.description ?? "",
       domainTags:  args.domainTags ?? [],
       status:      "active",
+      removed:     false,
       createdAt:   now(),
       updatedAt:   now(),
     };
@@ -713,6 +715,7 @@ tool(
       components: args.components ?? [],
       tags: args.tags ?? [],
       status: "active",
+      removed: false,
       ...(phase.value ? { phase: phase.value } : {}),
       createdAt: now(),
       updatedAt: now(),
@@ -953,6 +956,7 @@ tool(
       status: "draft",
       platforms: args.platforms ?? [],
       dataFields: args.dataFields ?? [],
+      removed: false,
       createdAt: now(),
       updatedAt: now(),
     };
@@ -1181,6 +1185,7 @@ tool(
       order,
       status:      args.activate ? "active" : "planned",
       description: args.description ?? "",
+      removed:     false,
       createdAt:   now(),
       updatedAt:   now(),
     };
@@ -1782,6 +1787,7 @@ tool(
       terminal: args.terminal ?? existing?.terminal ?? false,
       elements: parsed.elements,
       storyVersions,
+      removed: existing?.removed ?? false,
       createdAt: existing?.createdAt ?? ts,
       updatedAt: ts,
     };
@@ -2233,6 +2239,7 @@ tool(
       sourcePath: args.sourcePath,
       phase: phase.value,
       version: htmlVersion(content),
+      removed: false,
       createdAt: ts,
       updatedAt: ts,
     };
@@ -2437,6 +2444,7 @@ tool(
           components: [],
           sourcePath,
           version: htmlVersion(md),
+          removed: false,
           createdAt: ts,
           updatedAt: ts,
         } as TAdr);

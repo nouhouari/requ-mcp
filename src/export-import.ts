@@ -32,6 +32,8 @@ export async function buildExport(store: AnyStore): Promise<ExportPayload> {
     version: "1",
     exportedAt: new Date().toISOString(),
     source: config ? { name: config.name } : undefined,
+    versions: [],
+    versionedData: {},
     data: { components, requirements, stories, scenarios, screens, adrs, phases, executions, vcsRefs },
   };
 }
