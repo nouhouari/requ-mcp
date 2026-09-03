@@ -19,7 +19,7 @@ async function snapshot(store: AnyStore): Promise<ExportData> {
       store.listAdrs(),
       store.listPhases(),
       store.listVcsRefs(),
-      store.readAllExecutions(),
+      store.readAllExecutions({ carryOver: false }),
     ]);
 
   const executions: Record<string, Execution[]> = {};
@@ -76,7 +76,7 @@ export async function buildExport(
 export async function applyImport(
   store: AnyStore,
   payload: ExportPayload,
-  opts: { allVersions?: boolean } = {},
+  opts: { allVersions?: boolean; force?: boolean } = {},
 ): Promise<ImportReport> {
   const restoreHistory =
     opts.allVersions !== false && payload.version === "2" && payload.versions.length > 0;
@@ -93,15 +93,34 @@ export async function applyImport(
   const primary = payload.projectVersion;
   for (const v of payload.versions) {
     const existing = await store.getVersion(v.version);
+
+    // A locked version already present in the target is a baseline someone is
+    // building against. Importing into it would both mutate frozen scope and,
+    // via the temporary unlock below, leave it open. Refuse instead.
+    if (existing?.status === "locked" && !opts.force) {
+      merged.errors.push(
+        `[${v.version}] version already exists and is locked; ` +
+          `it was left untouched. Import into a new version, or pass force to overwrite.`,
+      );
+      continue;
+    }
+
     // Register as a draft first: a locked row would refuse its own contents.
+    // `existing` is only ever a draft here unless force was given.
     if (!existing) await store.writeVersion({ ...v, status: "draft" });
     else if (existing.status === "locked") await store.writeVersion({ ...existing, status: "draft" });
 
-    const data = v.version === primary ? payload.data : payload.versionedData[v.version];
-    if (data) mergeInto(await importSnapshot(store.at(v.version) as AnyStore, data), v.version);
-
-    if (v.status === "locked") await store.writeVersion(v);
-    merged.imported["versions"] = (merged.imported["versions"] ?? 0) + 1;
+    try {
+      const data = v.version === primary ? payload.data : payload.versionedData[v.version];
+      if (data) mergeInto(await importSnapshot(store.at(v.version) as AnyStore, data), v.version);
+      merged.imported["versions"] = (merged.imported["versions"] ?? 0) + 1;
+    } finally {
+      // Restore the lock whatever happened, so a failure part-way cannot leave a
+      // baseline open. An existing row keeps its own status; a new one takes the
+      // status it was exported with.
+      const restore = existing ?? v;
+      if (restore.status === "locked") await store.writeVersion(restore);
+    }
   }
   return merged;
 }

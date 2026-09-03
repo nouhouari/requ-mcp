@@ -248,6 +248,46 @@ async function main() {
     check("the audit trail keeps the lock timestamps", !!v11.lockedAt && !!v11.unlockedAt, v11);
     check("the audit trail keeps actor and reason", v11.actor === "ba@example.com" && v11.reason === "typo in AC", v11);
     check("versions record their parent", v11.parent === "1.0.0", v11);
+
+    // --- progress updates reach a locked baseline -------------------------------
+    // A status-only call on a dual-purpose spec tool is progress, so it must land
+    // on the version the team is delivering — the locked one — not on the draft.
+    await call("lock_version", { version: "1.1.0", actor: "ba@example.com" });
+    const beforeDraft = await call("list_versions");
+    check("no draft is open after the second lock", !beforeDraft.data.draftVersion, beforeDraft.data);
+
+    const done = await call("update_user_story", { id: "US-001", status: "done" });
+    check("a status-only story update succeeds on a locked baseline", done.isError !== true, done);
+    const onBaseline = await call("get_user_story", { id: "US-001", version: "1.1.0" });
+    check("…and lands on the locked baseline", onBaseline.data.status === "done", onBaseline.data);
+
+    const retitle = await call("update_user_story", { id: "US-001", title: "Reworded" });
+    check("…while a title change is still refused", retitle.isError === true, retitle);
+
+    await call("create_version", { bump: "minor" });
+    const done2 = await call("update_user_story", { id: "US-002", status: "done" });
+    check("a status update still targets the baseline once a draft exists", done2.isError !== true, done2);
+    const notDraft = await call("get_user_story", { id: "US-002", version: "1.2.0" });
+    check("…and not the open draft", notDraft.data.status !== "done", notDraft.data);
+
+    // --- an unknown ?version= is rejected, not silently created ------------------
+    const phantom = await api("/api/requirements?version=9.9.9");
+    check("GET with an unknown ?version= 404s", phantom.status === 404, phantom.body);
+
+    // --- import refuses to reopen a locked baseline -----------------------------
+    const exported = await call("export_project", { allVersions: true });
+    const reimport = await call("import_project", { data: exported.data, allVersions: true });
+    check(
+      "import leaves an existing locked version untouched",
+      JSON.stringify(reimport.data?.errors ?? reimport).includes("locked"),
+      reimport.data,
+    );
+    const lockedAfterReimport = await call("list_versions");
+    check(
+      "…and it is still locked afterwards",
+      lockedAfterReimport.data.versions.find((v: any) => v.version === "1.1.0").status === "locked",
+      lockedAfterReimport.data.versions,
+    );
   } finally {
     await h.stop();
     await fs.rm(tmp, { recursive: true, force: true });

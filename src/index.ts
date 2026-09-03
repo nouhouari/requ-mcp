@@ -48,7 +48,7 @@ import {
   type VcsRef,
 } from "./schema.js";
 import { SEMVER_RE } from "./schema.js";
-import { bumpSemver, compareSemver } from "./versioning.js";
+import { bumpSemver, compareSemver, MUTABLE_WHILE_LOCKED } from "./versioning.js";
 import { diffVersions } from "./version-diff.js";
 import { createVersion, lockVersion, unlockVersion, setActiveVersion } from "./version-ops.js";
 import {
@@ -303,11 +303,29 @@ const versionSchema = z
  * then the initial version. Every read and write below this point is confined to
  * that one baseline.
  */
+/**
+ * True when every field the caller actually supplied stays writable while the
+ * version is locked. `key`, `version` and the entity id are transport/addressing,
+ * not content, so they do not count either way.
+ */
+const ADDRESSING_ARGS = new Set(["key", "version", "id", "storyId", "screenId", "adrId"]);
+
+function isProgressOnlyPayload(entity: VersionedEntity, args: Record<string, unknown>): boolean {
+  const allowed = new Set<string>(MUTABLE_WHILE_LOCKED[entity]);
+  if (allowed.size === 0) return false;
+  const supplied = Object.keys(args).filter(
+    (k) => args[k] !== undefined && !ADDRESSING_ARGS.has(k),
+  );
+  return supplied.length > 0 && supplied.every((k) => allowed.has(k));
+}
+
 async function bindVersion(
   store: AnyStore,
   explicit: string | undefined,
   mutates: Mutates | undefined,
   toolName: string,
+  entity?: VersionedEntity,
+  args?: Record<string, unknown>,
 ): Promise<AnyStore> {
   // init_project creates the project (and its first version), so there is nothing
   // to resolve against yet.
@@ -320,9 +338,17 @@ async function bindVersion(
     return store; // uninitialized — the tool itself will report that
   }
 
+  // A `spec` tool called with nothing but lock-permitted fields is a progress
+  // update wearing a specification tool's clothes — marking a story done, or an
+  // ADR accepted. Those belong on the baseline the team is delivering, so they
+  // resolve like progress and are allowed to land on a locked version.
+  const progressOnly = mutates === "spec" && entity !== undefined && args !== undefined
+    && isProgressOnlyPayload(entity, args);
+  const effective: Mutates | undefined = progressOnly ? "progress" : mutates;
+
   const target =
     explicit ??
-    (mutates === "spec"
+    (effective === "spec"
       ? cfg.draftVersion ?? cfg.currentVersion
       : cfg.currentVersion ?? cfg.draftVersion) ??
     INITIAL_VERSION;
@@ -338,7 +364,7 @@ async function bindVersion(
   // say so here rather than letting the store reject each field one at a time.
   // lock_version is exempt: locking an already-locked version is a no-op it
   // reports for itself, not an error.
-  if (mutates === "spec" && !explicit && toolName !== "lock_version") {
+  if (effective === "spec" && !explicit && toolName !== "lock_version") {
     const row = known.find((v) => v.version === target);
     if (row?.status === "locked") {
       throw new Error(
@@ -371,11 +397,21 @@ type Handler = (args: any, store: AnyStore) => Promise<unknown>;
  */
 type Mutates = "spec" | "progress";
 
+/**
+ * Entity a `spec` tool writes, so version resolution can tell a scope change
+ * from a progress update on a dual-purpose tool.
+ *
+ * `update_user_story` sets a title (specification — belongs in the draft) *and*
+ * a status (progress — belongs on the baseline the team is delivering). Which
+ * one a given call is depends on its payload, not on the tool, so the freeze
+ * matrix is consulted against the arguments actually supplied.
+ */
 type ToolDef = {
   name: string;
   config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> };
   handler: Handler;
   mutates?: Mutates;
+  entity?: VersionedEntity;
 };
 
 /**
@@ -391,14 +427,15 @@ function tool(
   config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> },
   handler: Handler,
   mutates?: Mutates,
+  entity?: VersionedEntity,
 ) {
-  toolDefs.push({ name, config, handler, mutates });
+  toolDefs.push({ name, config, handler, mutates, entity });
 }
 
 /** Build a fresh McpServer with every collected tool registered on it. */
 function createServer(): McpServer {
   const server = new McpServer({ name: "requ-mcp", version: PKG_VERSION });
-  for (const { name, config, handler, mutates } of toolDefs) {
+  for (const { name, config, handler, mutates, entity } of toolDefs) {
     const base = config.inputSchema ?? {};
     const inputSchema: Record<string, z.ZodTypeAny> = { ...base };
     // Every tool accepts `key` as the HTTP-mode project identifier. Tools that
@@ -414,7 +451,7 @@ function createServer(): McpServer {
         try {
           const selector = selectorFor(name, args);
           const store = await getStore(server, selector, name === "init_project");
-          const bound = await bindVersion(store, args.version, mutates, name);
+          const bound = await bindVersion(store, args.version, mutates, name, entity, args);
           return (await handler(args, bound)) as ReturnType<typeof json>;
         } catch (e) {
           return fail((e as Error).message);
@@ -1371,6 +1408,7 @@ tool(
     return json(story);
   },
   "spec",
+  "stories",
 );
 
 tool(
@@ -1506,6 +1544,7 @@ tool(
     return json(phase);
   },
   "spec",
+  "phases",
 );
 
 tool(
@@ -1698,7 +1737,7 @@ tool(
     await store.writeScenario(sc);
     return json({ scenario: sc, valid: validation.ok, warnings: { unknownStories: await unknownStories(store, stories) } });
   },
-  "spec",
+  "progress",
 );
 
 tool(
@@ -1741,7 +1780,7 @@ tool(
     await store.writeScenario(sc);
     return json({ scenario: sc, valid: sc.valid, warnings: { unknownStories: await unknownStories(store, sc.stories) } });
   },
-  "spec",
+  "progress",
 );
 
 tool(
@@ -1840,7 +1879,7 @@ tool(
     const deleted = await store.deleteScenario(tk);
     return json({ deleted, testKey: tk });
   },
-  "spec",
+  "progress",
 );
 
 tool(
@@ -1923,7 +1962,7 @@ tool(
     }
     return json({ root, scenariosParsed: index.scenarios.length, imported: imported.length, skipped: skipped.length, invalid });
   },
-  "spec",
+  "progress",
 );
 
 // ===========================================================================
@@ -2086,6 +2125,7 @@ tool(
     });
   },
   "spec",
+  "screens",
 );
 
 tool(
@@ -2659,6 +2699,7 @@ tool(
     return json(adrSummary(adr));
   },
   "spec",
+  "adrs",
 );
 
 tool(

@@ -497,7 +497,8 @@ type StoreResult =
   | { status: "ok"; store: AnyHttpStore }
   | { status: "not_initialized" }
   | { status: "ambiguous"; available: string[] }
-  | { status: "unknown_project"; slug: string };
+  | { status: "unknown_project"; slug: string }
+  | { status: "unknown_version"; version: string; known: string[] };
 
 /**
  * Resolve the project, then the specification version, from the query string.
@@ -507,21 +508,31 @@ type StoreResult =
  * keeps seeing exactly what it saw before. Because every route goes through
  * here, no individual handler needs to know versions exist.
  */
-function resolveStore(
+async function resolveStore(
   stores: Map<string, AnyHttpStore>,
   searchParams: URLSearchParams,
-): StoreResult {
+): Promise<StoreResult> {
   if (stores.size === 0) return { status: "not_initialized" };
-  const atVersion = (store: AnyHttpStore): AnyHttpStore => {
+
+  // An unregistered version is not an empty one: writing to it would create a
+  // whole baseline that list_versions and the dashboard cannot see, while still
+  // consuming ids. Reject it here, as the MCP layer does.
+  const atVersion = async (store: AnyHttpStore): Promise<StoreResult> => {
     const version = searchParams.get("version");
-    return version ? (store.at(version) as AnyHttpStore) : store;
+    if (!version) return { status: "ok", store };
+    const known = await store.listVersions();
+    if (!known.some((v) => v.version === version)) {
+      return { status: "unknown_version", version, known: known.map((v) => v.version) };
+    }
+    return { status: "ok", store: store.at(version) as AnyHttpStore };
   };
-  if (stores.size === 1) return { status: "ok", store: atVersion([...stores.values()][0]) };
+
+  if (stores.size === 1) return atVersion([...stores.values()][0]);
   const slug = searchParams.get("project");
   if (!slug) return { status: "ambiguous", available: [...stores.keys()] };
   const store = stores.get(slug);
   if (!store) return { status: "unknown_project", slug };
-  return { status: "ok", store: atVersion(store) };
+  return atVersion(store);
 }
 
 function handleStoreResult(
@@ -538,6 +549,12 @@ function handleStoreResult(
     });
     res.writeHead(400, { ...CORS_HEADERS, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
     res.end(body);
+  } else if (result.status === "unknown_version") {
+    jsonError(
+      res,
+      404,
+      `Unknown version: ${result.version}. Known: [${result.known.join(", ")}]`,
+    );
   } else {
     jsonError(res, 404, `Unknown project: ${result.slug}`);
   }
@@ -572,7 +589,7 @@ export async function handleWebRequest(
   // SSE — GET /events
   // -------------------------------------------------------------------------
   if (rawUrl === "/events" || rawUrl.startsWith("/events?")) {
-    const sseResult = resolveStore(stores, new URL(rawUrl, "http://localhost").searchParams);
+    const sseResult = await resolveStore(stores, new URL(rawUrl, "http://localhost").searchParams);
     if (!handleStoreResult(res, sseResult)) return true;
     const store = sseResult.store;
 
@@ -723,7 +740,7 @@ export async function handleWebRequest(
     // URL prefix the dashboard should link to. Used to enable/disable the
     // "Allure report" button per story.
     if (matchRoute(pathname, method, "/api/allure-status", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const slug = searchParams.get("project")
@@ -848,7 +865,7 @@ export async function handleWebRequest(
 
     // --- GET /api/summary ---
     if (matchRoute(pathname, method, "/api/summary", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         if (!await r.store.isInitialized()) return notInitialized(res);
@@ -906,7 +923,7 @@ export async function handleWebRequest(
 
     // --- GET /api/versions --- (history + which version reads and edits default to)
     if (matchRoute(pathname, method, "/api/versions", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const [versions, cfg] = await Promise.all([r.store.listVersions(), r.store.readConfig()]);
@@ -921,7 +938,7 @@ export async function handleWebRequest(
 
     // --- GET /api/versions/diff --- (?from=&to=&entity=)
     if (matchRoute(pathname, method, "/api/versions/diff", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const cfg = await r.store.readConfig();
@@ -955,7 +972,7 @@ export async function handleWebRequest(
 
     // --- POST /api/versions --- (branch the next version)
     if (matchRoute(pathname, method, "/api/versions", "POST") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const body = await parseJsonBody(req, res);
@@ -971,7 +988,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/versions/:version/lock", "POST");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const body = await parseJsonBody(req, res);
@@ -988,7 +1005,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/versions/:version/unlock", "POST");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const body = await parseJsonBody(req, res);
@@ -1003,7 +1020,7 @@ export async function handleWebRequest(
 
     // --- POST /api/versions/active --- (move the current/draft pointers)
     if (matchRoute(pathname, method, "/api/versions/active", "POST") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const body = await parseJsonBody(req, res);
@@ -1017,7 +1034,7 @@ export async function handleWebRequest(
 
     // --- GET /api/requirements ---
     if (matchRoute(pathname, method, "/api/requirements", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         jsonOk(res, await r.store.listRequirements());
@@ -1031,7 +1048,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/requirements/:id", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const req_ = await r.store.getRequirement(params.id);
@@ -1051,7 +1068,7 @@ export async function handleWebRequest(
 
     // --- GET /api/stories ---
     if (matchRoute(pathname, method, "/api/stories", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         jsonOk(res, await r.store.listStories());
@@ -1065,7 +1082,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/stories/:id", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const story = await r.store.getStory(params.id);
@@ -1082,7 +1099,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/stories/:id/scenarios", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const [scenarios, stories] = await Promise.all([r.store.listScenarios(), r.store.listStories()]);
@@ -1102,7 +1119,7 @@ export async function handleWebRequest(
     // Full story detail enriched with linked scenarios (pass/total) so the
     // dashboard detail modal can render everything in a single request.
     if (matchRoute(pathname, method, "/api/story", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const id = searchParams.get("id");
@@ -1151,7 +1168,7 @@ export async function handleWebRequest(
 
     // --- GET /api/adrs --- (architecture decisions; body omitted)
     if (matchRoute(pathname, method, "/api/adrs", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const adrs = await r.store.listAdrs();
@@ -1184,7 +1201,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/adrs/:id/content", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const adr = await r.store.getAdr(params.id);
@@ -1208,7 +1225,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/adrs/:id", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const adr = await r.store.getAdr(params.id);
@@ -1231,7 +1248,7 @@ export async function handleWebRequest(
 
     // --- GET /api/screens --- (UI specs; filterable, mockup body omitted)
     if (matchRoute(pathname, method, "/api/screens", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const [screens, stories] = await Promise.all([r.store.listScreens(), r.store.listStories()]);
@@ -1274,7 +1291,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/screens/:id/html", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const screen = await r.store.getScreen(params.id);
@@ -1300,7 +1317,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/screens/:id", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const screen = await r.store.getScreen(params.id);
@@ -1332,7 +1349,7 @@ export async function handleWebRequest(
 
     // --- GET /api/ui-coverage --- (the section-4 consistency checks)
     if (matchRoute(pathname, method, "/api/ui-coverage", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const parsedMode = parseCoverageMode(searchParams, res);
@@ -1364,7 +1381,7 @@ export async function handleWebRequest(
 
     // --- GET /api/components ---
     if (matchRoute(pathname, method, "/api/components", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         jsonOk(res, await r.store.listComponents());
@@ -1376,7 +1393,7 @@ export async function handleWebRequest(
 
     // --- GET /api/phases ---
     if (matchRoute(pathname, method, "/api/phases", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         jsonOk(res, await r.store.listPhases());
@@ -1388,7 +1405,7 @@ export async function handleWebRequest(
 
     // --- GET /api/config ---
     if (matchRoute(pathname, method, "/api/config", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         if (!await r.store.isInitialized()) return notInitialized(res);
@@ -1401,7 +1418,7 @@ export async function handleWebRequest(
 
     // --- PATCH /api/config ---
     if (matchRoute(pathname, method, "/api/config", "PATCH") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         let body: Record<string, unknown>;
@@ -1425,7 +1442,7 @@ export async function handleWebRequest(
 
     // --- GET /api/vcs ---
     if (matchRoute(pathname, method, "/api/vcs", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         jsonOk(res, await r.store.listVcsRefs());
@@ -1437,7 +1454,7 @@ export async function handleWebRequest(
 
     // --- GET /api/coverage/trend ---
     if (matchRoute(pathname, method, "/api/coverage/trend", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const mode = parseCoverageMode(searchParams, res);
@@ -1453,7 +1470,7 @@ export async function handleWebRequest(
 
     // --- GET /api/coverage/gaps ---
     if (matchRoute(pathname, method, "/api/coverage/gaps", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const mode = parseCoverageMode(searchParams, res);
@@ -1475,7 +1492,7 @@ export async function handleWebRequest(
 
     // --- GET /api/coverage ---
     if (matchRoute(pathname, method, "/api/coverage", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const mode = parseCoverageMode(searchParams, res);
@@ -1511,7 +1528,7 @@ export async function handleWebRequest(
 
     // --- GET /api/scenarios --- (query by story/requirement/phase/tags/feature/q/valid)
     if (matchRoute(pathname, method, "/api/scenarios", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const [scenarios, stories, phases, requirements] = await Promise.all([
@@ -1565,7 +1582,7 @@ export async function handleWebRequest(
     {
       const params = matchRoute(pathname, method, "/api/scenarios/:id", "GET");
       if (params !== null) {
-        const r = resolveStore(stores, searchParams);
+        const r = await resolveStore(stores, searchParams);
         if (!handleStoreResult(res, r)) return true;
         try {
           const sc = await r.store.getScenario(params.id);
@@ -1591,7 +1608,7 @@ export async function handleWebRequest(
 
     // --- GET /api/tags --- (distinct tags with counts)
     if (matchRoute(pathname, method, "/api/tags", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const scenarios = await r.store.listScenarios();
@@ -1607,7 +1624,7 @@ export async function handleWebRequest(
 
     // --- GET /api/export ---
     if (matchRoute(pathname, method, "/api/export", "GET") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const payload = await buildExport(r.store, { allVersions: searchParams.get("allVersions") === "true" });
@@ -1630,7 +1647,7 @@ export async function handleWebRequest(
 
     // --- POST /api/import ---
     if (matchRoute(pathname, method, "/api/import", "POST") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         const bodyText = await collectBody(req);
@@ -1654,7 +1671,7 @@ export async function handleWebRequest(
 
     // --- POST /api/scenarios/execute ---
     if (matchRoute(pathname, method, "/api/scenarios/execute", "POST") !== null) {
-      const r = resolveStore(stores, searchParams);
+      const r = await resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
         if (!await r.store.isInitialized()) return notInitialized(res);

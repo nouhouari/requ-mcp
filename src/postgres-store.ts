@@ -39,7 +39,6 @@ let _pool: Pool | null = null;
 let _schemaReady: Promise<void> | null = null;
 
 /** Version status cache, keyed `${projectId}:${version}`. */
-const _versionStatus = new Map<string, "draft" | "locked">();
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS config (
@@ -129,6 +128,12 @@ const SCHEMA_SQL = `
  * until someone locks a version for the first time.
  */
 const MIGRATION_SQL = `
+-- Serialise the whole migration: two processes booting together would otherwise
+-- race on the primary-key rebuild and on the backfill below. A transaction-scoped
+-- lock is released even if the migration throws, so it cannot leak on a pooled
+-- connection.
+SELECT pg_advisory_xact_lock(7213099);
+
 DO $$
 DECLARE
   t text;
@@ -170,7 +175,8 @@ SELECT DISTINCT c.project_id,
          'createdAt', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
        )
 FROM config c
-WHERE NOT EXISTS (SELECT 1 FROM versions v WHERE v.project_id = c.project_id);
+WHERE NOT EXISTS (SELECT 1 FROM versions v WHERE v.project_id = c.project_id)
+ON CONFLICT (project_id, version) DO NOTHING;
 
 -- Point migrated projects at the version their rows were stamped with, so the
 -- pointers are explicit rather than relying on the INITIAL_VERSION fallback.
@@ -182,6 +188,7 @@ SET value = (
     )::text
 WHERE key = 'config'
   AND value::jsonb->>'currentVersion' IS NULL;
+
 `;
 
 /**
@@ -191,7 +198,19 @@ WHERE key = 'config'
 export function initPgPool(connectionString: string): void {
   if (_pool) return;
   _pool = new Pool({ connectionString });
-  _schemaReady = _pool
+  _schemaReady = runSchema();
+}
+
+/**
+ * Apply the schema and the forward migration.
+ *
+ * A failure here is not cached: `_schemaReady` is cleared so the next call
+ * retries. Otherwise a process that lost the boot race — or hit a momentary
+ * connection problem — would await a permanently rejected promise and fail every
+ * query for the rest of its life.
+ */
+function runSchema(): Promise<void> {
+  return _pool!
     .query(SCHEMA_SQL)
     .then(() => _pool!.query(MIGRATION_SQL))
     .then(() =>
@@ -200,7 +219,11 @@ export function initPgPool(connectionString: string): void {
         CREATE INDEX IF NOT EXISTS idx_exec_project_phase ON executions(project_id, phase_id, ran_at);
       `)
     )
-    .then(() => undefined);
+    .then(() => undefined)
+    .catch((e) => {
+      _schemaReady = null;
+      throw e;
+    });
 }
 
 /** Table backing each versioned entity type. */
@@ -244,22 +267,27 @@ export class PostgresStore {
 
   private async pool(): Promise<Pool> {
     if (!_pool) throw new Error("PostgreSQL not configured. Set REQU_PG_URL.");
-    await _schemaReady;
+    await (_schemaReady ??= runSchema());
     return _pool;
   }
 
-  /** The version this store reads and writes. Falls back to the project pointer. */
+  /**
+   * The version this store reads and writes.
+   *
+   * A store bound by `at()` keeps that version for its lifetime. An unbound
+   * store re-reads the project pointer on every call and deliberately does not
+   * cache: the base instances live for the whole process, so caching would make
+   * them blind to a later lock_version or create_version and leave them serving
+   * a version that is no longer current.
+   */
   async version(): Promise<string> {
     if (this._version) return this._version;
-    let resolved = INITIAL_VERSION;
     try {
       const cfg = await this.readConfig();
-      resolved = cfg.draftVersion ?? cfg.currentVersion ?? INITIAL_VERSION;
+      return cfg.currentVersion ?? cfg.draftVersion ?? INITIAL_VERSION;
     } catch {
-      /* uninitialized project — the initial version is the right answer */
+      return INITIAL_VERSION; // uninitialized project
     }
-    this._version = resolved;
-    return resolved;
   }
 
   // --- version registry ---
@@ -292,7 +320,6 @@ export class PostgresStore {
        ON CONFLICT (project_id, version) DO UPDATE SET status = EXCLUDED.status, data = EXCLUDED.data`,
       [this.projectId, parsed.version, parsed.status, parsed],
     );
-    _versionStatus.set(`${this.projectId}:${parsed.version}`, parsed.status);
   }
 
   /**
@@ -357,7 +384,6 @@ export class PostgresStore {
     } finally {
       client.release();
     }
-    _versionStatus.delete(`${this.projectId}:${version}`);
   }
 
   /** Ids used by an entity type in *any* version, so an id is never reused. */
@@ -370,18 +396,19 @@ export class PostgresStore {
     return rows.map((r) => r.id as string);
   }
 
+  /**
+   * Read the lock state from the registry on every call.
+   *
+   * Deliberately uncached: a lock applied by another process — the HTTP server
+   * alongside a stdio session, say — must be seen immediately, or this guard
+   * could be talked into writing to a frozen baseline. It is one indexed lookup
+   * and only runs on writes.
+   */
   async isLocked(): Promise<boolean> {
-    const version = await this.version();
-    const cacheKey = `${this.projectId}:${version}`;
-    let status = _versionStatus.get(cacheKey);
-    if (!status) {
-      const row = await this.getVersion(version);
-      // An unregistered version is an open draft: that is the state a brand-new
-      // project is in before its first version row is written.
-      status = row?.status ?? "draft";
-      _versionStatus.set(cacheKey, status);
-    }
-    return status === "locked";
+    const row = await this.getVersion(await this.version());
+    // An unregistered version is an open draft: that is the state a brand-new
+    // project is in before its first version row is written.
+    return (row?.status ?? "draft") === "locked";
   }
 
   // ---- generic versioned row helpers -------------------------------------
@@ -668,12 +695,17 @@ export class PostgresStore {
     }
   }
 
-  async readAllExecutions(opts?: { versions?: string[] }): Promise<Map<string, TExecution[]>> {
+  async readAllExecutions(
+    opts?: { versions?: string[]; carryOver?: boolean },
+  ): Promise<Map<string, TExecution[]>> {
     const phases = await this.listPhases();
     const out = new Map<string, TExecution[]>();
     for (const p of phases) out.set(p.id, await this.readExecutionLog(p.id, opts));
     // Results recorded against an ancestor version only count while the story
-    // they cover has not changed since — see src/version-carryover.ts.
+    // they cover has not changed since — see src/version-carryover.ts. That is a
+    // coverage-reporting rule, so callers that want the raw log (export, for one)
+    // opt out rather than silently losing history.
+    if (opts?.carryOver === false) return out;
     return applyCarryOver(this, out);
   }
 
@@ -702,7 +734,8 @@ export class PostgresStore {
     const v = VcsRef.parse(ref);
     await pool.query(
       `INSERT INTO vcs_refs(project_id, id, data, version) VALUES($1, $2, $3, $4)
-       ON CONFLICT (project_id, id) DO UPDATE SET data = EXCLUDED.data`,
+       ON CONFLICT (project_id, id) DO UPDATE
+         SET data = EXCLUDED.data, version = EXCLUDED.version`,
       [this.projectId, v.id, v, await this.version()],
     );
   }
@@ -795,7 +828,7 @@ export class PostgresStore {
   /** Discover all project_ids that have a config row (DB-native project list). */
   static async listProjectIds(): Promise<string[]> {
     if (!_pool) throw new Error("PostgreSQL not configured. Set REQU_PG_URL.");
-    await _schemaReady;
+    await (_schemaReady ??= runSchema());
     const { rows } = await _pool.query("SELECT DISTINCT project_id FROM config ORDER BY project_id");
     return rows.map((r) => r.project_id as string);
   }

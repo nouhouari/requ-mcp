@@ -117,7 +117,6 @@ export class SqliteStore {
   /** Bound version, or null to resolve the project's pointer lazily. */
   private _version: string | null;
   /** Version status cache, shared by every view of this database. */
-  private _status: Map<string, "draft" | "locked">;
 
   constructor(root: string, dbPathOverride?: string, version: string | null = null) {
     this.root = path.resolve(root);
@@ -128,7 +127,6 @@ export class SqliteStore {
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA_SQL);
     this._version = version;
-    this._status = new Map();
     this.migrate();
   }
 
@@ -227,18 +225,23 @@ export class SqliteStore {
 
   // ---- version registry --------------------------------------------------
 
-  /** The version this store reads and writes. Falls back to the project pointer. */
+  /**
+   * The version this store reads and writes.
+   *
+   * A store bound by `at()` keeps that version for its lifetime. An unbound
+   * store re-reads the project pointer on every call and deliberately does not
+   * cache: the base instances live for the whole process, so caching would make
+   * them blind to a later lock_version or create_version and leave them serving
+   * a version that is no longer current.
+   */
   async version(): Promise<string> {
     if (this._version) return this._version;
-    let resolved = INITIAL_VERSION;
     try {
       const cfg = await this.readConfig();
-      resolved = cfg.draftVersion ?? cfg.currentVersion ?? INITIAL_VERSION;
+      return cfg.currentVersion ?? cfg.draftVersion ?? INITIAL_VERSION;
     } catch {
-      /* uninitialized project — the initial version is the right answer */
+      return INITIAL_VERSION; // uninitialized project
     }
-    this._version = resolved;
-    return resolved;
   }
 
   async listVersions(): Promise<TProjectVersion[]> {
@@ -258,7 +261,6 @@ export class SqliteStore {
     const parsed = ProjectVersion.parse(v);
     this.db.prepare("INSERT OR REPLACE INTO versions(version, status, data) VALUES (?, ?, ?)")
       .run(parsed.version, parsed.status, JSON.stringify(parsed));
-    this._status.set(parsed.version, parsed.status);
   }
 
   /**
@@ -297,7 +299,6 @@ export class SqliteStore {
       this.db.prepare("DELETE FROM versions WHERE version = ?").run(version);
     });
     tx();
-    this._status.delete(version);
   }
 
   /** Ids used by an entity type in *any* version, so an id is never reused. */
@@ -306,17 +307,18 @@ export class SqliteStore {
     return rows.map((r) => r.id);
   }
 
+  /**
+   * Read the lock state from the registry on every call.
+   *
+   * Deliberately uncached: the database file can be open in another process, so
+   * a cached "draft" could let this guard write to a baseline that has since
+   * been frozen. It is one indexed lookup and only runs on writes.
+   */
   async isLocked(): Promise<boolean> {
-    const version = await this.version();
-    let status = this._status.get(version);
-    if (!status) {
-      const row = await this.getVersion(version);
-      // An unregistered version is an open draft: that is the state a brand-new
-      // project is in before its first version row is written.
-      status = row?.status ?? "draft";
-      this._status.set(version, status);
-    }
-    return status === "locked";
+    const row = await this.getVersion(await this.version());
+    // An unregistered version is an open draft: that is the state a brand-new
+    // project is in before its first version row is written.
+    return (row?.status ?? "draft") === "locked";
   }
 
   // ---- generic versioned row helpers -------------------------------------
@@ -568,12 +570,17 @@ export class SqliteStore {
     tx();
   }
 
-  async readAllExecutions(opts?: { versions?: string[] }): Promise<Map<string, TExecution[]>> {
+  async readAllExecutions(
+    opts?: { versions?: string[]; carryOver?: boolean },
+  ): Promise<Map<string, TExecution[]>> {
     const phases = await this.listPhases();
     const out = new Map<string, TExecution[]>();
     for (const p of phases) out.set(p.id, await this.readExecutionLog(p.id, opts));
     // Results recorded against an ancestor version only count while the story
-    // they cover has not changed since — see src/version-carryover.ts.
+    // they cover has not changed since — see src/version-carryover.ts. That is a
+    // coverage-reporting rule, so callers that want the raw log (export, for one)
+    // opt out rather than silently losing history.
+    if (opts?.carryOver === false) return out;
     return applyCarryOver(this, out);
   }
 
