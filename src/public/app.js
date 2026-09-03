@@ -170,6 +170,19 @@ document.addEventListener('alpine:init', function () {
       // ── Server version ─────────────────────────────────────────────────────────
       appVersion: '',
 
+      // ── Specification versions (baselines) ────────────────────────────────────
+      // `activeVersion` is what every tab reads through: apiUrl() appends it to
+      // each request, so switching it re-scopes the whole dashboard at once.
+      versions: [],
+      versionMeta: { currentVersion: null, draftVersion: null },
+      activeVersion: '',
+      versionsLoading: false,
+      diffFrom: '',
+      diffTo: '',
+      diff: null,
+      diffLoading: false,
+      diffError: '',
+
       // =========================================================================
       // Lifecycle
       // =========================================================================
@@ -179,6 +192,7 @@ document.addEventListener('alpine:init', function () {
         if (vd && vd.version) this.appVersion = vd.version;
         await this.loadProjects();
         if (this.projects.length > 1) { this.tab = 'global'; }
+        await this.loadVersions();
         await this.loadConfig();
         await this.loadSummary();
         this.setupSSE();
@@ -257,6 +271,97 @@ document.addEventListener('alpine:init', function () {
         }
       },
 
+      // =========================================================================
+      // Specification versions
+      // =========================================================================
+
+      async loadVersions() {
+        this.versionsLoading = true;
+        // Read the registry unscoped: apiUrl() would otherwise pin the request
+        // to the version being listed, which is circular.
+        var p = '/api/versions';
+        if (this.projects.length > 1 && this.activeProject) p += '?project=' + this.activeProject.slug;
+        var d = await this._fetch(p);
+        if (d) {
+          this.versions = d.versions || [];
+          this.versionMeta = { currentVersion: d.currentVersion, draftVersion: d.draftVersion };
+          if (!this.activeVersion) {
+            this.activeVersion = d.currentVersion || d.draftVersion ||
+              (this.versions.length ? this.versions[this.versions.length - 1].version : '');
+          }
+          if (!this.diffTo && this.versions.length > 1) {
+            this.diffFrom = this.versions[this.versions.length - 2].version;
+            this.diffTo   = this.versions[this.versions.length - 1].version;
+          }
+        }
+        this.versionsLoading = false;
+      },
+
+      /** Re-read every tab through another baseline. */
+      async switchVersion(version) {
+        if (!version || version === this.activeVersion) return;
+        this.activeVersion = version;
+        await Promise.all([
+          this.loadConfig(),
+          this.loadSummary(),
+          this.loadRequirements(),
+          this.loadStories(),
+          this.loadComponents(),
+          this.loadPhases(),
+          this.loadAdrs(),
+          this.loadCoverage(),
+          this.loadTrend(),
+          this.loadGaps(),
+        ]);
+        if (this.tab === 'scenarios') this.loadScenarios();
+        if (this.tab === 'screens') this.loadScreens();
+      },
+
+      async loadDiff() {
+        if (!this.diffFrom || !this.diffTo || this.diffFrom === this.diffTo) return;
+        this.diffLoading = true;
+        this.diffError = '';
+        this.diff = null;
+        var p = '/api/versions/diff?from=' + encodeURIComponent(this.diffFrom) + '&to=' + encodeURIComponent(this.diffTo);
+        if (this.projects.length > 1 && this.activeProject) p += '&project=' + this.activeProject.slug;
+        try {
+          var res = await window.fetch(p);
+          var body = await res.json();
+          if (!res.ok) { this.diffError = body && body.error ? body.error : 'Comparison failed'; }
+          else { this.diff = body; }
+        } catch (e) {
+          this.diffError = String(e);
+        }
+        this.diffLoading = false;
+      },
+
+      /** Entity types with at least one difference, so an unchanged type is hidden. */
+      diffEntityNames() {
+        if (!this.diff) return [];
+        var sum = this.diff.summary || {};
+        return Object.keys(sum).filter(function (k) {
+          return sum[k].added > 0 || sum[k].removed > 0 || sum[k].modified > 0;
+        });
+      },
+
+      diffIsIdentical() {
+        return this.diffEntityNames().length === 0;
+      },
+
+      /** One-line rendering of a field value for the diff list. */
+      brief(v) {
+        if (v === undefined || v === null) return '∅';
+        var s = typeof v === 'string' ? v : JSON.stringify(v);
+        s = s.replace(/\s+/g, ' ').trim();
+        return s.length > 80 ? s.slice(0, 80) + '…' : (s || '∅');
+      },
+
+      shortDate(iso) {
+        if (!iso) return '—';
+        var d = new Date(iso);
+        return isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 10);
+      },
+
       async switchProject(slug) {
         var self = this;
         var found = this.projects.find(function (p) { return p.slug === slug; });
@@ -276,6 +381,10 @@ document.addEventListener('alpine:init', function () {
         this.setupSSE();
         // Load config + summary first so that coveragePhase is set to the new
         // project's activePhase before loadCoverage() reads it.
+        this.activeVersion = '';
+        this.versions = [];
+        this.diff = null;
+        await this.loadVersions();
         await Promise.all([self.loadConfig(), self.loadSummary()]);
         // Now load the remaining data in parallel using the correct coveragePhase.
         await Promise.all([
@@ -680,6 +789,7 @@ document.addEventListener('alpine:init', function () {
         if (id === 'scenarios')  { this.loadScenarios(); }
         if (id === 'screens')    { this.loadScreens(); }
         if (id === 'adrs')       { this.loadAdrs(); }
+        if (id === 'versions')   { this.loadVersions(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -703,8 +813,8 @@ document.addEventListener('alpine:init', function () {
        */
       shiftFocus(dir) {
         var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios']
-          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios'];
+          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions']
+          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions'];
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }
@@ -723,9 +833,16 @@ document.addEventListener('alpine:init', function () {
        * query string by using '&' instead of '?'.
        */
       apiUrl: function (p) {
-        if (this.projects.length <= 1 || !this.activeProject) return p;
-        var sep = p.indexOf('?') === -1 ? '?' : '&';
-        return p + sep + 'project=' + this.activeProject.slug;
+        var out = p;
+        if (this.projects.length > 1 && this.activeProject) {
+          out += (out.indexOf('?') === -1 ? '?' : '&') + 'project=' + this.activeProject.slug;
+        }
+        // Scope every read to the selected baseline. Omitted while the project
+        // has a single version, so the request looks exactly as it always did.
+        if (this.activeVersion && this.versions.length > 1) {
+          out += (out.indexOf('?') === -1 ? '?' : '&') + 'version=' + encodeURIComponent(this.activeVersion);
+        }
+        return out;
       },
 
       // =========================================================================
