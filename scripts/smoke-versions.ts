@@ -63,6 +63,12 @@ async function main() {
     await call("create_user_story", { title: "Cancel a booking", requirements: ["REQ-002"], id: "US-002" });
     await call("create_adr", { title: "Store bookings in Postgres", id: "ADR-001", content: "# Store bookings in Postgres\n\n## Status\n\nAccepted\n", requirements: ["REQ-001"] });
 
+    // Both stories pass in 1.0.0, so their results are candidates for carry-over.
+    await call("record_execution", { feature: "Booking", name: "Book a slot", status: "pass" });
+    await call("record_execution", { feature: "Booking", name: "Cancel a booking", status: "pass" });
+    const base = await call("coverage_report", { mode: "cumulative" });
+    check("1.0.0 covers both stories", base.data.summary.storiesCovered === 2, base.data.summary);
+
     // --- locking -------------------------------------------------------------
     const locked = await call("lock_version", { actor: "ba@example.com", reason: "Sprint 1 baseline" });
     check("lock_version locks the draft", locked.data.version === "1.0.0" && locked.data.status === "locked", locked.data);
@@ -136,6 +142,21 @@ async function main() {
 
     const scoped = await call("diff_versions", { from: "1.0.0", to: "1.1.0", entity: "stories" });
     check("diff_versions can be scoped to one entity", Object.keys(scoped.data.entities).length === 1 && !!scoped.data.entities.stories, scoped.data);
+
+    // --- coverage carries over only for unchanged stories ---------------------
+    // US-002's scope changed in 1.1.0, so its 1.0.0 pass no longer counts.
+    const reworded = await call("update_user_story", { id: "US-002", title: "Cancel a confirmed booking" });
+    check("story reworded in the draft", reworded.isError === false, reworded.data);
+
+    const carried = await call("coverage_report", { mode: "cumulative", version: "1.1.0" });
+    check("1.1.0 carries over the unchanged story", carried.data.summary.storiesCovered === 1, carried.data.summary);
+    const stillLocked = await call("coverage_report", { mode: "cumulative", version: "1.0.0" });
+    check("the locked baseline still reports both covered", stillLocked.data.summary.storiesCovered === 2, stillLocked.data.summary);
+
+    // Re-running against 1.1.0 restores it.
+    await call("record_execution", { feature: "Booking", name: "Cancel a booking", status: "pass", version: "1.1.0" });
+    const rerun = await call("coverage_report", { mode: "cumulative", version: "1.1.0" });
+    check("re-running against 1.1.0 restores coverage", rerun.data.summary.storiesCovered === 2, rerun.data.summary);
 
     // --- ids never collide across versions ------------------------------------
     const reallocated = await call("create_requirement", { title: "Another one" });

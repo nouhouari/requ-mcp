@@ -29,6 +29,7 @@ import {
   type VersionedEntity,
 } from "./schema.js";
 import { assertWritable, compareSemver } from "./versioning.js";
+import { applyCarryOver } from "./version-carryover.js";
 import { nextId } from "./ids.js";
 
 const SCHEMA_SQL = `
@@ -555,7 +556,9 @@ export class SqliteStore {
     const phases = await this.listPhases();
     const out = new Map<string, TExecution[]>();
     for (const p of phases) out.set(p.id, await this.readExecutionLog(p.id, opts));
-    return out;
+    // Results recorded against an ancestor version only count while the story
+    // they cover has not changed since — see src/version-carryover.ts.
+    return applyCarryOver(this, out);
   }
 
   // --- vcs refs (tagged) ---
