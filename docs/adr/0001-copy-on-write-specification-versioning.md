@@ -85,6 +85,16 @@ cannot hold different gherkin in two versions — regenerating a scenario for v2
 overwrites v1's text. Promoting scenarios into the copy-on-write set is a
 contained follow-up if that becomes a problem.
 
+Negative: progress recorded against a locked baseline does not propagate into
+the open draft. Marking a story done in v1.0.0 leaves the copy in the v1.1.0
+draft at whatever status it held when the draft branched, so when v1.1.0 is
+locked and becomes current the progress appears to revert. This falls out of
+copy-on-write combined with routing progress to the baseline being delivered,
+and both halves are wanted individually. The pragmatic answer for now is that
+`status` is one of the fields that stays writable while locked, so it can be
+re-asserted on the new baseline; a carry-forward of progress at lock time is the
+obvious improvement if this proves annoying.
+
 Neutral: SQLite cannot change a primary key with `ALTER TABLE`, so the migration
 rebuilds each table (create, copy, drop, rename) in one transaction. It is
 idempotent and guarded by a column check, and runs before any read.

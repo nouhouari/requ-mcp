@@ -288,6 +288,36 @@ async function main() {
       lockedAfterReimport.data.versions.find((v: any) => v.version === "1.1.0").status === "locked",
       lockedAfterReimport.data.versions,
     );
+
+    // --- a tool's own `version` field is content, not addressing ----------------
+    // create_version names the version it makes; a screen's version is a content
+    // hash. Neither may be swallowed by the injected addressing parameter.
+    await call("lock_version", { atVersion: "1.2.0", actor: "ba@example.com" });
+    const named = await call("create_version", { version: "2.0.0", label: "Explicit" });
+    check("create_version accepts an explicit version", named.isError !== true, named);
+    const afterNamed = await call("list_versions");
+    check(
+      "…and it appears in the registry",
+      afterNamed.data.versions.some((v: any) => v.version === "2.0.0"),
+      afterNamed.data.versions.map((v: any) => v.version),
+    );
+
+    const scr = await call("create_or_update_screen", {
+      id: "SCR-V", name: "Versioned", platform: "web",
+      html: "<main>hello</main>", version: "1.0.0",
+    });
+    check("a screen keeps its own version field", scr.isError !== true, scr);
+    const scrRead = await call("get_screen", { id: "SCR-V", version: "2.0.0" });
+    check("…stored in the draft, not the version it names", scrRead.isError !== true, scrRead);
+    check("…with its content version intact", scrRead.data?.version === "1.0.0", scrRead.data);
+
+    // --- REST import targets the draft, not the locked baseline -----------------
+    const payload = await call("export_project", { version: "2.0.0" });
+    const imported = await api("/api/import", {
+      method: "POST",
+      body: JSON.stringify(JSON.parse(payload.data)),
+    });
+    check("POST /api/import succeeds with a locked baseline present", imported.status === 200, imported.body);
   } finally {
     await h.stop();
     await fs.rm(tmp, { recursive: true, force: true });

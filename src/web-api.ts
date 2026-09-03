@@ -1659,7 +1659,20 @@ export async function handleWebRequest(
           jsonError(res, 400, `Invalid export format: ${result.error.message}`);
           return true;
         }
-        const report = await applyImport(r.store, result.data, { allVersions: searchParams.get("allVersions") !== "false" });
+        // Import writes specification, so without an explicit ?version= it must
+        // aim at the open draft — the same target the import_project tool picks.
+        // The unbound store resolves to the current version, which is the locked
+        // baseline once one exists, and every write would be refused.
+        let target = r.store;
+        if (!searchParams.get("version")) {
+          const cfg = await r.store.readConfig();
+          const draft = cfg.draftVersion ?? cfg.currentVersion;
+          if (draft) target = r.store.at(draft) as AnyHttpStore;
+        }
+        const report = await applyImport(target, result.data, {
+          allVersions: searchParams.get("allVersions") !== "false",
+          force: searchParams.get("force") === "true",
+        });
         jsonOk(res, report);
       } catch (err) {
         const msg = (err as Error).message;

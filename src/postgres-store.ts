@@ -198,7 +198,12 @@ WHERE key = 'config'
 export function initPgPool(connectionString: string): void {
   if (_pool) return;
   _pool = new Pool({ connectionString });
+  // Kick the migration off eagerly, but swallow the rejection *here*: nothing is
+  // awaiting this assignment yet, and an unhandled rejection would kill the
+  // process before the retry below could run. Callers await `_schemaReady`
+  // themselves and still see the error.
   _schemaReady = runSchema();
+  _schemaReady.catch(() => {});
 }
 
 /**

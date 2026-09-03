@@ -341,6 +341,16 @@ the version the team is *delivering*, while `update_user_story`'s title change
 defaults to the version the BA is *writing*. `set_active_version` moves either
 pointer.
 
+The split is decided per call, not per tool, because several tools do both. A
+call to `update_user_story` that sets only `status` is a progress update and
+lands on the locked baseline; the same tool given a `title` is a scope change
+and lands on the draft. The rule is the freeze matrix above: supply nothing but
+fields that stay writable while locked, and the call is treated as progress.
+
+A few tools own a `version` field of their own — the version `create_version` is
+about to create, or a screen's content hash. Those are addressed with
+`atVersion` instead, so their own field keeps its meaning.
+
 ### Versions and phases are different things
 
 A **phase** is a release slot (P1, P2…) — planning. A **version** is a content

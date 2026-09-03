@@ -308,14 +308,23 @@ const versionSchema = z
  * version is locked. `key`, `version` and the entity id are transport/addressing,
  * not content, so they do not count either way.
  */
-const ADDRESSING_ARGS = new Set(["key", "version", "id", "storyId", "screenId", "adrId"]);
+const ADDRESSING_ARGS = new Set(["key", "atVersion", "id", "storyId", "screenId", "adrId"]);
 
-function isProgressOnlyPayload(entity: VersionedEntity, args: Record<string, unknown>): boolean {
+function isProgressOnlyPayload(
+  entity: VersionedEntity,
+  args: Record<string, unknown>,
+  ownsVersion: boolean,
+): boolean {
   const allowed = new Set<string>(MUTABLE_WHILE_LOCKED[entity]);
   if (allowed.size === 0) return false;
-  const supplied = Object.keys(args).filter(
-    (k) => args[k] !== undefined && !ADDRESSING_ARGS.has(k),
-  );
+  const supplied = Object.keys(args).filter((k) => {
+    if (args[k] === undefined) return false;
+    if (ADDRESSING_ARGS.has(k)) return false;
+    // `version` is addressing for most tools but content for the few that
+    // declare one, and content must count towards the decision.
+    if (k === "version") return ownsVersion;
+    return true;
+  });
   return supplied.length > 0 && supplied.every((k) => allowed.has(k));
 }
 
@@ -326,6 +335,7 @@ async function bindVersion(
   toolName: string,
   entity?: VersionedEntity,
   args?: Record<string, unknown>,
+  ownsVersion = false,
 ): Promise<AnyStore> {
   // init_project creates the project (and its first version), so there is nothing
   // to resolve against yet.
@@ -343,7 +353,7 @@ async function bindVersion(
   // ADR accepted. Those belong on the baseline the team is delivering, so they
   // resolve like progress and are allowed to land on a locked version.
   const progressOnly = mutates === "spec" && entity !== undefined && args !== undefined
-    && isProgressOnlyPayload(entity, args);
+    && isProgressOnlyPayload(entity, args, ownsVersion);
   const effective: Mutates | undefined = progressOnly ? "progress" : mutates;
 
   const target =
@@ -441,9 +451,19 @@ function createServer(): McpServer {
     // Every tool accepts `key` as the HTTP-mode project identifier. Tools that
     // already declare their own `key` (e.g. init_project) keep their definition.
     if (!("key" in inputSchema)) inputSchema.key = keySchema;
-    // …and `version` to address a specification baseline. Omitted, it resolves to
-    // the project's draft (for specification edits) or current version (otherwise).
-    if (!("version" in inputSchema)) inputSchema.version = versionSchema;
+
+    // …and a parameter addressing the specification baseline. Omitted, it
+    // resolves to the project's draft (for specification edits) or current
+    // version (otherwise).
+    //
+    // A few tools own a `version` field of their own — the name of the version
+    // create_version is about to make, or a screen's content hash. Injecting
+    // over those would be silently destructive, so they are addressed with
+    // `atVersion` instead and their own field stays content.
+    const ownsVersion = "version" in base;
+    const addressArg = ownsVersion ? "atVersion" : "version";
+    inputSchema[addressArg] = versionSchema;
+
     server.registerTool(
       name,
       { title: config.title, description: config.description, inputSchema },
@@ -451,7 +471,9 @@ function createServer(): McpServer {
         try {
           const selector = selectorFor(name, args);
           const store = await getStore(server, selector, name === "init_project");
-          const bound = await bindVersion(store, args.version, mutates, name, entity, args);
+          const bound = await bindVersion(
+            store, args[addressArg], mutates, name, entity, args, ownsVersion,
+          );
           return (await handler(args, bound)) as ReturnType<typeof json>;
         } catch (e) {
           return fail((e as Error).message);
@@ -3248,6 +3270,7 @@ tool(
     inputSchema: {
       data: z.string().describe("JSON string produced by export_project"),
       allVersions: z.boolean().optional().describe("Restore the payload's whole version history when it has one. Default true."),
+      force: z.boolean().optional().describe("Overwrite a version that already exists and is locked. Off by default: a locked baseline is left untouched and reported instead."),
     },
   },
   async (args, store) => {
@@ -3262,7 +3285,7 @@ tool(
     if (!parsed.success) {
       return fail(`Invalid export format: ${parsed.error.message}`);
     }
-    const report = await applyImport(store, parsed.data, { allVersions: args.allVersions });
+    const report = await applyImport(store, parsed.data, { allVersions: args.allVersions, force: args.force });
     return json(report);
   },
   "spec",
