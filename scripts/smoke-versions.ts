@@ -180,6 +180,32 @@ async function main() {
     check("unlock_version reopens a locked baseline with force", reopened.data.status === "draft", reopened.data);
     check("…and records it as the draft", reopened.data.draftVersion === "1.1.0", reopened.data);
 
+    // --- REST parity -----------------------------------------------------------
+    const api = async (p: string, init?: RequestInit) => {
+      const res = await fetch(`${h.base}${p}`, init);
+      return { status: res.status, body: await res.json().catch(() => null) as any };
+    };
+
+    const restVersions = await api("/api/versions");
+    check("GET /api/versions lists the history", restVersions.body.versions.length === 2, restVersions.body);
+    // 1.1.0 became current when it was locked a few lines above, then reopened.
+    check("GET /api/versions reports the pointers", restVersions.body.currentVersion === "1.1.0" && restVersions.body.draftVersion === "1.1.0", restVersions.body);
+
+    const restBaseline = await api("/api/requirements?version=1.0.0");
+    check("?version= scopes a read route", !JSON.stringify(restBaseline.body).includes("REQ-003"), restBaseline.body?.length);
+    const restDraft = await api("/api/requirements?version=1.1.0");
+    check("?version= reaches the draft", JSON.stringify(restDraft.body).includes("REQ-003"), restDraft.body?.length);
+
+    const restDiff = await api("/api/versions/diff?from=1.0.0&to=1.1.0");
+    check("GET /api/versions/diff matches the tool", restDiff.body.summary.requirements.added === 2, restDiff.body.summary);
+    const restBadDiff = await api("/api/versions/diff?from=9.9.9&to=1.1.0");
+    check("GET /api/versions/diff 404s an unknown version", restBadDiff.status === 404, restBadDiff.body);
+    const restNoFrom = await api("/api/versions/diff");
+    check("GET /api/versions/diff 400s without from", restNoFrom.status === 400, restNoFrom.body);
+
+    const restConflict = await api("/api/versions", { method: "POST", body: JSON.stringify({ bump: "minor" }) });
+    check("POST /api/versions 409s while a draft is open", restConflict.status === 409, restConflict.body);
+
     const history = await call("list_versions");
     const v11 = history.data.versions.find((v: any) => v.version === "1.1.0");
     check("the audit trail keeps the lock timestamps", !!v11.lockedAt && !!v11.unlockedAt, v11);

@@ -16,6 +16,8 @@ import { PostgresStore } from "./postgres-store.js";
 type AnyHttpStore = SqliteStore | PostgresStore;
 import { stringify as yamlStringify } from "yaml";
 import { indexConductor, scenariosByStory, validateTestRef } from "./conductor.js";
+import { diffVersions } from "./version-diff.js";
+import { createVersion, lockVersion, unlockVersion, setActiveVersion } from "./version-ops.js";
 import {
   buildReport,
   buildTrend,
@@ -113,6 +115,30 @@ async function collectBody(req: IncomingMessage, maxBytes = 10 * 1024 * 1024): P
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
+}
+
+/**
+ * Read a JSON request body, answering 400 and returning null when it is absent
+ * or malformed. An empty body is an empty object, so endpoints whose parameters
+ * are all optional can be POSTed with no payload.
+ */
+async function parseJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | null> {
+  const raw = (await collectBody(req)).trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      jsonError(res, 400, "Request body must be a JSON object");
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    jsonError(res, 400, "Request body is not valid JSON");
+    return null;
+  }
 }
 
 /**
@@ -473,17 +499,29 @@ type StoreResult =
   | { status: "ambiguous"; available: string[] }
   | { status: "unknown_project"; slug: string };
 
+/**
+ * Resolve the project, then the specification version, from the query string.
+ *
+ * `?version=` binds every read below this point to that baseline. Omitted, the
+ * store resolves the project's current version itself, so an unversioned caller
+ * keeps seeing exactly what it saw before. Because every route goes through
+ * here, no individual handler needs to know versions exist.
+ */
 function resolveStore(
   stores: Map<string, AnyHttpStore>,
   searchParams: URLSearchParams,
 ): StoreResult {
   if (stores.size === 0) return { status: "not_initialized" };
-  if (stores.size === 1) return { status: "ok", store: [...stores.values()][0] };
+  const atVersion = (store: AnyHttpStore): AnyHttpStore => {
+    const version = searchParams.get("version");
+    return version ? (store.at(version) as AnyHttpStore) : store;
+  };
+  if (stores.size === 1) return { status: "ok", store: atVersion([...stores.values()][0]) };
   const slug = searchParams.get("project");
   if (!slug) return { status: "ambiguous", available: [...stores.keys()] };
   const store = stores.get(slug);
   if (!store) return { status: "unknown_project", slug };
-  return { status: "ok", store };
+  return { status: "ok", store: atVersion(store) };
 }
 
 function handleStoreResult(
@@ -862,6 +900,117 @@ export async function handleWebRequest(
           })
         );
         jsonOk(res, results.filter(Boolean));
+      } catch (err) { jsonError(res, 500, String(err)); }
+      return true;
+    }
+
+    // --- GET /api/versions --- (history + which version reads and edits default to)
+    if (matchRoute(pathname, method, "/api/versions", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const [versions, cfg] = await Promise.all([r.store.listVersions(), r.store.readConfig()]);
+        jsonOk(res, {
+          currentVersion: cfg.currentVersion ?? null,
+          draftVersion: cfg.draftVersion ?? null,
+          versions,
+        });
+      } catch (err) { jsonError(res, 500, String(err)); }
+      return true;
+    }
+
+    // --- GET /api/versions/diff --- (?from=&to=&entity=)
+    if (matchRoute(pathname, method, "/api/versions/diff", "GET") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const cfg = await r.store.readConfig();
+        const known = await r.store.listVersions();
+        const from = searchParams.get("from");
+        const to = searchParams.get("to") ?? cfg.draftVersion ?? cfg.currentVersion ?? null;
+        if (!from) { jsonError(res, 400, "Missing required query parameter: from"); return true; }
+        if (!to) { jsonError(res, 400, "Missing required query parameter: to"); return true; }
+        for (const v of [from, to]) {
+          if (known.length && !known.some((k) => k.version === v)) {
+            jsonError(res, 404, `Unknown version '${v}'`);
+            return true;
+          }
+        }
+        if (from === to) { jsonError(res, 400, `from and to are both '${to}'`); return true; }
+        const diff = await diffVersions(r.store, from, to, {
+          includeFieldChanges: searchParams.get("fields") !== "false",
+        });
+        const entity = searchParams.get("entity");
+        if (!entity) { jsonOk(res, diff); return true; }
+        if (!(entity in diff.entities)) { jsonError(res, 400, `Unknown entity '${entity}'`); return true; }
+        jsonOk(res, {
+          from: diff.from,
+          to: diff.to,
+          summary: { [entity]: diff.summary[entity] },
+          entities: { [entity]: diff.entities[entity] },
+        });
+      } catch (err) { jsonError(res, 500, String(err)); }
+      return true;
+    }
+
+    // --- POST /api/versions --- (branch the next version)
+    if (matchRoute(pathname, method, "/api/versions", "POST") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const body = await parseJsonBody(req, res);
+        if (body === null) return true;
+        const result = await createVersion(r.store, body as never);
+        if (!result.ok) { jsonError(res, 409, result.error); return true; }
+        jsonOk(res, result.data);
+      } catch (err) { jsonError(res, 500, String(err)); }
+      return true;
+    }
+
+    // --- POST /api/versions/:version/lock ---
+    {
+      const params = matchRoute(pathname, method, "/api/versions/:version/lock", "POST");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const body = await parseJsonBody(req, res);
+          if (body === null) return true;
+          const result = await lockVersion(r.store, params.version, body as never);
+          if (!result.ok) { jsonError(res, 409, result.error); return true; }
+          jsonOk(res, result.data);
+        } catch (err) { jsonError(res, 500, String(err)); }
+        return true;
+      }
+    }
+
+    // --- POST /api/versions/:version/unlock --- (needs force:true in the body)
+    {
+      const params = matchRoute(pathname, method, "/api/versions/:version/unlock", "POST");
+      if (params !== null) {
+        const r = resolveStore(stores, searchParams);
+        if (!handleStoreResult(res, r)) return true;
+        try {
+          const body = await parseJsonBody(req, res);
+          if (body === null) return true;
+          const result = await unlockVersion(r.store, params.version, body as never);
+          if (!result.ok) { jsonError(res, 409, result.error); return true; }
+          jsonOk(res, result.data);
+        } catch (err) { jsonError(res, 500, String(err)); }
+        return true;
+      }
+    }
+
+    // --- POST /api/versions/active --- (move the current/draft pointers)
+    if (matchRoute(pathname, method, "/api/versions/active", "POST") !== null) {
+      const r = resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const body = await parseJsonBody(req, res);
+        if (body === null) return true;
+        const result = await setActiveVersion(r.store, body as never);
+        if (!result.ok) { jsonError(res, 400, result.error); return true; }
+        jsonOk(res, result.data);
       } catch (err) { jsonError(res, 500, String(err)); }
       return true;
     }

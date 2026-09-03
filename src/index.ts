@@ -50,6 +50,7 @@ import {
 import { SEMVER_RE } from "./schema.js";
 import { bumpSemver, compareSemver } from "./versioning.js";
 import { diffVersions } from "./version-diff.js";
+import { createVersion, lockVersion, unlockVersion, setActiveVersion } from "./version-ops.js";
 import {
   danglingStoryTags,
   indexConductor,
@@ -724,67 +725,9 @@ tool(
     },
   },
   async (args, store) => {
-    const cfg = await store.readConfig();
-    const existing = await store.listVersions();
-
-    const draft = existing.find((v) => v.status === "draft");
-    if (draft) {
-      return fail(
-        `Version ${draft.version} is still an open draft. Lock it before creating the next version, ` +
-          `so exactly one version is editable at a time.`,
-      );
-    }
-
-    const from = args.from ?? cfg.currentVersion ?? cfg.draftVersion ?? INITIAL_VERSION;
-    const parent = existing.find((v) => v.version === from);
-    if (existing.length && !parent) {
-      return fail(`Unknown source version '${from}'. Known: [${existing.map((v) => v.version).join(", ")}].`);
-    }
-
-    let target: string;
-    if (args.version) {
-      if (!SEMVER_RE.test(args.version)) return fail(`'${args.version}' is not a semver like 1.2.0.`);
-      target = args.version;
-    } else {
-      target = bumpSemver(from, args.bump ?? "minor");
-    }
-    if (existing.some((v) => v.version === target)) return fail(`Version ${target} already exists.`);
-    if (compareSemver(target, from) <= 0) {
-      return fail(`New version ${target} must be greater than its parent ${from}.`);
-    }
-
-    // Copy first, register second: a half-copied version that is not in the
-    // registry is invisible, whereas a registered empty one would look valid.
-    let counts: Record<string, number>;
-    try {
-      counts = await store.copyVersion(from, target);
-      await store.writeVersion({
-        version: target,
-        status: "draft",
-        label: args.label ?? "",
-        parent: from,
-        createdAt: now(),
-        actor: args.actor,
-        reason: args.reason,
-      });
-    } catch (e) {
-      await store.dropVersion(target).catch(() => {});
-      return fail(`Could not create version ${target}: ${(e as Error).message}`);
-    }
-
-    if (args.setDraft !== false) {
-      await store.writeConfig({ ...cfg, draftVersion: target });
-    }
-
-    return json({
-      created: target,
-      from,
-      status: "draft",
-      copied: counts,
-      draftVersion: args.setDraft !== false ? target : (cfg.draftVersion ?? null),
-      currentVersion: cfg.currentVersion ?? null,
-    });
-  },
+    const r = await createVersion(store, args);
+    return r.ok ? json(r.data) : fail(r.error);
+  }
 );
 
 tool(
@@ -804,27 +747,8 @@ tool(
     },
   },
   async (args, store) => {
-    const target = await store.version();
-    const row = await store.getVersion(target);
-    if (!row) return fail(`Version ${target} is not registered. Run list_versions to see what exists.`);
-    if (row.status === "locked") return json({ version: target, status: "locked", alreadyLocked: true });
-
-    await store.writeVersion({ ...row, status: "locked", lockedAt: now(), actor: args.actor ?? row.actor, reason: args.reason ?? row.reason });
-
-    const cfg = await store.readConfig();
-    const next = { ...cfg };
-    if (args.setCurrent !== false) next.currentVersion = target;
-    // The draft pointer no longer has anywhere to go: create_version reopens one.
-    if (cfg.draftVersion === target) next.draftVersion = undefined;
-    await store.writeConfig(next);
-
-    return json({
-      version: target,
-      status: "locked",
-      currentVersion: next.currentVersion ?? null,
-      draftVersion: next.draftVersion ?? null,
-      hint: "Specification edits now require a new version — run create_version.",
-    });
+    const r = await lockVersion(store, await store.version(), args);
+    return r.ok ? json(r.data) : fail(r.error);
   },
   "spec",
 );
@@ -845,37 +769,9 @@ tool(
     },
   },
   async (args, store) => {
-    const target = await store.version();
-    const row = await store.getVersion(target);
-    if (!row) return fail(`Version ${target} is not registered.`);
-    if (row.status !== "locked") return json({ version: target, status: row.status, alreadyOpen: true });
-    if (args.force !== true) {
-      return fail(
-        `Unlocking ${target} changes a baseline a team may already be building against. ` +
-          `Prefer create_version to put the change in the next version. Pass force:true to unlock anyway.`,
-      );
-    }
-
-    const other = (await store.listVersions()).find((v) => v.status === "draft");
-    if (other) {
-      return fail(
-        `Version ${other.version} is already an open draft. Only one version may be editable at a time.`,
-      );
-    }
-
-    await store.writeVersion({
-      ...row,
-      status: "draft",
-      unlockedAt: now(),
-      actor: args.actor ?? row.actor,
-      reason: args.reason ?? row.reason,
-    });
-
-    const cfg = await store.readConfig();
-    await store.writeConfig({ ...cfg, draftVersion: target });
-
-    return json({ version: target, status: "draft", draftVersion: target, forced: true });
-  },
+    const r = await unlockVersion(store, await store.version(), args);
+    return r.ok ? json(r.data) : fail(r.error);
+  }
 );
 
 tool(
@@ -892,28 +788,9 @@ tool(
     },
   },
   async (args, store) => {
-    if (!args.current && !args.draft) return fail("Give current, draft, or both.");
-    const known = await store.listVersions();
-    const byId = new Map(known.map((v) => [v.version, v]));
-
-    for (const [field, value] of [["current", args.current], ["draft", args.draft]] as const) {
-      if (value && known.length && !byId.has(value)) {
-        return fail(`Unknown version '${value}' for ${field}. Known: [${known.map((v) => v.version).join(", ")}].`);
-      }
-    }
-    if (args.draft && byId.get(args.draft)?.status === "locked") {
-      return fail(`Version ${args.draft} is locked and cannot be the draft. Unlock it or create a new version.`);
-    }
-
-    const cfg = await store.readConfig();
-    const next = {
-      ...cfg,
-      currentVersion: args.current ?? cfg.currentVersion,
-      draftVersion: args.draft ?? cfg.draftVersion,
-    };
-    await store.writeConfig(next);
-    return json({ currentVersion: next.currentVersion ?? null, draftVersion: next.draftVersion ?? null });
-  },
+    const r = await setActiveVersion(store, { current: args.current, draft: args.draft });
+    return r.ok ? json(r.data) : fail(r.error);
+  }
 );
 
 tool(
