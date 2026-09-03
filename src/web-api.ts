@@ -1610,7 +1610,7 @@ export async function handleWebRequest(
       const r = resolveStore(stores, searchParams);
       if (!handleStoreResult(res, r)) return true;
       try {
-        const payload = await buildExport(r.store);
+        const payload = await buildExport(r.store, { allVersions: searchParams.get("allVersions") === "true" });
         const body = JSON.stringify(payload, null, 2);
         // Strip to a safe allowlist before reflecting into a response header.
         const rawSlug = searchParams.get("project") ?? "project";
@@ -1642,7 +1642,7 @@ export async function handleWebRequest(
           jsonError(res, 400, `Invalid export format: ${result.error.message}`);
           return true;
         }
-        const report = await applyImport(r.store, result.data);
+        const report = await applyImport(r.store, result.data, { allVersions: searchParams.get("allVersions") !== "false" });
         jsonOk(res, report);
       } catch (err) {
         const msg = (err as Error).message;

@@ -180,6 +180,23 @@ async function main() {
     check("unlock_version reopens a locked baseline with force", reopened.data.status === "draft", reopened.data);
     check("…and records it as the draft", reopened.data.draftVersion === "1.1.0", reopened.data);
 
+    // --- export / import round-trip ---------------------------------------------
+    const oneVersion = await call("export_project", { version: "1.0.0" });
+    const onePayload = JSON.parse(oneVersion.data);
+    check("export defaults to a single version", onePayload.projectVersion === "1.0.0" && Object.keys(onePayload.versionedData).length === 0, { pv: onePayload.projectVersion, keys: Object.keys(onePayload.versionedData) });
+    check("a single-version export omits REQ-003", !onePayload.data.requirements.some((r: any) => r.id === "REQ-003"), onePayload.data.requirements.map((r: any) => r.id));
+
+    const full = await call("export_project", { allVersions: true });
+    const fullPayload = JSON.parse(full.data);
+    check("allVersions export carries the registry", fullPayload.versions.length === 2, fullPayload.versions);
+    check("allVersions export carries the other version", Object.keys(fullPayload.versionedData).length === 1, Object.keys(fullPayload.versionedData));
+
+    const restored = await call("import_project", { data: full.data, key: h.key });
+    check("re-importing the history is a no-op", restored.isError === false, restored.data);
+    const afterImport = await call("list_versions");
+    check("re-import does not duplicate versions", afterImport.data.versions.length === 2, afterImport.data.versions.map((v: any) => v.version));
+    check("re-import preserves the lock state", afterImport.data.versions.find((v: any) => v.version === "1.0.0").status === "locked", afterImport.data.versions);
+
     // --- REST parity -----------------------------------------------------------
     const api = async (p: string, init?: RequestInit) => {
       const res = await fetch(`${h.base}${p}`, init);

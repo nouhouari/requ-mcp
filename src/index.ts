@@ -3186,12 +3186,14 @@ tool(
   {
     title: "Export project",
     description:
-      "Export all project data (components, requirements, stories, scenarios, screens, architecture decisions, phases, executions, VCS refs) as a JSON string. Pass the result to import_project on another instance to migrate or copy data.",
-    inputSchema: {},
+      "Export project data (components, requirements, stories, scenarios, screens, architecture decisions, phases, executions, VCS refs) as a JSON string. Exports one specification version — the current baseline unless you pass version — or the whole history with allVersions. Pass the result to import_project on another instance to migrate or copy data.",
+    inputSchema: {
+      allVersions: z.boolean().optional().describe("Include every specification version and the version registry, not just one. Default false."),
+    },
   },
-  async (_args, store) => {
+  async (args, store) => {
     await ensureInit(store);
-    const payload = await buildExport(store);
+    const payload = await buildExport(store, { allVersions: args.allVersions === true });
     return json(JSON.stringify(payload, null, 2));
   },
 );
@@ -3201,9 +3203,10 @@ tool(
   {
     title: "Import project",
     description:
-      "Import project data from a JSON string produced by export_project. Existing records (same ID) are skipped and reported. Returns a summary of what was imported and what was skipped.",
+      "Import project data from a JSON string produced by export_project. Existing records (same ID) are skipped and reported. A payload containing a version registry restores every version with its lock state; pass allVersions:false to collapse it into the target version instead. Returns a summary of what was imported and what was skipped.",
     inputSchema: {
       data: z.string().describe("JSON string produced by export_project"),
+      allVersions: z.boolean().optional().describe("Restore the payload's whole version history when it has one. Default true."),
     },
   },
   async (args, store) => {
@@ -3218,7 +3221,7 @@ tool(
     if (!parsed.success) {
       return fail(`Invalid export format: ${parsed.error.message}`);
     }
-    const report = await applyImport(store, parsed.data);
+    const report = await applyImport(store, parsed.data, { allVersions: args.allVersions });
     return json(report);
   },
   "spec",
