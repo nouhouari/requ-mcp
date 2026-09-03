@@ -1863,6 +1863,7 @@
           <p class="text-sm text-slate-600 max-w-2xl">
             A version is a frozen set of requirements, stories, screens, decisions, components and phases.
             Locking one lets a team build against a stable baseline while the next version is prepared.
+            <span class="block mt-1 text-slate-500">Select a version below to read it — every other tab re-scopes to your selection.</span>
           </p>
           <div class="ml-auto flex items-center gap-3 text-xs">
             <span class="text-slate-500">Reading</span>
@@ -1906,13 +1907,17 @@
                 </thead>
                 <tbody>
                   <template x-for="v in versions" :key="v.version">
-                    <tr :class="v.version === activeVersion ? 'bg-indigo-50/60' : ''">
+                    <tr :class="v.version === activeVersion ? 'bg-indigo-50 shadow-[inset_3px_0_0_0_#4f46e5]' : ''"
+                      :aria-current="v.version === activeVersion ? 'true' : null">
                       <th scope="row" class="font-mono">
-                        <button class="text-indigo-700 hover:underline font-semibold"
+                        <button class="font-semibold"
+                          :class="v.version === activeVersion ? 'text-indigo-900 cursor-default' : 'text-indigo-700 hover:underline'"
                           @click="switchVersion(v.version)"
-                          :aria-label="'Read version ' + v.version"
+                          :aria-label="v.version === activeVersion ? 'Version ' + v.version + ', currently being read' : 'Read version ' + v.version"
                           x-text="'v' + v.version"></button>
-                        <span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-700"
+                        <span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-indigo-600 text-white font-sans font-semibold"
+                          x-show="v.version === activeVersion">reading</span>
+                        <span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-700 font-sans"
                           x-show="v.version === versionMeta.currentVersion">current</span>
                       </th>
                       <td>
