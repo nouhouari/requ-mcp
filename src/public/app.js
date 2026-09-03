@@ -550,7 +550,16 @@ document.addEventListener('alpine:init', function () {
               var d = JSON.parse(e.data);
               if (d && typeof d === 'object') {
                 var prev = self.summary;
-                self.summary = d;
+                // The event stream is not version-scoped, so it always describes
+                // the project's current version. Adopting it while another
+                // baseline is selected would make the header contradict the tab
+                // below it; re-read the scoped summary instead.
+                if (self.activeVersion &&
+                    self.activeVersion !== self.versionMeta.currentVersion) {
+                  self.loadSummary();
+                } else {
+                  self.summary = d;
+                }
                 self.notInitialized = false;
                 if (self.tab === 'global') { self.loadGlobalSummary(); }
                 if (!prev || d.requirements !== prev.requirements) self.loadRequirements();
