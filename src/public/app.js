@@ -290,8 +290,9 @@ document.addEventListener('alpine:init', function () {
               (this.versions.length ? this.versions[this.versions.length - 1].version : '');
           }
           if (!this.diffTo && this.versions.length > 1) {
-            this.diffFrom = this.versions[this.versions.length - 2].version;
-            this.diffTo   = this.versions[this.versions.length - 1].version;
+            var pair = this.defaultDiffPair();
+            this.diffFrom = pair.from;
+            this.diffTo   = pair.to;
           }
         }
         this.versionsLoading = false;
@@ -315,6 +316,31 @@ document.addEventListener('alpine:init', function () {
         ]);
         if (this.tab === 'scenarios') this.loadScenarios();
         if (this.tab === 'screens') this.loadScreens();
+      },
+
+      /** Default comparison: the previous baseline against the newest one. */
+      defaultDiffPair() {
+        if (this.versions.length < 2) return { from: '', to: '' };
+        return {
+          from: this.versions[this.versions.length - 2].version,
+          to:   this.versions[this.versions.length - 1].version,
+        };
+      },
+
+      diffIsPristine() {
+        var d = this.defaultDiffPair();
+        return !this.diff && !this.diffError &&
+          this.diffFrom === d.from && this.diffTo === d.to;
+      },
+
+      /** Clear the result and put both selects back to the default pair. */
+      resetDiff() {
+        var d = this.defaultDiffPair();
+        this.diffFrom = d.from;
+        this.diffTo = d.to;
+        this.diff = null;
+        this.diffError = '';
+        this.diffLoading = false;
       },
 
       async loadDiff() {

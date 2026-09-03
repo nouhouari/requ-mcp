@@ -1956,6 +1956,8 @@
               </template>
             </select>
             <button class="btn-primary text-sm" @click="loadDiff()" :disabled="!diffFrom || !diffTo || diffFrom === diffTo">Compare</button>
+            <button class="btn-secondary text-sm" @click="resetDiff()" :disabled="diffIsPristine()"
+              aria-label="Reset the comparison to the two most recent versions">Reset</button>
             <span class="text-sm text-red-600" x-show="diffError" x-text="diffError"></span>
           </div>
 
