@@ -78,6 +78,20 @@ export const MUTABLE_WHILE_LOCKED: Record<VersionedEntity, readonly string[]> = 
 /** Never compared: bookkeeping that changes on every write. */
 const IGNORED_FIELDS = new Set(["updatedAt"]);
 
+/**
+ * Fields carrying a schema default, and the default they carry.
+ *
+ * A row written before the field existed has no key for it, while the value
+ * being written has been through zod and therefore holds the default. Without
+ * this normalisation that gap reads as a change and would freeze rows in
+ * migrated projects — including edits the freeze matrix explicitly permits.
+ */
+const DEFAULTED_FIELDS: Record<string, unknown> = { removed: false };
+
+function normalize(key: string, value: unknown): unknown {
+  return value === undefined && key in DEFAULTED_FIELDS ? DEFAULTED_FIELDS[key] : value;
+}
+
 export type WritableCheck = { ok: true } | { ok: false; frozen: string[] };
 
 /**
@@ -100,7 +114,7 @@ export function checkWritable(
 
   for (const key of keys) {
     if (IGNORED_FIELDS.has(key) || allowed.has(key)) continue;
-    if (!deepEqual(before[key], after[key])) frozen.push(key);
+    if (!deepEqual(normalize(key, before[key]), normalize(key, after[key]))) frozen.push(key);
   }
 
   return frozen.length ? { ok: false, frozen: frozen.sort() } : { ok: true };

@@ -13,6 +13,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startHarness } from "./lib/http-harness.js";
+import { checkWritable } from "../src/versioning.js";
 
 let passed = 0;
 let failed = 0;
@@ -48,6 +49,25 @@ async function main() {
   const call = h.call;
 
   try {
+    // --- freeze matrix, including pre-versioning rows ------------------------
+    // A row written before `removed` existed has no such key, while the value
+    // being written carries the schema default. That gap must not read as a
+    // change, or migrated projects freeze edits the matrix permits.
+    const legacy = { id: "US-001", title: "T", status: "draft" };
+    check(
+      "a status-only edit is allowed on a locked row that predates `removed`",
+      checkWritable("stories", legacy, { ...legacy, status: "done", removed: false }).ok === true,
+      checkWritable("stories", legacy, { ...legacy, status: "done", removed: false }),
+    );
+    check(
+      "a real title change is still frozen on such a row",
+      checkWritable("stories", legacy, { ...legacy, title: "X", removed: false }).ok === false,
+    );
+    check(
+      "an actual soft delete is still frozen",
+      checkWritable("stories", { ...legacy, removed: false }, { ...legacy, removed: true }).ok === false,
+    );
+
     // --- 1.0.0 exists from the start ----------------------------------------
     await call("init_project", { name: "VersionSmoke", conductorPath: ".", initialPhase: "v1.0" });
 
