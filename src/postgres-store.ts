@@ -171,6 +171,17 @@ SELECT DISTINCT c.project_id,
        )
 FROM config c
 WHERE NOT EXISTS (SELECT 1 FROM versions v WHERE v.project_id = c.project_id);
+
+-- Point migrated projects at the version their rows were stamped with, so the
+-- pointers are explicit rather than relying on the INITIAL_VERSION fallback.
+UPDATE config
+SET value = (
+      value::jsonb
+      || jsonb_build_object('currentVersion', '${INITIAL_VERSION}',
+                            'draftVersion',   '${INITIAL_VERSION}')
+    )::text
+WHERE key = 'config'
+  AND value::jsonb->>'currentVersion' IS NULL;
 `;
 
 /**

@@ -207,6 +207,22 @@ export class SqliteStore {
       this.db.prepare("INSERT INTO versions(version, status, data) VALUES (?, ?, ?)")
         .run(v.version, v.status, JSON.stringify(v));
     }
+
+    // Make the pointers explicit on migrated projects rather than leaving them
+    // to the INITIAL_VERSION fallback.
+    if (initialized) {
+      const row = this.db.prepare("SELECT value FROM config WHERE key = 'config'")
+        .get() as { value: string } | undefined;
+      if (row) {
+        const cfg = JSON.parse(row.value) as Record<string, unknown>;
+        if (cfg.currentVersion === undefined) {
+          cfg.currentVersion = INITIAL_VERSION;
+          cfg.draftVersion   = INITIAL_VERSION;
+          this.db.prepare("UPDATE config SET value = ? WHERE key = 'config'")
+            .run(JSON.stringify(cfg));
+        }
+      }
+    }
   }
 
   // ---- version registry --------------------------------------------------
