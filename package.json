@@ -22,6 +22,7 @@
     "smoke:screens": "tsx scripts/smoke-screens.ts",
     "smoke:adrs": "tsx scripts/smoke-adrs.ts",
     "smoke:search": "tsx scripts/smoke-search.ts",
+    "smoke:versions": "tsx scripts/smoke-versions.ts",
     "smoke:pg": "tsx scripts/smoke-pg.ts",
     "prepare": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
     "prepublishOnly": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\""
