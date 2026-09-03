@@ -381,6 +381,11 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     // Distinct stored scenarios whose latest result (across all phases) is a pass.
     // (Not the per-story link sum, which double-counts multi-story scenarios.)
     scenariosPassingDistinct:     scenarios.filter((sc) => statusAll.get(testKey(sc)) === "pass").length,
+    // Distinct scenarios reachable from at least one story, counted once even
+    // when several stories link the same scenario.
+    scenariosLinkedDistinct: new Set(
+      [...storyMap.values()].flat().map((sc) => testKey(sc)),
+    ).size,
     deliveredVerifiedPct:       delivered.deliveredVerifiedPct,
     deliveredVerified:          delivered.deliveredVerified,
     deliveredTotal:             delivered.deliveredTotal,

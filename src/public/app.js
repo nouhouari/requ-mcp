@@ -1139,35 +1139,59 @@ document.addEventListener('alpine:init', function () {
       },
 
       /**
+       * Distinct scenarios across every story, with their pass state.
+       *
+       * A scenario linked to two stories is ONE scenario: summing
+       * story.scenarios.length double-counts it, which is why this card used to
+       * disagree with the "Counts by phase" total (both claim to count
+       * scenarios, and the phase totals partition each scenario once).
+       *
+       * Returns null when cumulative coverage is not loaded, so both callers
+       * fall back to the same internally-consistent summary pair.
+       */
+      _projectScenarioTally() {
+        if (!this.coverage || !this.coverage.stories || this.coverageMode !== 'cumulative') return null;
+        var self = this;
+        var pass = Object.create(null);
+        this.coverage.stories.forEach(function (s) {
+          (s.scenarios || []).forEach(function (sc) {
+            var k = self.scenarioKey(sc);
+            pass[k] = (pass[k] || false) || sc.status === 'pass';
+          });
+        });
+        var keys = Object.keys(pass);
+        return {
+          linked: keys.length,
+          passing: keys.filter(function (k) { return pass[k]; }).length,
+        };
+      },
+
+      /**
        * Project-global count of linked scenarios (all stories, every phase).
        * Read from the cumulative coverage payload so the KPI card reflects the
        * whole project. Both helpers use the SAME source and the SAME condition
        * (cumulative coverage loaded), so the passing/linked pair on the card is
-       * never mixed across scopes; the fallback pair (summary scenariosLinked /
-       * scenariosPassing) is likewise internally consistent (strict report).
+       * never mixed across scopes; the fallback pair (summary
+       * scenariosPassingDistinct / scenariosLinkedDistinct) is likewise
+       * internally consistent and distinct-counted.
        */
       projectScenariosLinked() {
-        if (this.coverage && this.coverage.stories && this.coverageMode === 'cumulative') {
-          return this.coverage.stories.reduce(function (n, s) {
-            return n + ((s.scenarios && s.scenarios.length) || 0);
-          }, 0);
-        }
-        return this.summaryVal('scenariosLinked');
+        var t = this._projectScenarioTally();
+        if (t) return t.linked;
+        return this.summaryVal('scenariosLinkedDistinct');
       },
 
       /**
-       * Project-global count of passing scenarios. Aggregated from the
-       * cumulative coverage data (status carried across phases) so the value is
-       * the project total, not the active phase. Falls back to the summary value
-       * (same source as projectScenariosLinked's fallback — see above).
+       * Project-global count of passing scenarios, counted once per distinct
+       * scenario. Aggregated from the cumulative coverage data (status carried
+       * across phases) so the value is the project total, not the active phase.
+       * Falls back to the summary value (same source as
+       * projectScenariosLinked's fallback — see above).
        */
       projectScenariosPassing() {
-        if (this.coverage && this.coverage.stories && this.coverageMode === 'cumulative') {
-          return this.coverage.stories.reduce(function (n, s) {
-            return n + (s.passing || 0);
-          }, 0);
-        }
-        return this.summaryVal('scenariosPassing');
+        var t = this._projectScenarioTally();
+        if (t) return t.passing;
+        return this.summaryVal('scenariosPassingDistinct');
       },
 
       /** Format a percentage value (number) to one decimal place. */
