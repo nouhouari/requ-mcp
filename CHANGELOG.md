@@ -4,6 +4,80 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [2.0.0] – unreleased
+
+### Added
+- **Specification versioning.** A project can now hold several *versions* of its
+  specification — requirements, stories, screens, ADRs, components and phases.
+  Locking one freezes it so a delivery team can build against a baseline that
+  cannot move, while the BA prepares the next scope in an open draft.
+
+  ```bash
+  lock_version   { actor: "ba@example.com", reason: "Sprint 1 baseline" }
+  create_version { bump: "minor", label: "Sprint 2 scope" }   # → 1.1.0, editable
+  diff_versions  { from: "1.0.0", to: "1.1.0" }
+  ```
+
+  A version is a full copy of every entity, so each one is queryable and
+  reportable exactly like any other data — `coverage_report`, `find_gaps`, the
+  `search_*` tools, the REST API and the dashboard all work per version.
+  See [Versions](README.md#versions--lockable-specification-baselines) and
+  [ADR-0001](docs/adr/0001-copy-on-write-specification-versioning.md).
+
+- **New tools** — `list_versions`, `create_version`, `lock_version`,
+  `unlock_version`, `set_active_version`, `diff_versions`. Every other tool
+  gained an optional `version` parameter.
+
+- **New REST endpoints** — `GET /api/versions`, `GET /api/versions/diff`,
+  `POST /api/versions`, `POST /api/versions/:version/lock`,
+  `POST /api/versions/:version/unlock`, `POST /api/versions/active`. Every read
+  route accepts `?version=`.
+
+- **Versions dashboard tab** — history with lock state, parent and audit trail,
+  plus a field-level comparison of any two versions. A header selector re-scopes
+  every other tab to the chosen baseline.
+
+- **Coverage carry-over** — a result recorded against an ancestor version keeps
+  counting while the story it covers is unchanged, and stops counting the moment
+  the specification moves. Copying a version costs nothing in re-testing; a real
+  scope change is never signed off by an old green run.
+
+- **`export_project { allVersions: true }`** exports the whole history plus the
+  version registry; import restores every version with its lock state.
+
+### Changed — BREAKING
+- **Writes to a locked version are rejected.** Once a version is locked, every
+  specification field is read-only in it. Only progress fields stay writable:
+  `status` on stories, screens and phases, and `status`/`supersededBy` on ADRs.
+  Test executions, scenario results and VCS links are never frozen. Creating or
+  deleting an entity in a locked version is always rejected.
+
+  *Why:* a baseline that can still be edited is not a baseline. The check lives
+  in the store, below both the MCP tools and the REST API, so it cannot be
+  bypassed by choosing a different entry point.
+
+  *Migrating:* nothing to do. Existing data is stamped `1.0.0` and registered as
+  a **draft**, so no call changes behaviour until you lock for the first time.
+
+- **Entity ids are now allocated across all versions.** `nextId` scans every
+  version, so `REQ-060` never refers to two different requirements. Ids in a
+  project that has only one version are unaffected.
+
+- **Deleting an entity writes a tombstone** instead of removing the row, so a
+  diff can report the removal. Listings hide tombstones by default; pass
+  `includeRemoved` to see them.
+
+- **`export_project` emits format `"2"`**, adding `projectVersion`, `versions`
+  and `versionedData`. `data` still carries the primary snapshot, so a reader
+  written against format `"1"` keeps working. Format `"1"` payloads still import.
+
+### Migration
+The schema migration runs automatically on first open and is idempotent. It adds
+`version` and `removed` columns, rebuilds the primary keys to include `version`,
+creates the version registry, and stamps all existing rows as a `1.0.0` draft.
+SQLite cannot change a primary key in place, so each table is rebuilt inside one
+transaction. **Take a backup before upgrading**, as with any schema change.
+
 ## [1.0.0] – 2026-08-28
 
 ### Removed — BREAKING

@@ -57,6 +57,21 @@
             </template>
           </select>
         </template>
+        <!-- Specification version: every tab reads through this selection. -->
+        <template x-if="versions.length > 1">
+          <select
+            class="filter-select filter-select--dark text-xs bg-slate-800 border-slate-700 focus:border-indigo-400"
+            style="width:150px;"
+            :value="activeVersion"
+            @change="switchVersion($event.target.value)"
+            aria-label="Switch specification version">
+            <template x-for="v in versions" :key="v.version">
+              <option :value="v.version"
+                :selected="activeVersion === v.version"
+                x-text="'v' + v.version + (v.status === 'locked' ? ' \u00b7 locked' : ' \u00b7 draft')"></option>
+            </template>
+          </select>
+        </template>
       </div>
 
       <!-- Right side: phase + stats + live -->
@@ -147,6 +162,7 @@
         {id:'components',   label:'Components'},
         {id:'vcs',          label:'VCS'},
         {id:'scenarios',    label:'Scenarios'},
+        {id:'versions',     label:'Versions'},
       ]" :key="t.id">
         <button
           :id="'tab-' + t.id"
@@ -1835,6 +1851,179 @@
             </template>
           </div>
         </template>
+      </div>
+
+
+      <!-- ══════════════════════════════════════════════════════════
+           TAB: VERSIONS (specification baselines)
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-versions" role="tabpanel" aria-labelledby="tab-versions" tabindex="0" x-show="tab === 'versions'" class="tab-panel space-y-4">
+
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-3">
+          <p class="text-sm text-slate-600 max-w-2xl">
+            A version is a frozen set of requirements, stories, screens, decisions, components and phases.
+            Locking one lets a team build against a stable baseline while the next version is prepared.
+            <span class="block mt-1 text-slate-500">Select a version below to read it — every other tab re-scopes to your selection.</span>
+          </p>
+          <div class="ml-auto flex items-center gap-3 text-xs">
+            <span class="text-slate-500">Reading</span>
+            <span class="font-mono font-semibold text-slate-800" x-text="'v' + (activeVersion || '—')"></span>
+            <span class="text-slate-500" x-show="versionMeta.draftVersion">· draft</span>
+            <span class="font-mono font-semibold text-amber-700" x-show="versionMeta.draftVersion" x-text="'v' + versionMeta.draftVersion"></span>
+          </div>
+        </div>
+
+        <!-- History -->
+        <div class="section-card">
+          <template x-if="versionsLoading">
+            <div class="p-6 space-y-3">
+              <template x-for="i in [1,2,3]" :key="i"><div class="skeleton skeleton-md"></div></template>
+            </div>
+          </template>
+
+          <template x-if="!versionsLoading && versions.length === 0">
+            <div class="empty-state">
+              <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v20M2 12h20"/></svg>
+              <h3>No versions yet</h3>
+              <p>This project predates specification versioning, or has not been initialised.</p>
+            </div>
+          </template>
+
+          <template x-if="!versionsLoading && versions.length > 0">
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <caption class="sr-only">Specification versions, oldest first</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Version</th>
+                    <th scope="col">State</th>
+                    <th scope="col">Label</th>
+                    <th scope="col">From</th>
+                    <th scope="col">Created</th>
+                    <th scope="col">Locked</th>
+                    <th scope="col">By</th>
+                    <th scope="col">Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="v in versions" :key="v.version">
+                    <tr :class="v.version === activeVersion ? 'bg-indigo-50 shadow-[inset_3px_0_0_0_#4f46e5]' : ''"
+                      :aria-current="v.version === activeVersion ? 'true' : null">
+                      <th scope="row" class="font-mono">
+                        <button class="font-semibold"
+                          :class="v.version === activeVersion ? 'text-indigo-900 cursor-default' : 'text-indigo-700 hover:underline'"
+                          @click="switchVersion(v.version)"
+                          :aria-label="v.version === activeVersion ? 'Version ' + v.version + ', currently being read' : 'Read version ' + v.version"
+                          x-text="'v' + v.version"></button>
+                        <span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-indigo-600 text-white font-sans font-semibold"
+                          x-show="v.version === activeVersion">reading</span>
+                        <span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-700 font-sans"
+                          x-show="v.version === versionMeta.currentVersion">current</span>
+                      </th>
+                      <td>
+                        <span class="text-[11px] px-2 py-0.5 rounded font-medium"
+                          :class="v.status === 'locked' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'"
+                          x-text="v.status"></span>
+                      </td>
+                      <td x-text="v.label || '—'"></td>
+                      <td class="font-mono text-slate-500" x-text="v.parent ? 'v' + v.parent : '—'"></td>
+                      <td class="text-slate-500" x-text="shortDate(v.createdAt)"></td>
+                      <td class="text-slate-500" x-text="v.lockedAt ? shortDate(v.lockedAt) : '—'"></td>
+                      <td class="text-slate-500" x-text="v.actor || '—'"></td>
+                      <td class="text-slate-500" x-text="v.reason || '—'"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+
+        <!-- Diff -->
+        <div class="section-card" x-show="versions.length > 1">
+          <div class="p-4 flex flex-wrap items-center gap-3 border-b border-slate-100">
+            <h3 class="text-sm font-semibold text-slate-800">Compare</h3>
+            <label for="diff-from" class="text-sm text-slate-600">From</label>
+            <select id="diff-from" class="filter-select" x-model="diffFrom">
+              <template x-for="v in versions" :key="'f' + v.version">
+                <option :value="v.version" x-text="'v' + v.version"></option>
+              </template>
+            </select>
+            <label for="diff-to" class="text-sm text-slate-600">To</label>
+            <select id="diff-to" class="filter-select" x-model="diffTo">
+              <template x-for="v in versions" :key="'t' + v.version">
+                <option :value="v.version" x-text="'v' + v.version"></option>
+              </template>
+            </select>
+            <button class="btn-primary text-sm" @click="loadDiff()" :disabled="!diffFrom || !diffTo || diffFrom === diffTo">Compare</button>
+            <button class="btn-secondary text-sm" @click="resetDiff()" :disabled="diffIsPristine()"
+              aria-label="Reset the comparison to the two most recent versions">Reset</button>
+            <span class="text-sm text-red-600" x-show="diffError" x-text="diffError"></span>
+          </div>
+
+          <template x-if="diffLoading">
+            <div class="p-6 space-y-3">
+              <template x-for="i in [1,2,3]" :key="i"><div class="skeleton skeleton-md"></div></template>
+            </div>
+          </template>
+
+          <template x-if="!diffLoading && diff">
+            <div class="p-4 space-y-4">
+              <p class="text-sm text-slate-600" x-show="diffIsIdentical()">
+                No specification differences between these versions.
+              </p>
+              <template x-for="entity in diffEntityNames()" :key="entity">
+                <div class="border border-slate-200 rounded-lg">
+                  <div class="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center gap-3">
+                    <span class="text-sm font-semibold text-slate-800 capitalize" x-text="entity"></span>
+                    <span class="text-[11px] px-2 py-0.5 rounded bg-emerald-100 text-emerald-800"
+                      x-text="'+' + diff.summary[entity].added"></span>
+                    <span class="text-[11px] px-2 py-0.5 rounded bg-red-100 text-red-800"
+                      x-text="'−' + diff.summary[entity].removed"></span>
+                    <span class="text-[11px] px-2 py-0.5 rounded bg-amber-100 text-amber-800"
+                      x-text="'~' + diff.summary[entity].modified"></span>
+                    <span class="ml-auto text-[11px] text-slate-500"
+                      x-text="diff.summary[entity].unchanged + ' unchanged'"></span>
+                  </div>
+                  <ul class="divide-y divide-slate-100">
+                    <template x-for="e in diff.entities[entity].added" :key="'a' + e.id">
+                      <li class="px-3 py-2 text-sm flex items-baseline gap-2">
+                        <span class="text-emerald-700 font-semibold">added</span>
+                        <span class="font-mono text-slate-700" x-text="e.id"></span>
+                        <span class="text-slate-500 truncate" x-text="e.title || ''"></span>
+                      </li>
+                    </template>
+                    <template x-for="e in diff.entities[entity].removed" :key="'r' + e.id">
+                      <li class="px-3 py-2 text-sm flex items-baseline gap-2">
+                        <span class="text-red-700 font-semibold">removed</span>
+                        <span class="font-mono text-slate-700" x-text="e.id"></span>
+                        <span class="text-slate-500 truncate" x-text="e.title || ''"></span>
+                      </li>
+                    </template>
+                    <template x-for="e in diff.entities[entity].modified" :key="'m' + e.id">
+                      <li class="px-3 py-2 text-sm">
+                        <div class="flex items-baseline gap-2">
+                          <span class="text-amber-700 font-semibold">changed</span>
+                          <span class="font-mono text-slate-700" x-text="e.id"></span>
+                          <span class="text-slate-500 truncate" x-text="e.title || ''"></span>
+                        </div>
+                        <ul class="mt-1 ml-6 space-y-0.5">
+                          <template x-for="c in (e.changes || [])" :key="c.field">
+                            <li class="text-xs text-slate-600">
+                              <span class="font-mono font-semibold" x-text="c.field"></span>
+                              <span class="text-red-600 line-through ml-2" x-text="brief(c.from)"></span>
+                              <span class="text-emerald-700 ml-2" x-text="brief(c.to)"></span>
+                            </li>
+                          </template>
+                        </ul>
+                      </li>
+                    </template>
+                  </ul>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
       </div>
 
       </div><!-- /tab panels -->

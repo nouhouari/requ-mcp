@@ -170,6 +170,19 @@ document.addEventListener('alpine:init', function () {
       // ── Server version ─────────────────────────────────────────────────────────
       appVersion: '',
 
+      // ── Specification versions (baselines) ────────────────────────────────────
+      // `activeVersion` is what every tab reads through: apiUrl() appends it to
+      // each request, so switching it re-scopes the whole dashboard at once.
+      versions: [],
+      versionMeta: { currentVersion: null, draftVersion: null },
+      activeVersion: '',
+      versionsLoading: false,
+      diffFrom: '',
+      diffTo: '',
+      diff: null,
+      diffLoading: false,
+      diffError: '',
+
       // =========================================================================
       // Lifecycle
       // =========================================================================
@@ -179,6 +192,7 @@ document.addEventListener('alpine:init', function () {
         if (vd && vd.version) this.appVersion = vd.version;
         await this.loadProjects();
         if (this.projects.length > 1) { this.tab = 'global'; }
+        await this.loadVersions();
         await this.loadConfig();
         await this.loadSummary();
         this.setupSSE();
@@ -257,6 +271,123 @@ document.addEventListener('alpine:init', function () {
         }
       },
 
+      // =========================================================================
+      // Specification versions
+      // =========================================================================
+
+      async loadVersions() {
+        this.versionsLoading = true;
+        // Read the registry unscoped: apiUrl() would otherwise pin the request
+        // to the version being listed, which is circular.
+        var p = '/api/versions';
+        if (this.projects.length > 1 && this.activeProject) p += '?project=' + this.activeProject.slug;
+        var d = await this._fetch(p);
+        if (d) {
+          this.versions = d.versions || [];
+          this.versionMeta = { currentVersion: d.currentVersion, draftVersion: d.draftVersion };
+          if (!this.activeVersion) {
+            this.activeVersion = d.currentVersion || d.draftVersion ||
+              (this.versions.length ? this.versions[this.versions.length - 1].version : '');
+          }
+          if (!this.diffTo && this.versions.length > 1) {
+            var pair = this.defaultDiffPair();
+            this.diffFrom = pair.from;
+            this.diffTo   = pair.to;
+          }
+        }
+        this.versionsLoading = false;
+      },
+
+      /** Re-read every tab through another baseline. */
+      async switchVersion(version) {
+        if (!version || version === this.activeVersion) return;
+        this.activeVersion = version;
+        await Promise.all([
+          this.loadConfig(),
+          this.loadSummary(),
+          this.loadRequirements(),
+          this.loadStories(),
+          this.loadComponents(),
+          this.loadPhases(),
+          this.loadAdrs(),
+          this.loadCoverage(),
+          this.loadTrend(),
+          this.loadGaps(),
+        ]);
+        if (this.tab === 'scenarios') this.loadScenarios();
+        if (this.tab === 'screens') this.loadScreens();
+      },
+
+      /** Default comparison: the previous baseline against the newest one. */
+      defaultDiffPair() {
+        if (this.versions.length < 2) return { from: '', to: '' };
+        return {
+          from: this.versions[this.versions.length - 2].version,
+          to:   this.versions[this.versions.length - 1].version,
+        };
+      },
+
+      diffIsPristine() {
+        var d = this.defaultDiffPair();
+        return !this.diff && !this.diffError &&
+          this.diffFrom === d.from && this.diffTo === d.to;
+      },
+
+      /** Clear the result and put both selects back to the default pair. */
+      resetDiff() {
+        var d = this.defaultDiffPair();
+        this.diffFrom = d.from;
+        this.diffTo = d.to;
+        this.diff = null;
+        this.diffError = '';
+        this.diffLoading = false;
+      },
+
+      async loadDiff() {
+        if (!this.diffFrom || !this.diffTo || this.diffFrom === this.diffTo) return;
+        this.diffLoading = true;
+        this.diffError = '';
+        this.diff = null;
+        var p = '/api/versions/diff?from=' + encodeURIComponent(this.diffFrom) + '&to=' + encodeURIComponent(this.diffTo);
+        if (this.projects.length > 1 && this.activeProject) p += '&project=' + this.activeProject.slug;
+        try {
+          var res = await window.fetch(p);
+          var body = await res.json();
+          if (!res.ok) { this.diffError = body && body.error ? body.error : 'Comparison failed'; }
+          else { this.diff = body; }
+        } catch (e) {
+          this.diffError = String(e);
+        }
+        this.diffLoading = false;
+      },
+
+      /** Entity types with at least one difference, so an unchanged type is hidden. */
+      diffEntityNames() {
+        if (!this.diff) return [];
+        var sum = this.diff.summary || {};
+        return Object.keys(sum).filter(function (k) {
+          return sum[k].added > 0 || sum[k].removed > 0 || sum[k].modified > 0;
+        });
+      },
+
+      diffIsIdentical() {
+        return this.diffEntityNames().length === 0;
+      },
+
+      /** One-line rendering of a field value for the diff list. */
+      brief(v) {
+        if (v === undefined || v === null) return '∅';
+        var s = typeof v === 'string' ? v : JSON.stringify(v);
+        s = s.replace(/\s+/g, ' ').trim();
+        return s.length > 80 ? s.slice(0, 80) + '…' : (s || '∅');
+      },
+
+      shortDate(iso) {
+        if (!iso) return '—';
+        var d = new Date(iso);
+        return isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 10);
+      },
+
       async switchProject(slug) {
         var self = this;
         var found = this.projects.find(function (p) { return p.slug === slug; });
@@ -276,6 +407,10 @@ document.addEventListener('alpine:init', function () {
         this.setupSSE();
         // Load config + summary first so that coveragePhase is set to the new
         // project's activePhase before loadCoverage() reads it.
+        this.activeVersion = '';
+        this.versions = [];
+        this.diff = null;
+        await this.loadVersions();
         await Promise.all([self.loadConfig(), self.loadSummary()]);
         // Now load the remaining data in parallel using the correct coveragePhase.
         await Promise.all([
@@ -441,7 +576,16 @@ document.addEventListener('alpine:init', function () {
               var d = JSON.parse(e.data);
               if (d && typeof d === 'object') {
                 var prev = self.summary;
-                self.summary = d;
+                // The event stream is not version-scoped, so it always describes
+                // the project's current version. Adopting it while another
+                // baseline is selected would make the header contradict the tab
+                // below it; re-read the scoped summary instead.
+                if (self.activeVersion &&
+                    self.activeVersion !== self.versionMeta.currentVersion) {
+                  self.loadSummary();
+                } else {
+                  self.summary = d;
+                }
                 self.notInitialized = false;
                 if (self.tab === 'global') { self.loadGlobalSummary(); }
                 if (!prev || d.requirements !== prev.requirements) self.loadRequirements();
@@ -680,6 +824,7 @@ document.addEventListener('alpine:init', function () {
         if (id === 'scenarios')  { this.loadScenarios(); }
         if (id === 'screens')    { this.loadScreens(); }
         if (id === 'adrs')       { this.loadAdrs(); }
+        if (id === 'versions')   { this.loadVersions(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -703,8 +848,8 @@ document.addEventListener('alpine:init', function () {
        */
       shiftFocus(dir) {
         var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios']
-          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios'];
+          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions']
+          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions'];
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }
@@ -723,9 +868,16 @@ document.addEventListener('alpine:init', function () {
        * query string by using '&' instead of '?'.
        */
       apiUrl: function (p) {
-        if (this.projects.length <= 1 || !this.activeProject) return p;
-        var sep = p.indexOf('?') === -1 ? '?' : '&';
-        return p + sep + 'project=' + this.activeProject.slug;
+        var out = p;
+        if (this.projects.length > 1 && this.activeProject) {
+          out += (out.indexOf('?') === -1 ? '?' : '&') + 'project=' + this.activeProject.slug;
+        }
+        // Scope every read to the selected baseline. Omitted while the project
+        // has a single version, so the request looks exactly as it always did.
+        if (this.activeVersion && this.versions.length > 1) {
+          out += (out.indexOf('?') === -1 ? '?' : '&') + 'version=' + encodeURIComponent(this.activeVersion);
+        }
+        return out;
       },
 
       // =========================================================================
@@ -987,35 +1139,59 @@ document.addEventListener('alpine:init', function () {
       },
 
       /**
+       * Distinct scenarios across every story, with their pass state.
+       *
+       * A scenario linked to two stories is ONE scenario: summing
+       * story.scenarios.length double-counts it, which is why this card used to
+       * disagree with the "Counts by phase" total (both claim to count
+       * scenarios, and the phase totals partition each scenario once).
+       *
+       * Returns null when cumulative coverage is not loaded, so both callers
+       * fall back to the same internally-consistent summary pair.
+       */
+      _projectScenarioTally() {
+        if (!this.coverage || !this.coverage.stories || this.coverageMode !== 'cumulative') return null;
+        var self = this;
+        var pass = Object.create(null);
+        this.coverage.stories.forEach(function (s) {
+          (s.scenarios || []).forEach(function (sc) {
+            var k = self.scenarioKey(sc);
+            pass[k] = (pass[k] || false) || sc.status === 'pass';
+          });
+        });
+        var keys = Object.keys(pass);
+        return {
+          linked: keys.length,
+          passing: keys.filter(function (k) { return pass[k]; }).length,
+        };
+      },
+
+      /**
        * Project-global count of linked scenarios (all stories, every phase).
        * Read from the cumulative coverage payload so the KPI card reflects the
        * whole project. Both helpers use the SAME source and the SAME condition
        * (cumulative coverage loaded), so the passing/linked pair on the card is
-       * never mixed across scopes; the fallback pair (summary scenariosLinked /
-       * scenariosPassing) is likewise internally consistent (strict report).
+       * never mixed across scopes; the fallback pair (summary
+       * scenariosPassingDistinct / scenariosLinkedDistinct) is likewise
+       * internally consistent and distinct-counted.
        */
       projectScenariosLinked() {
-        if (this.coverage && this.coverage.stories && this.coverageMode === 'cumulative') {
-          return this.coverage.stories.reduce(function (n, s) {
-            return n + ((s.scenarios && s.scenarios.length) || 0);
-          }, 0);
-        }
-        return this.summaryVal('scenariosLinked');
+        var t = this._projectScenarioTally();
+        if (t) return t.linked;
+        return this.summaryVal('scenariosLinkedDistinct');
       },
 
       /**
-       * Project-global count of passing scenarios. Aggregated from the
-       * cumulative coverage data (status carried across phases) so the value is
-       * the project total, not the active phase. Falls back to the summary value
-       * (same source as projectScenariosLinked's fallback — see above).
+       * Project-global count of passing scenarios, counted once per distinct
+       * scenario. Aggregated from the cumulative coverage data (status carried
+       * across phases) so the value is the project total, not the active phase.
+       * Falls back to the summary value (same source as
+       * projectScenariosLinked's fallback — see above).
        */
       projectScenariosPassing() {
-        if (this.coverage && this.coverage.stories && this.coverageMode === 'cumulative') {
-          return this.coverage.stories.reduce(function (n, s) {
-            return n + (s.passing || 0);
-          }, 0);
-        }
-        return this.summaryVal('scenariosPassing');
+        var t = this._projectScenarioTally();
+        if (t) return t.passing;
+        return this.summaryVal('scenariosPassingDistinct');
       },
 
       /** Format a percentage value (number) to one decimal place. */

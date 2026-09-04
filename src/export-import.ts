@@ -3,14 +3,14 @@
  */
 import type { SqliteStore } from "./sqlite-store.js";
 import type { PostgresStore } from "./postgres-store.js";
-import type { Execution, ExportPayload, ImportReport } from "./schema.js";
+import type { Execution, ExportData, ExportPayload, ImportReport } from "./schema.js";
 
 type AnyStore = SqliteStore | PostgresStore;
 
-export async function buildExport(store: AnyStore): Promise<ExportPayload> {
-  const [config, components, requirements, stories, scenarios, screens, adrs, phases, vcsRefs, executionsByPhase] =
+/** Everything in one version, plus the shared (tagged) scenarios and VCS links. */
+async function snapshot(store: AnyStore): Promise<ExportData> {
+  const [components, requirements, stories, scenarios, screens, adrs, phases, vcsRefs, executionsByPhase] =
     await Promise.all([
-      store.readConfig().catch(() => null),
       store.listComponents(),
       store.listRequirements(),
       store.listStories(),
@@ -19,26 +19,115 @@ export async function buildExport(store: AnyStore): Promise<ExportPayload> {
       store.listAdrs(),
       store.listPhases(),
       store.listVcsRefs(),
-      store.readAllExecutions(),
+      store.readAllExecutions({ carryOver: false }),
     ]);
 
-  // Convert Map<phaseId, Execution[]> to plain object
   const executions: Record<string, Execution[]> = {};
-  for (const [phaseId, runs] of executionsByPhase.entries()) {
-    executions[phaseId] = runs;
-  }
+  for (const [phaseId, runs] of executionsByPhase.entries()) executions[phaseId] = runs;
 
-  return {
-    version: "1",
-    exportedAt: new Date().toISOString(),
-    source: config ? { name: config.name } : undefined,
-    data: { components, requirements, stories, scenarios, screens, adrs, phases, executions, vcsRefs },
-  };
+  return { components, requirements, stories, scenarios, screens, adrs, phases, executions, vcsRefs };
 }
 
+/**
+ * Export one version by default — the one the store is bound to — because that
+ * is the baseline a consumer asked about. `allVersions` adds the registry and
+ * every other version under `versionedData`, so the whole history round-trips.
+ *
+ * `data` is always the primary snapshot, so a reader that predates versioning
+ * keeps working against a format-"2" payload.
+ */
+export async function buildExport(
+  store: AnyStore,
+  opts: { allVersions?: boolean } = {},
+): Promise<ExportPayload> {
+  const config = await store.readConfig().catch(() => null);
+  const projectVersion = await store.version();
+  const data = await snapshot(store);
+
+  const base = {
+    exportedAt: new Date().toISOString(),
+    source: config ? { name: config.name } : undefined,
+    projectVersion,
+    data,
+  };
+
+  if (!opts.allVersions) {
+    return { ...base, version: "2" as const, versions: [], versionedData: {} };
+  }
+
+  const versions = await store.listVersions();
+  const versionedData: Record<string, ExportData> = {};
+  for (const v of versions) {
+    if (v.version === projectVersion) continue;
+    versionedData[v.version] = await snapshot(store.at(v.version) as AnyStore);
+  }
+  return { ...base, version: "2" as const, versions, versionedData };
+}
+
+/**
+ * Import a payload.
+ *
+ * A format-"2" payload carrying a version registry restores the whole history:
+ * each version is registered as a draft, filled, and only then set to its
+ * recorded status — otherwise the lock guard would reject the very rows that
+ * define the locked baseline. Everything else imports into the version the
+ * store is bound to, which is what a single-version payload means.
+ */
 export async function applyImport(
   store: AnyStore,
   payload: ExportPayload,
+  opts: { allVersions?: boolean; force?: boolean } = {},
+): Promise<ImportReport> {
+  const restoreHistory =
+    opts.allVersions !== false && payload.version === "2" && payload.versions.length > 0;
+
+  if (!restoreHistory) return importSnapshot(store, payload.data);
+
+  const merged: ImportReport = { imported: {}, skipped: {}, errors: [] };
+  const mergeInto = (r: ImportReport, prefix: string) => {
+    for (const [k, n] of Object.entries(r.imported)) merged.imported[k] = (merged.imported[k] ?? 0) + n;
+    for (const [k, ids] of Object.entries(r.skipped)) (merged.skipped[k] ??= []).push(...ids);
+    merged.errors.push(...r.errors.map((e) => `[${prefix}] ${e}`));
+  };
+
+  const primary = payload.projectVersion;
+  for (const v of payload.versions) {
+    const existing = await store.getVersion(v.version);
+
+    // A locked version already present in the target is a baseline someone is
+    // building against. Importing into it would both mutate frozen scope and,
+    // via the temporary unlock below, leave it open. Refuse instead.
+    if (existing?.status === "locked" && !opts.force) {
+      merged.errors.push(
+        `[${v.version}] version already exists and is locked; ` +
+          `it was left untouched. Import into a new version, or pass force to overwrite.`,
+      );
+      continue;
+    }
+
+    // Register as a draft first: a locked row would refuse its own contents.
+    // `existing` is only ever a draft here unless force was given.
+    if (!existing) await store.writeVersion({ ...v, status: "draft" });
+    else if (existing.status === "locked") await store.writeVersion({ ...existing, status: "draft" });
+
+    try {
+      const data = v.version === primary ? payload.data : payload.versionedData[v.version];
+      if (data) mergeInto(await importSnapshot(store.at(v.version) as AnyStore, data), v.version);
+      merged.imported["versions"] = (merged.imported["versions"] ?? 0) + 1;
+    } finally {
+      // Restore the lock whatever happened, so a failure part-way cannot leave a
+      // baseline open. An existing row keeps its own status; a new one takes the
+      // status it was exported with.
+      const restore = existing ?? v;
+      if (restore.status === "locked") await store.writeVersion(restore);
+    }
+  }
+  return merged;
+}
+
+async function importSnapshot(
+  store: AnyStore,
+  data: ExportData,
 ): Promise<ImportReport> {
   const report: ImportReport = {
     imported: {},
@@ -73,8 +162,6 @@ export async function applyImport(
   const existingStoryIds       = new Set(existingStories.map(x => x.id));
   const existingPhaseIds       = new Set(existingPhases.map(x => x.id));
   const existingVcsRefIds      = new Set(existingVcsRefs.map(x => x.id));
-
-  const { data } = payload;
 
   // --- Components ---
   for (const comp of data.components) {

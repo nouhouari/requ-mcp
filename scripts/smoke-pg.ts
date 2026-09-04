@@ -14,6 +14,8 @@ import { spawn } from "node:child_process";
 import { Pool } from "pg";
 import { PostgresStore, initPgPool } from "../src/postgres-store.js";
 import { buildExport, applyImport } from "../src/export-import.js";
+import { createVersion, lockVersion } from "../src/version-ops.js";
+import { diffVersions } from "../src/version-diff.js";
 import type { Component, Requirement, UserStory, Phase, Execution, VcsRef, Config, Scenario } from "../src/schema.js";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
@@ -227,6 +229,63 @@ async function main() {
     check("project A requirements unaffected by B", (await storeA.listRequirements()).length === 1);
 
     // --- export / import round-trip (A → B) ---
+    // --- versioning (copy-on-write baselines) -------------------------------
+    console.log("\n  [versions]");
+    const pidV = `${runId}-v`;
+    const storeV = new PostgresStore(root, pidV);
+    await storeV.init({ name: "PG Versions", key: "PGVER", conductorPath: ".", currentVersion: "1.0.0", draftVersion: "1.0.0" });
+    await storeV.writeVersion({ version: "1.0.0", status: "draft", label: "Initial", createdAt: ts() });
+
+    await storeV.writeRequirement({
+      id: "REQ-001", title: "Guests can book", description: "", status: "active",
+      components: [], tags: [], removed: false, createdAt: ts(), updatedAt: ts(),
+    } as Requirement);
+    await storeV.writeStory({
+      id: "US-001", title: "Book a slot", description: "", status: "draft",
+      requirements: ["REQ-001"], acceptanceCriteria: [], removed: false,
+      createdAt: ts(), updatedAt: ts(),
+    } as UserStory);
+
+    const lockRes = await lockVersion(storeV, "1.0.0", { actor: "ba", reason: "baseline" });
+    check("lockVersion succeeds", lockRes.ok === true, lockRes);
+    check("locked version is reported as locked", await storeV.isLocked() === true);
+
+    let rejected = false;
+    try {
+      const r = (await storeV.getRequirement("REQ-001"))!;
+      await storeV.writeRequirement({ ...r, title: "Changed", updatedAt: ts() });
+    } catch { rejected = true; }
+    check("locked version rejects a requirement edit", rejected);
+
+    const progressed = (await storeV.getStory("US-001"))!;
+    await storeV.writeStory({ ...progressed, status: "done", updatedAt: ts() });
+    check("locked version allows a status change", (await storeV.getStory("US-001"))!.status === "done");
+
+    const createRes = await createVersion(storeV, { bump: "minor", label: "Next", actor: "ba" });
+    check("createVersion opens 1.1.0", createRes.ok === true && (createRes as any).data.created === "1.1.0", createRes);
+
+    const v11 = storeV.at("1.1.0") as PostgresStore;
+    check("the copy carries the requirement", (await v11.listRequirements()).length === 1);
+    const copied = (await v11.getRequirement("REQ-001"))!;
+    await v11.writeRequirement({ ...copied, title: "Guests can book online", updatedAt: ts() });
+    check("1.1.0 takes the edit", (await v11.getRequirement("REQ-001"))!.title === "Guests can book online");
+    check("1.0.0 is untouched", (await (storeV.at("1.0.0") as PostgresStore).getRequirement("REQ-001"))!.title === "Guests can book");
+
+    await v11.deleteRequirement("REQ-001");
+    check("soft delete hides the row", (await v11.listRequirements()).length === 0);
+    check("…but includeRemoved surfaces the tombstone", (await v11.listRequirements({ includeRemoved: true })).length === 1);
+    check("…and the locked baseline still has it", (await (storeV.at("1.0.0") as PostgresStore).listRequirements()).length === 1);
+
+    const pgDiff = await diffVersions(storeV, "1.0.0", "1.1.0");
+    check("diff reports the removal", pgDiff.entities.requirements.removed.some((e) => e.id === "REQ-001"), pgDiff.summary.requirements);
+    check("ids are allocated across versions", (await storeV.idsAcrossVersions("requirements")).includes("REQ-001"));
+
+    await cleanup(cleanupPool, pidV);
+    await cleanupPool.query("DELETE FROM versions WHERE project_id = $1", [pidV]);
+    for (const t of ["screens", "adrs"]) {
+      await cleanupPool.query(`DELETE FROM ${t} WHERE project_id = $1`, [pidV]);
+    }
+
     console.log("\n  [export / import]");
     // B needs the same phases for executions to import
     await storeB.writePhase(p1);

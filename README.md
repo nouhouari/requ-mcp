@@ -99,6 +99,7 @@ when running under Docker Compose).
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
 | **Decisions** | Architecture decisions (ADRs) with status badges and their requirement/component links; open one to read the record with its mermaid diagrams rendered |
+| **Versions** | Specification baselines: the version history with lock state, parent and audit trail, plus a side-by-side comparison of any two versions showing additions, removals and field-level changes |
 
 **Live updates:** The dashboard polls for KPI count changes every 5 seconds via Server-Sent Events (SSE) — no page refresh needed. The summary payload (`GET /api/summary` and the SSE feed) includes project totals plus `scenariosTotal` and a `byPhase[]` array of per-phase `{ requirements, stories, scenarios }` counts (partitioned by earliest phase, with an Unassigned bucket).
 
@@ -223,6 +224,12 @@ Both hold the same entities: components, requirements, stories, scenarios,
 screens, architecture decisions, phases, executions and VCS refs. Move data
 between servers with `export_project` / `import_project`.
 
+Specification entities are additionally keyed by **version**, so a project holds
+one full set of rows per baseline (see
+[Versions](#versions--lockable-specification-baselines)). Executions, scenarios
+and VCS refs are *not* versioned — they are progress, kept in a single namespace
+and tagged with the version they were produced against.
+
 ## Tools
 
 | Tool | Actor | Purpose |
@@ -250,11 +257,143 @@ between servers with `export_project` / `import_project`.
 | `find_gaps` | reporting | Requirements without stories, stories without scenarios, stories not covered (per phase) |
 | `create_adr` / `update_adr` / `get_adr` / `list_adrs` / `search_adrs` / `delete_adr` | architect | Record and evolve architecture decisions — see [Architecture decisions](#architecture-decisions--adrs) |
 | `get_adr_content` / `import_adrs_from_files` | architect | Read a decision's markdown; bulk-import an existing `docs/adr/` folder |
+| `list_versions` / `create_version` / `lock_version` / `unlock_version` / `set_active_version` / `diff_versions` | BA/release | Manage specification baselines — see [Versions](#versions--lockable-specification-baselines) |
 | `set_repo` / `get_repo` | dev | Record the project's repository reference — `repoUrl`, `defaultBranch`, `vcsType` (`gitlab` / `github` / `bitbucket`) |
 | `link_branch` / `link_merge_request` / `update_merge_request` / `list_vcs_refs` | dev | Link branches and merge/pull requests to stories and requirements — see [VCS references](#vcs-references) |
 
 Every tool also accepts an optional `key` selecting the target project (see
-[How it finds the project](#how-it-finds-the-project)).
+[How it finds the project](#how-it-finds-the-project)) and an optional `version`
+selecting the specification baseline (see [Versions](#versions--lockable-specification-baselines)).
+
+## Versions — lockable specification baselines
+
+A **version** is a complete, frozen set of requirements, stories, screens,
+decisions, components and phases. It exists so a delivery team can build against
+a specification that cannot move under them, while the BA prepares the next one.
+
+```
+1.0.0  locked   ← the team is building this
+  └── 1.1.0  draft    ← the BA is writing the next scope here
+```
+
+Creating a version **copies** every entity, so each version is a full set of
+rows you can read, filter and report on exactly like any other. There is no
+second query path and no blob to hydrate — `coverage_report`, `find_gaps`, the
+REST API and the dashboard all work per version without knowing how it is
+stored.
+
+### The lifecycle
+
+```bash
+lock_version   { actor: "ba@example.com", reason: "Sprint 1 baseline" }
+create_version { bump: "minor", label: "Sprint 2 scope" }   # → 1.1.0, editable
+# …the BA edits 1.1.0 while the team keeps delivering 1.0.0…
+diff_versions  { from: "1.0.0", to: "1.1.0" }
+lock_version   { version: "1.1.0" }
+```
+
+**Exactly one version is editable at a time.** `create_version` refuses while a
+draft is open, so "which version am I changing?" always has one answer.
+
+### What a lock freezes
+
+Locking freezes the *specification* and leaves *progress* writable, because the
+team still has to report how far they have got against the baseline they were
+handed.
+
+| Entity | Writable while locked | Frozen |
+|---|---|---|
+| Requirement | *(nothing)* | all fields |
+| UserStory | `status` | title, description, requirements, acceptance criteria, platforms, data fields |
+| Screen | `status` | html, elements, story links, name, platform, phase |
+| Adr | `status`, `supersededBy` | title, content, requirements, components |
+| Component | *(nothing)* | all fields |
+| Phase | `status` | name, order, description |
+
+Creating or deleting an entity in a locked version is always rejected. Test
+executions, scenario results and VCS links are never frozen — they are progress,
+not specification.
+
+The check runs in the store, not in the tool handlers, so the MCP tools and the
+REST API are guarded by the same code. A rejected write says exactly which
+fields were frozen and what to do instead:
+
+```
+Cannot change frozen field(s) [title] of a user story in locked version 1.0.0.
+Only [status] stay writable while locked. Create the next version
+(create_version) and make the change there.
+```
+
+`unlock_version { force: true }` reopens a baseline for the case where a lock
+was a mistake. It is deliberately awkward: someone may already be building
+against that version, and the reason is recorded in the audit trail.
+
+### Which version a call targets
+
+Every tool accepts an optional `version`. Without one, the project's two
+pointers decide:
+
+- **specification edits** go to `draftVersion` — the open draft;
+- **reads and progress updates** go to `currentVersion` — the locked baseline.
+
+That split is the point: `record_execution` and `link_merge_request` default to
+the version the team is *delivering*, while `update_user_story`'s title change
+defaults to the version the BA is *writing*. `set_active_version` moves either
+pointer.
+
+The split is decided per call, not per tool, because several tools do both. A
+call to `update_user_story` that sets only `status` is a progress update and
+lands on the locked baseline; the same tool given a `title` is a scope change
+and lands on the draft. The rule is the freeze matrix above: supply nothing but
+fields that stay writable while locked, and the call is treated as progress.
+
+A few tools own a `version` field of their own — the version `create_version` is
+about to create, or a screen's content hash. Those are addressed with
+`atVersion` instead, so their own field keeps its meaning.
+
+### Versions and phases are different things
+
+A **phase** is a release slot (P1, P2…) — planning. A **version** is a content
+snapshot — what the specification said at a moment in time. A phase can be
+re-baselined many times, and a version can span several phases.
+
+### Coverage carry-over
+
+A test result recorded against 1.0.0 still counts in 1.1.0 — but only for the
+stories whose specification is byte-identical along the whole ancestor chain.
+Reword a story's acceptance criteria and its old results stop counting, so the
+scenario reads as untested until it is re-run. Copying a version therefore costs
+nothing in re-testing, while a real scope change is never silently signed off by
+an old green run.
+
+### REST endpoints
+
+```
+GET  /api/versions                                # history + both pointers
+GET  /api/versions/diff?from=1.0.0&to=1.1.0       # &entity= to scope it
+POST /api/versions                                # {from, version|bump, label, actor, reason}
+POST /api/versions/:version/lock                  # {actor, reason}
+POST /api/versions/:version/unlock                # {force, actor, reason}
+POST /api/versions/active                         # {current, draft}
+```
+
+Every read route also accepts `?version=` — `/api/requirements?version=1.0.0`
+returns the requirements as they were in that baseline. Omitted, routes resolve
+the project's current version, so a caller that predates versioning is
+unaffected.
+
+### Export and import
+
+`export_project` exports one version — the current baseline, or the one you name
+— and `allVersions: true` exports the whole history plus the version registry.
+Importing a payload that carries a registry restores every version with its lock
+state.
+
+### Upgrading
+
+Existing projects are migrated in place on first open: all data is stamped
+`1.0.0`, registered as a **draft**, and both pointers aim at it. Nothing is
+frozen and no call changes behaviour until you lock for the first time.
 
 ## Architecture decisions — ADRs
 

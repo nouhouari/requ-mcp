@@ -27,11 +27,16 @@ import {
   testKey,
   storiesFromTags,
   AdrStatus,
+  INITIAL_VERSION,
+  ProjectVersion,
+  VERSIONED_ENTITIES,
   VcsRefKind,
   VcsRefState,
   VcsType,
   type AcceptanceCriterion,
   type Adr as TAdr,
+  type ProjectVersion as TProjectVersion,
+  type VersionedEntity,
   type Component as TComponent,
   type Execution,
   type Phase,
@@ -42,6 +47,10 @@ import {
   type UserStory,
   type VcsRef,
 } from "./schema.js";
+import { SEMVER_RE } from "./schema.js";
+import { bumpSemver, compareSemver, MUTABLE_WHILE_LOCKED } from "./versioning.js";
+import { diffVersions } from "./version-diff.js";
+import { createVersion, lockVersion, unlockVersion, setActiveVersion } from "./version-ops.js";
 import {
   danglingStoryTags,
   indexConductor,
@@ -277,12 +286,142 @@ function selectorFor(toolName: string, args: any): string | undefined {
   return args.key;
 }
 
+const versionSchema = z
+  .string()
+  .optional()
+  .describe(
+    "Specification version to address, e.g. '1.2.0'. Omit to use the project's " +
+      "default: the open draft for specification edits, the current locked baseline " +
+      "for reads and for recording progress.",
+  );
+
+/**
+ * Resolve which version a tool call targets, and return a store bound to it.
+ *
+ * Precedence: an explicit `version` argument, then the project pointer that suits
+ * the tool (`draftVersion` for specification edits, `currentVersion` otherwise),
+ * then the initial version. Every read and write below this point is confined to
+ * that one baseline.
+ */
+/**
+ * True when every field the caller actually supplied stays writable while the
+ * version is locked. `key`, `version` and the entity id are transport/addressing,
+ * not content, so they do not count either way.
+ */
+const ADDRESSING_ARGS = new Set(["key", "atVersion", "id", "storyId", "screenId", "adrId"]);
+
+function isProgressOnlyPayload(
+  entity: VersionedEntity,
+  args: Record<string, unknown>,
+  ownsVersion: boolean,
+): boolean {
+  const allowed = new Set<string>(MUTABLE_WHILE_LOCKED[entity]);
+  if (allowed.size === 0) return false;
+  const supplied = Object.keys(args).filter((k) => {
+    if (args[k] === undefined) return false;
+    if (ADDRESSING_ARGS.has(k)) return false;
+    // `version` is addressing for most tools but content for the few that
+    // declare one, and content must count towards the decision.
+    if (k === "version") return ownsVersion;
+    return true;
+  });
+  return supplied.length > 0 && supplied.every((k) => allowed.has(k));
+}
+
+async function bindVersion(
+  store: AnyStore,
+  explicit: string | undefined,
+  mutates: Mutates | undefined,
+  toolName: string,
+  entity?: VersionedEntity,
+  args?: Record<string, unknown>,
+  ownsVersion = false,
+): Promise<AnyStore> {
+  // init_project creates the project (and its first version), so there is nothing
+  // to resolve against yet.
+  if (toolName === "init_project") return store;
+
+  let cfg: Awaited<ReturnType<AnyStore["readConfig"]>> | null = null;
+  try {
+    cfg = await store.readConfig();
+  } catch {
+    return store; // uninitialized — the tool itself will report that
+  }
+
+  // A `spec` tool called with nothing but lock-permitted fields is a progress
+  // update wearing a specification tool's clothes — marking a story done, or an
+  // ADR accepted. Those belong on the baseline the team is delivering, so they
+  // resolve like progress and are allowed to land on a locked version.
+  const progressOnly = mutates === "spec" && entity !== undefined && args !== undefined
+    && isProgressOnlyPayload(entity, args, ownsVersion);
+  const effective: Mutates | undefined = progressOnly ? "progress" : mutates;
+
+  const target =
+    explicit ??
+    (effective === "spec"
+      ? cfg.draftVersion ?? cfg.currentVersion
+      : cfg.currentVersion ?? cfg.draftVersion) ??
+    INITIAL_VERSION;
+
+  const known = await store.listVersions();
+  if (known.length && !known.some((v) => v.version === target)) {
+    throw new Error(
+      `Unknown version '${target}'. Known: [${known.map((v) => v.version).join(", ")}].`,
+    );
+  }
+
+  // A specification edit aimed at a locked baseline is almost always a mistake:
+  // say so here rather than letting the store reject each field one at a time.
+  // lock_version is exempt: locking an already-locked version is a no-op it
+  // reports for itself, not an error.
+  if (effective === "spec" && !explicit && toolName !== "lock_version") {
+    const row = known.find((v) => v.version === target);
+    if (row?.status === "locked") {
+      throw new Error(
+        `Version ${target} is locked and no draft is open. ` +
+          `Run create_version to start the next version, then retry.`,
+      );
+    }
+  }
+
+  return store.at(target) as AnyStore;
+}
+
+/** Sole open draft of a project, if there is one. */
+async function openDraft(store: AnyStore): Promise<TProjectVersion | null> {
+  const versions = await store.listVersions();
+  return versions.find((v) => v.status === "draft") ?? null;
+}
+
 type Handler = (args: any, store: AnyStore) => Promise<unknown>;
 
+/**
+ * What a tool does to the data, which decides the version it defaults to.
+ *
+ *  - `spec`     — edits the specification. Defaults to the open draft, because
+ *                 that is where new scope is written.
+ *  - `progress` — records how far delivery has got (test runs, VCS links).
+ *                 Defaults to the *current* baseline: the team reports progress
+ *                 against the version they are building, which is usually locked.
+ *  - undefined  — a read. Defaults to the current baseline.
+ */
+type Mutates = "spec" | "progress";
+
+/**
+ * Entity a `spec` tool writes, so version resolution can tell a scope change
+ * from a progress update on a dual-purpose tool.
+ *
+ * `update_user_story` sets a title (specification — belongs in the draft) *and*
+ * a status (progress — belongs on the baseline the team is delivering). Which
+ * one a given call is depends on its payload, not on the tool, so the freeze
+ * matrix is consulted against the arguments actually supplied.
+ */
 type ToolDef = {
   name: string;
   config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> };
   handler: Handler;
+  mutates?: Mutates;
+  entity?: VersionedEntity;
 };
 
 /**
@@ -297,19 +436,34 @@ function tool(
   name: string,
   config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> },
   handler: Handler,
+  mutates?: Mutates,
+  entity?: VersionedEntity,
 ) {
-  toolDefs.push({ name, config, handler });
+  toolDefs.push({ name, config, handler, mutates, entity });
 }
 
 /** Build a fresh McpServer with every collected tool registered on it. */
 function createServer(): McpServer {
   const server = new McpServer({ name: "requ-mcp", version: PKG_VERSION });
-  for (const { name, config, handler } of toolDefs) {
+  for (const { name, config, handler, mutates, entity } of toolDefs) {
     const base = config.inputSchema ?? {};
     const inputSchema: Record<string, z.ZodTypeAny> = { ...base };
     // Every tool accepts `key` as the HTTP-mode project identifier. Tools that
     // already declare their own `key` (e.g. init_project) keep their definition.
     if (!("key" in inputSchema)) inputSchema.key = keySchema;
+
+    // …and a parameter addressing the specification baseline. Omitted, it
+    // resolves to the project's draft (for specification edits) or current
+    // version (otherwise).
+    //
+    // A few tools own a `version` field of their own — the name of the version
+    // create_version is about to make, or a screen's content hash. Injecting
+    // over those would be silently destructive, so they are addressed with
+    // `atVersion` instead and their own field stays content.
+    const ownsVersion = "version" in base;
+    const addressArg = ownsVersion ? "atVersion" : "version";
+    inputSchema[addressArg] = versionSchema;
+
     server.registerTool(
       name,
       { title: config.title, description: config.description, inputSchema },
@@ -317,7 +471,10 @@ function createServer(): McpServer {
         try {
           const selector = selectorFor(name, args);
           const store = await getStore(server, selector, name === "init_project");
-          return (await handler(args, store)) as ReturnType<typeof json>;
+          const bound = await bindVersion(
+            store, args[addressArg], mutates, name, entity, args, ownsVersion,
+          );
+          return (await handler(args, bound)) as ReturnType<typeof json>;
         } catch (e) {
           return fail((e as Error).message);
         }
@@ -515,8 +672,20 @@ tool(
       conductorReportPath: args.conductorReportPath ?? existing?.conductorReportPath,
       activePhase: existing?.activePhase,
       uiPlatforms: args.uiPlatforms ?? existing?.uiPlatforms,
+      // A new project opens on an editable 1.0.0; both pointers aim at it until
+      // it is locked and a successor is created.
+      currentVersion: existing?.currentVersion ?? INITIAL_VERSION,
+      draftVersion:   existing?.draftVersion   ?? INITIAL_VERSION,
     };
     await store.init(config);
+    if (!(await store.getVersion(config.draftVersion))) {
+      await store.writeVersion({
+        version: config.draftVersion,
+        status: "draft",
+        label: "Initial version",
+        createdAt: now(),
+      });
+    }
     let phase: Phase | undefined;
     if (args.initialPhase) {
       phase = {
@@ -525,6 +694,7 @@ tool(
         order: 1,
         status: "active",
         description: "",
+        removed: false,
         createdAt: now(),
         updatedAt: now(),
       };
@@ -569,6 +739,158 @@ tool(
 );
 
 // ===========================================================================
+// Versions
+// ===========================================================================
+
+tool(
+  "list_versions",
+  {
+    title: "List Specification Versions",
+    description:
+      "List every specification version (baseline) of the project, oldest first, " +
+      "with its lock state, label, parent and audit trail. Also reports which " +
+      "version reads default to (current) and which specification edits go to (draft).",
+    inputSchema: {},
+  },
+  async (_args, store) => {
+    const versions = await store.listVersions();
+    const cfg = await store.readConfig();
+    return json({
+      currentVersion: cfg.currentVersion ?? null,
+      draftVersion: cfg.draftVersion ?? null,
+      versions,
+    });
+  },
+);
+
+tool(
+  "create_version",
+  {
+    title: "Create the Next Specification Version",
+    description:
+      "Branch a new, editable specification version from an existing one, copying " +
+      "every requirement, story, screen, ADR, component and phase. Use this after " +
+      "locking a baseline so the BA can prepare the next scope without disturbing " +
+      "the version a team is currently building. Only one draft may be open at a " +
+      "time: lock the open draft first. Give either an explicit version or a bump.",
+    inputSchema: {
+      from: z.string().optional().describe("Version to branch from. Defaults to the current baseline."),
+      version: z.string().optional().describe("Explicit semver for the new version, e.g. '2.0.0'."),
+      bump: z.enum(["major", "minor", "patch"]).optional().describe("Derive the new version from 'from' by bumping this part. Defaults to 'minor'."),
+      label: z.string().optional().describe("Human label, e.g. 'Q3 scope'."),
+      actor: z.string().optional().describe("Who is creating this version, recorded for traceability."),
+      reason: z.string().optional().describe("Why this version is being created."),
+      setDraft: z.boolean().optional().describe("Point the project's draft pointer at the new version. Default true."),
+    },
+  },
+  async (args, store) => {
+    const r = await createVersion(store, args);
+    return r.ok ? json(r.data) : fail(r.error);
+  }
+);
+
+tool(
+  "lock_version",
+  {
+    title: "Lock a Specification Version",
+    description:
+      "Freeze a version's specification so a team can build against a stable " +
+      "baseline. Once locked, requirements, stories, screens, ADRs, components and " +
+      "phases can no longer be edited in it — only progress fields (statuses, " +
+      "ADR supersession) stay writable, along with test executions and VCS links. " +
+      "Locking also makes this version the project's current baseline for reads.",
+    inputSchema: {
+      actor: z.string().optional().describe("Who is locking, recorded for traceability."),
+      reason: z.string().optional().describe("Why this baseline is being frozen."),
+      setCurrent: z.boolean().optional().describe("Make this the current baseline for reads. Default true."),
+    },
+  },
+  async (args, store) => {
+    const r = await lockVersion(store, await store.version(), args);
+    return r.ok ? json(r.data) : fail(r.error);
+  },
+  "spec",
+);
+
+tool(
+  "unlock_version",
+  {
+    title: "Unlock a Specification Version",
+    description:
+      "Reopen a locked version for editing. This is an escape hatch for correcting " +
+      "a mistake in a freshly locked baseline: anyone already building against it " +
+      "will see the specification change underneath them, so prefer create_version. " +
+      "Requires force:true, and the reason is recorded in the version's audit trail.",
+    inputSchema: {
+      force: z.boolean().optional().describe("Must be true — confirms you accept that a published baseline will change."),
+      actor: z.string().optional().describe("Who is unlocking, recorded for traceability."),
+      reason: z.string().optional().describe("Why the baseline is being reopened."),
+    },
+  },
+  async (args, store) => {
+    const r = await unlockVersion(store, await store.version(), args);
+    return r.ok ? json(r.data) : fail(r.error);
+  }
+);
+
+tool(
+  "set_active_version",
+  {
+    title: "Set the Active Version",
+    description:
+      "Change which version the project defaults to. 'current' is what reads and " +
+      "progress updates target; 'draft' is where specification edits go. Individual " +
+      "tool calls can still override this with their own version parameter.",
+    inputSchema: {
+      current: z.string().optional().describe("Version reads default to."),
+      draft: z.string().optional().describe("Version specification edits default to. Must be an unlocked version."),
+    },
+  },
+  async (args, store) => {
+    const r = await setActiveVersion(store, { current: args.current, draft: args.draft });
+    return r.ok ? json(r.data) : fail(r.error);
+  }
+);
+
+tool(
+  "diff_versions",
+  {
+    title: "Diff Two Specification Versions",
+    description:
+      "Compare two versions and report what was added, removed and modified per " +
+      "entity type, down to individual fields. Use it to review the scope change " +
+      "between the baseline a team is building and the next one being prepared.",
+    inputSchema: {
+      from: z.string().describe("Baseline version, e.g. '1.0.0'."),
+      to: z.string().optional().describe("Version to compare against. Defaults to the open draft, or the current baseline."),
+      entity: z.enum(VERSIONED_ENTITIES).optional().describe("Restrict the report to one entity type."),
+      fields: z.boolean().optional().describe("Include field-level before/after values for modified entities. Default true."),
+    },
+  },
+  async (args, store) => {
+    const known = await store.listVersions();
+    const cfg = await store.readConfig();
+    const to = args.to ?? cfg.draftVersion ?? cfg.currentVersion ?? (await store.version());
+    for (const v of [args.from, to]) {
+      if (known.length && !known.some((k) => k.version === v)) {
+        return fail(`Unknown version '${v}'. Known: [${known.map((k) => k.version).join(", ")}].`);
+      }
+    }
+    if (args.from === to) return fail(`from and to are both '${to}'.`);
+
+    const diff = await diffVersions(store, args.from, to, { includeFieldChanges: args.fields !== false });
+    if (!args.entity) return json(diff);
+    return json({
+      from: diff.from,
+      to: diff.to,
+      identical: diff.summary[args.entity].added === 0 && diff.summary[args.entity].removed === 0 && diff.summary[args.entity].modified === 0,
+      summary: { [args.entity]: diff.summary[args.entity] },
+      entities: { [args.entity]: diff.entities[args.entity] },
+    });
+  },
+);
+
+// ===========================================================================
 // Components
 // ===========================================================================
 
@@ -595,12 +917,14 @@ tool(
       description: args.description ?? "",
       domainTags:  args.domainTags ?? [],
       status:      "active",
+      removed:     false,
       createdAt:   now(),
       updatedAt:   now(),
     };
     await store.writeComponent(comp);
     return json(comp);
   },
+  "spec",
 );
 
 tool(
@@ -659,6 +983,7 @@ tool(
     await store.writeComponent(comp);
     return json(comp);
   },
+  "spec",
 );
 
 // ===========================================================================
@@ -702,7 +1027,8 @@ tool(
     }
 
     const existing = await store.listRequirements();
-    const id = args.id ?? nextId("REQ", existing.map((r) => r.id));
+    // Ids are allocated across every version, so REQ-060 never means two things.
+    const id = args.id ?? nextId("REQ", await store.idsAcrossVersions("requirements"));
     if (existing.some((r) => r.id === id)) return fail(`Requirement ${id} already exists.`);
     const req: Requirement = {
       id,
@@ -713,6 +1039,7 @@ tool(
       components: args.components ?? [],
       tags: args.tags ?? [],
       status: "active",
+      removed: false,
       ...(phase.value ? { phase: phase.value } : {}),
       createdAt: now(),
       updatedAt: now(),
@@ -720,6 +1047,7 @@ tool(
     await store.writeRequirement(req);
     return json(req);
   },
+  "spec",
 );
 
 tool(
@@ -829,6 +1157,7 @@ tool(
     await store.writeRequirement(req);
     return json(req);
   },
+  "spec",
 );
 
 tool(
@@ -908,6 +1237,7 @@ tool(
       dryRun: !!args.dryRun,
     });
   },
+  "spec",
 );
 
 // ===========================================================================
@@ -937,7 +1267,7 @@ tool(
     if (missing.length) return fail(`Unknown requirement(s): ${missing.join(", ")}`);
 
     const existing = await store.listStories();
-    const id = args.id ?? nextId("US", existing.map((s) => s.id));
+    const id = args.id ?? nextId("US", await store.idsAcrossVersions("stories"));
     if (existing.some((s) => s.id === id)) return fail(`Story ${id} already exists.`);
 
     const acceptanceCriteria: AcceptanceCriterion[] = (args.acceptanceCriteria ?? []).map((t: string, i: number) => ({
@@ -953,12 +1283,14 @@ tool(
       status: "draft",
       platforms: args.platforms ?? [],
       dataFields: args.dataFields ?? [],
+      removed: false,
       createdAt: now(),
       updatedAt: now(),
     };
     await store.writeStory(story);
     return json({ ...story, hint: `Tag scenarios with @${id} in your feature files to link tests to this story.` });
   },
+  "spec",
 );
 
 tool(
@@ -1097,6 +1429,8 @@ tool(
     await store.writeStory(story);
     return json(story);
   },
+  "spec",
+  "stories",
 );
 
 tool(
@@ -1120,6 +1454,7 @@ tool(
     await store.writeStory(story);
     return json({ storyId: args.storyId, criterion: ac });
   },
+  "spec",
 );
 
 tool(
@@ -1150,6 +1485,7 @@ tool(
     await store.writeStory(story);
     return json({ deleted: true, storyId: args.storyId, criterion: removed, remaining: story.acceptanceCriteria });
   },
+  "spec",
 );
 
 // ===========================================================================
@@ -1181,6 +1517,7 @@ tool(
       order,
       status:      args.activate ? "active" : "planned",
       description: args.description ?? "",
+      removed:     false,
       createdAt:   now(),
       updatedAt:   now(),
     };
@@ -1191,6 +1528,7 @@ tool(
     }
     return json(phase);
   },
+  "spec",
 );
 
 tool(
@@ -1227,6 +1565,8 @@ tool(
     await store.writePhase(phase);
     return json(phase);
   },
+  "spec",
+  "phases",
 );
 
 tool(
@@ -1243,6 +1583,7 @@ tool(
     await store.writeConfig({ ...cfg, activePhase: args.id });
     return json({ activePhase: args.id });
   },
+  "progress",
 );
 
 // ===========================================================================
@@ -1418,6 +1759,7 @@ tool(
     await store.writeScenario(sc);
     return json({ scenario: sc, valid: validation.ok, warnings: { unknownStories: await unknownStories(store, stories) } });
   },
+  "progress",
 );
 
 tool(
@@ -1460,6 +1802,7 @@ tool(
     await store.writeScenario(sc);
     return json({ scenario: sc, valid: sc.valid, warnings: { unknownStories: await unknownStories(store, sc.stories) } });
   },
+  "progress",
 );
 
 tool(
@@ -1558,6 +1901,7 @@ tool(
     const deleted = await store.deleteScenario(tk);
     return json({ deleted, testKey: tk });
   },
+  "progress",
 );
 
 tool(
@@ -1640,6 +1984,7 @@ tool(
     }
     return json({ root, scenariosParsed: index.scenarios.length, imported: imported.length, skipped: skipped.length, invalid });
   },
+  "progress",
 );
 
 // ===========================================================================
@@ -1782,6 +2127,7 @@ tool(
       terminal: args.terminal ?? existing?.terminal ?? false,
       elements: parsed.elements,
       storyVersions,
+      removed: existing?.removed ?? false,
       createdAt: existing?.createdAt ?? ts,
       updatedAt: ts,
     };
@@ -1800,6 +2146,8 @@ tool(
       hint: "Run check_ui_coverage to validate the UI traceability graph for this phase.",
     });
   },
+  "spec",
+  "screens",
 );
 
 tool(
@@ -2028,6 +2376,7 @@ tool(
     await store.writeScreen(screen);
     return json({ linked: true, story: args.story_id, screen: args.screen_id, role, stories: screen.stories });
   },
+  "spec",
 );
 
 tool(
@@ -2049,6 +2398,7 @@ tool(
     await store.writeScreen(screen);
     return json({ unlinked: true, story: args.story_id, screen: args.screen_id, stories: screen.stories });
   },
+  "spec",
 );
 
 tool(
@@ -2128,6 +2478,7 @@ tool(
     const deleted = await store.deleteScreen(args.id);
     return json({ deleted, id: args.id });
   },
+  "spec",
 );
 
 // ===========================================================================
@@ -2217,7 +2568,7 @@ tool(
     if (phase.error) return phase.error;
 
     const existing = await store.listAdrs();
-    const id = args.id ?? nextId("ADR", existing.map((a) => a.id));
+    const id = args.id ?? nextId("ADR", await store.idsAcrossVersions("adrs"));
     if (existing.some((a) => a.id === id)) return fail(`Adr ${id} already exists. Use update_adr.`);
 
     const content = args.content ?? "";
@@ -2233,12 +2584,14 @@ tool(
       sourcePath: args.sourcePath,
       phase: phase.value,
       version: htmlVersion(content),
+      removed: false,
       createdAt: ts,
       updatedAt: ts,
     };
     await store.writeAdr(adr);
     return json({ ...adrSummary(adr), hint: "Fetch the body with get_adr_content." });
   },
+  "spec",
 );
 
 tool(
@@ -2367,6 +2720,8 @@ tool(
     await store.writeAdr(adr);
     return json(adrSummary(adr));
   },
+  "spec",
+  "adrs",
 );
 
 tool(
@@ -2412,7 +2767,7 @@ tool(
     }
     const files = names.filter((n) => n.toLowerCase().endsWith(".md")).sort();
     const existing = await store.listAdrs();
-    const takenIds = new Set(existing.map((a) => a.id));
+    const takenIds = new Set(await store.idsAcrossVersions("adrs"));
     const bySourcePath = new Map(existing.filter((a) => a.sourcePath).map((a) => [a.sourcePath as string, a.id]));
 
     const imported: string[] = [];
@@ -2437,6 +2792,7 @@ tool(
           components: [],
           sourcePath,
           version: htmlVersion(md),
+          removed: false,
           createdAt: ts,
           updatedAt: ts,
         } as TAdr);
@@ -2449,6 +2805,7 @@ tool(
       hint: imported.length ? "Link them to requirements with update_adr." : undefined,
     });
   },
+  "spec",
 );
 
 tool(
@@ -2463,6 +2820,7 @@ tool(
     const deleted = await store.deleteAdr(args.id);
     return json({ deleted, id: args.id });
   },
+  "spec",
 );
 
 // ===========================================================================
@@ -2519,6 +2877,7 @@ tool(
     await store.appendExecutions(phaseId, [exec]);
     return json({ phase: phaseId, recorded: exec });
   },
+  "progress",
 );
 
 tool(
@@ -2581,6 +2940,7 @@ tool(
         .map((e) => ({ feature: e.feature, name: e.name, status: e.status })),
     });
   },
+  "progress",
 );
 
 // ===========================================================================
@@ -2711,6 +3071,7 @@ tool(
     await store.writeConfig(next);
     return json({ repoUrl: next.repoUrl, defaultBranch: next.defaultBranch, vcsType: next.vcsType ?? null });
   },
+  "progress",
 );
 
 tool(
@@ -2779,6 +3140,7 @@ tool(
     await store.writeVcsRef(ref);
     return json(ref);
   },
+  "progress",
 );
 
 tool(
@@ -2826,6 +3188,7 @@ tool(
     await store.writeVcsRef(ref);
     return json(ref);
   },
+  "progress",
 );
 
 tool(
@@ -2851,6 +3214,7 @@ tool(
     if (!updated) return fail(`Merge request reference ${target.id} not found.`);
     return json(updated);
   },
+  "progress",
 );
 
 tool(
@@ -2885,12 +3249,14 @@ tool(
   {
     title: "Export project",
     description:
-      "Export all project data (components, requirements, stories, scenarios, screens, architecture decisions, phases, executions, VCS refs) as a JSON string. Pass the result to import_project on another instance to migrate or copy data.",
-    inputSchema: {},
+      "Export project data (components, requirements, stories, scenarios, screens, architecture decisions, phases, executions, VCS refs) as a JSON string. Exports one specification version — the current baseline unless you pass version — or the whole history with allVersions. Pass the result to import_project on another instance to migrate or copy data.",
+    inputSchema: {
+      allVersions: z.boolean().optional().describe("Include every specification version and the version registry, not just one. Default false."),
+    },
   },
-  async (_args, store) => {
+  async (args, store) => {
     await ensureInit(store);
-    const payload = await buildExport(store);
+    const payload = await buildExport(store, { allVersions: args.allVersions === true });
     return json(JSON.stringify(payload, null, 2));
   },
 );
@@ -2900,9 +3266,11 @@ tool(
   {
     title: "Import project",
     description:
-      "Import project data from a JSON string produced by export_project. Existing records (same ID) are skipped and reported. Returns a summary of what was imported and what was skipped.",
+      "Import project data from a JSON string produced by export_project. Existing records (same ID) are skipped and reported. A payload containing a version registry restores every version with its lock state; pass allVersions:false to collapse it into the target version instead. Returns a summary of what was imported and what was skipped.",
     inputSchema: {
       data: z.string().describe("JSON string produced by export_project"),
+      allVersions: z.boolean().optional().describe("Restore the payload's whole version history when it has one. Default true."),
+      force: z.boolean().optional().describe("Overwrite a version that already exists and is locked. Off by default: a locked baseline is left untouched and reported instead."),
     },
   },
   async (args, store) => {
@@ -2917,9 +3285,10 @@ tool(
     if (!parsed.success) {
       return fail(`Invalid export format: ${parsed.error.message}`);
     }
-    const report = await applyImport(store, parsed.data);
+    const report = await applyImport(store, parsed.data, { allVersions: args.allVersions, force: args.force });
     return json(report);
   },
+  "spec",
 );
 
 function renderMarkdown(report: ReturnType<typeof buildReport> & { byComponent: Array<{ component: string; componentName?: string; domainTags?: string[]; requirements: number; verified: number; verifiedPct: number }> }, phaseName: string): string {
