@@ -4,7 +4,41 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
-## [2.0.0] – unreleased
+## [2.1.0] – 2026-09-06
+
+### Added
+- **Traceability dashboard tab.** A left-to-right chain graph — Requirements →
+  User stories → Scenarios → latest result — drawn as columns of cards with the
+  links between them, and a red dashed stub wherever the chain breaks: a
+  requirement without a story, a story without a scenario, a scenario never run
+  or failing, or a `@US-xxx` tag pointing at a story that does not exist. Phase
+  and cumulative/strict filters as on the Coverage tab, a "Gaps only" toggle,
+  search, and click-to-focus on any node to see just its chain — a Back button,
+  Esc or the browser's Back button return to the full chain; ids jump to the
+  entity's own tab. Refreshes live with the rest of the dashboard.
+- **`GET /api/traceability`** — the chain behind the tab: `requirements[]`,
+  `stories[]`, `scenarios[]` (each with its `lastRun` and a status that
+  distinguishes **`never_run`** from a recorded `pending`), `dangling[]` tags and
+  per-link gap counts. Same `phase`/`mode`/`project`/`version` parameters as
+  `/api/coverage`.
+- **`feedingPhases()` / `resolveLatestRuns()`** in `coverage.ts` — the phase
+  selection that decides which executions count is now defined once and shared
+  by `resolveStatuses` (no behaviour change) and the new latest-run resolution.
+- **Deployment compose file.** `deploy/docker-compose.yml` runs the published
+  image next to Postgres with health-gated startup, a persistent database
+  volume, a read-only container filesystem, rotated logs and the port bound to
+  `127.0.0.1` for use behind a reverse proxy; `deploy/env.example` documents the
+  settings. The root `docker-compose.yml` remains the build-from-source setup.
+- **Container image.** A multi-stage `Dockerfile` builds a small runtime image
+  (no compilers, runs as the `node` user, healthcheck on `/api/version`), and
+  the new `docker.yml` workflow smoke-tests it on every PR and publishes it to
+  `ghcr.io/nouhouari/requ-mcp` (linux/amd64 + linux/arm64) on every push to
+  `main`, tagged `latest`, `sha-<commit>` and the package version.
+  `docker-compose.yml` now builds from `Dockerfile` (replacing
+  `Dockerfile.requ`, which ran `tsx` against the sources) and honours
+  `REQU_IMAGE` to use the published image instead.
+
+## [2.0.0] – 2026-09-04 (merged to main; never published to npm — first shipped as part of 2.1.0)
 
 ### Added
 - **Specification versioning.** A project can now hold several *versions* of its

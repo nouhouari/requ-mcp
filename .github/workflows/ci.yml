@@ -43,3 +43,6 @@ jobs:
 
       - name: Smoke test — scenario search
         run: npm run smoke:search
+
+      - name: Smoke test — traceability chain
+        run: npm run smoke:traceability

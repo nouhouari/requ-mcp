@@ -61,6 +61,56 @@ project it means:
 > cannot read now fail with an explicit error rather than looking empty.
 
 <details>
+<summary>Deploying on a server (prebuilt image, no build step)</summary>
+
+`deploy/docker-compose.yml` runs the published image next to Postgres with
+health-gated startup, a persistent database volume, a read-only container
+filesystem, rotated logs, and the port bound to `127.0.0.1` so you can put a
+TLS-terminating reverse proxy in front of it:
+
+```bash
+cd deploy
+cp env.example .env     # set PG_PASSWORD (URL-safe) and REQU_WORKSPACE_DIR
+docker compose up -d
+docker compose logs -f requ
+```
+
+Pin `REQU_TAG` in `.env` to a version (e.g. `2.0.0`) for reproducible deploys;
+upgrade with `docker compose pull && docker compose up -d`. Back up with
+`docker compose exec -T postgres pg_dump -U requ requ > requ.sql`. Set
+`REQU_BIND=0.0.0.0` only on a trusted network — the server has no
+authentication of its own.
+</details>
+
+<details>
+<summary>Using the prebuilt image instead of building locally</summary>
+
+Every push to `main` publishes a multi-arch image (linux/amd64, linux/arm64) to
+GitHub Container Registry, tagged `latest`, `sha-<commit>` and the package
+version (`2.0.0`, `2.0`, `2`):
+
+```bash
+docker pull ghcr.io/nouhouari/requ-mcp:latest
+```
+
+Point the compose file at it with `REQU_IMAGE=ghcr.io/nouhouari/requ-mcp:latest`
+in `.env`, or run it standalone:
+
+```bash
+docker run -d --name requ -p 8788:8788 \
+  -e REQU_PG_URL=postgresql://user:pass@host:5432/requ \
+  -v /path/to/your/repos:/workspace:ro \
+  ghcr.io/nouhouari/requ-mcp:latest
+```
+
+Without `REQU_PG_URL` the image falls back to SQLite; set `REQU_PROJECTS` to
+the project root(s) under `/workspace` and mount a volume at `/data` (with
+`REQU_DB=/data/requ.db` for a single project) so the store outlives the
+container. The image runs as the unprivileged `node` user and exposes a
+healthcheck on `GET /api/version`.
+</details>
+
+<details>
 <summary>Running from source instead of Docker</summary>
 
 ```bash
@@ -96,6 +146,7 @@ when running under Docker Compose).
 | **Stories** | User stories with status, acceptance criteria count, and coverage badge; expand to see acceptance criteria and linked scenarios with pass/fail/pending icons |
 | **Screens** | UI specs: filterable screen cards (platform, status, staleness), the UI consistency-check results, and a viewer that renders the mockup in a sandboxed frame with traced elements outlined, its element table, exits and linked stories — see [Screens](#screens--ui-specifications) |
 | **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
+| **Traceability** | Left-to-right chain graph — Requirements → User stories → Scenarios → latest result — with a red dashed stub at every broken link (no story, no scenario, never run, failing, `@US` tag pointing at an unknown story). Phase + mode filters, "Gaps only", search; click a node to see just its chain, click an id to jump to its tab. Backed by `GET /api/traceability?phase=&mode=`, which takes the same parameters as `/api/coverage` and is the only place a scenario reads `never_run` rather than `pending` |
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
 | **Decisions** | Architecture decisions (ADRs) with status badges and their requirement/component links; open one to read the record with its mermaid diagrams rendered |
