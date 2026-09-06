@@ -23,6 +23,8 @@ import {
   buildTrend,
   findGaps,
   resolveStatuses,
+  resolveLatestRuns,
+  buildTraceability,
   resolveScenariosByStory,
   filterScenarios,
   countsByPhase,
@@ -1525,6 +1527,30 @@ export async function handleWebRequest(
           })),
         };
         jsonOk(res, enriched);
+      } catch (err) {
+        jsonError(res, 500, String(err));
+      }
+      return true;
+    }
+
+    // --- GET /api/traceability --- (the chain behind /api/coverage, one node per
+    // entity, with never-run scenarios and dangling @US tags made explicit)
+    if (matchRoute(pathname, method, "/api/traceability", "GET") !== null) {
+      const r = await resolveStore(stores, searchParams);
+      if (!handleStoreResult(res, r)) return true;
+      try {
+        const mode = parseCoverageMode(searchParams, res);
+        if (mode === null) return true;
+        const [{ requirements, stories, phases, executionsByPhase, storyMap }, scenarios] = await Promise.all([
+          buildCoverageData(r.store),
+          r.store.listScenarios(),
+        ]);
+        const phaseParam = searchParams.get("phase");
+        // Same semantics as /api/coverage: absent → active phase, empty → all phases.
+        const phaseId =
+          phaseParam === null ? await r.store.resolvePhaseId() : phaseParam || null;
+        const latestRuns = resolveLatestRuns(executionsByPhase, phases, phaseId, mode);
+        jsonOk(res, buildTraceability(requirements, stories, scenarios, storyMap, latestRuns, phaseId, mode, phases));
       } catch (err) {
         jsonError(res, 500, String(err));
       }

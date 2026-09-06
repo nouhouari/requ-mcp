@@ -11,6 +11,14 @@ document.addEventListener('alpine:init', function () {
   // instances in this closure variable keeps them raw and non-reactive.
   var CHARTS = { trend: null, donut: null };
 
+  // Non-reactive registry for the Traceability tab. The raw /api/traceability
+  // payload, the parent/child index and the edge list can reach thousands of
+  // entries; proxying them through Alpine would make every filter change crawl.
+  // Only the small, flat row arrays the template iterates live on the component.
+  var TRACE = { data: null, byId: {}, parents: {}, children: {}, edges: [], ro: null };
+  var TRACE_MAX_PER_STORY = 5;    // scenarios shown per story before "+N more"
+  var TRACE_MAX_SCENARIOS = 1500; // hard cap on scenario cards in one render
+
   Alpine.data('requApp', function () {
     return {
 
@@ -25,7 +33,7 @@ document.addEventListener('alpine:init', function () {
         config: false, summary: false, requirements: false,
         stories: false, components: false, phases: false,
         vcs: false, coverage: false, trend: false, gaps: false,
-        global: false, screens: false, adrs: false,
+        global: false, screens: false, adrs: false, traceability: false,
       },
 
       // ── Data ────────────────────────────────────────────────────────────────
@@ -110,6 +118,20 @@ document.addEventListener('alpine:init', function () {
       coveragePhase: null,
       coverageMode: 'cumulative',
       showStoriesDetail: false,
+
+      // ── Traceability tab ─────────────────────────────────────────────────────
+      tracePhase: null,          // null = not chosen yet, '' = "All phases"
+      traceMode: 'strict',
+      traceGapsOnly: false,
+      traceSearch: '',
+      traceSelected: null,       // focused node id (requirement/story/scenario)
+      traceHighlight: { ids: {} },
+      traceExpanded: {},         // storyId → true once "+N more" was clicked
+      traceRows: { cols: [[], [], []], counts: [0, 0, 0], total: 0, truncated: false },
+      traceSummary: null,
+      traceLoaded: false,
+      traceError: null,
+      _traceKey: '',             // "<phase>|<mode>" the loaded chain belongs to
 
       // ── Scenario viewer (gherkin) ─────────────────────────────────────────────
       /** testKey of the currently-open scenario, or null. */
@@ -221,6 +243,21 @@ document.addEventListener('alpine:init', function () {
         var self = this;
         this.$watch('coveragePhase', function () { self.refreshCoverage(); });
         this.$watch('coverageMode', function () { self.refreshCoverage(); });
+
+        // Traceability: phase/mode are server-side (refetch, but only once the tab
+        // has been opened — it is lazy); gaps-only and search are client-side.
+        this.$watch('tracePhase', function () { if (self.traceLoaded) self.loadTraceability(); });
+        this.$watch('traceMode',  function () { if (self.traceLoaded) self.loadTraceability(); });
+        this.$watch('traceGapsOnly', function () { self._traceRebuild(); });
+        this.$watch('traceSearch',   function () { self._traceRebuild(); });
+
+        // Browser Back/Forward drives the Traceability focus: leaving the focus
+        // entry clears it; returning to it (Forward) re-applies it when possible.
+        window.addEventListener('popstate', function (e) {
+          var id = e.state && e.state.traceFocus;
+          if (id && TRACE.byId[id]) { if (self.traceSelected !== id) self._traceFocus(id); }
+          else if (self.traceSelected) { self.traceClear(true); }
+        });
       },
 
       // =========================================================================
@@ -316,6 +353,7 @@ document.addEventListener('alpine:init', function () {
         ]);
         if (this.tab === 'scenarios') this.loadScenarios();
         if (this.tab === 'screens') this.loadScreens();
+        if (this.traceLoaded) this.loadTraceability(true);
       },
 
       /** Default comparison: the previous baseline against the newest one. */
@@ -402,6 +440,9 @@ document.addEventListener('alpine:init', function () {
         // Same for the Scenarios tab: a phase id from the previous project would
         // match nothing here and silently empty the list.
         this.scenariosPhase = '';
+        // And for Traceability: drop the old chain so its watchers stay quiet
+        // until loadSummary() has seeded tracePhase for the new project.
+        this._traceReset();
         // Reconnect SSE for the new project.
         if (this._sse) { this._sse.close(); this._sse = null; }
         this.setupSSE();
@@ -424,6 +465,7 @@ document.addEventListener('alpine:init', function () {
           self.loadGaps(),
           self.loadAllureStatus(),
         ]);
+        if (this.tab === 'traceability') this.loadTraceability(true);
       },
 
       async loadConfig() {
@@ -443,6 +485,8 @@ document.addEventListener('alpine:init', function () {
         if (d) {
           this.summary = d;
           if (!this.coveragePhase && d.activePhase) this.coveragePhase = d.activePhase;
+          // null = "not chosen yet"; '' = the user picked "All phases" — keep that.
+          if (this.tracePhase === null && d.activePhase) this.tracePhase = d.activePhase;
         }
         this.loading.summary = false;
       },
@@ -483,6 +527,7 @@ document.addEventListener('alpine:init', function () {
         if (d) this.phases = d;
         this.loading.phases = false;
         this.syncCoveragePhaseSelect();
+        this.syncTracePhaseSelect();
       },
 
       /**
@@ -600,7 +645,10 @@ document.addEventListener('alpine:init', function () {
                   d.storyCoveragePct !== prev.storyCoveragePct ||
                   d.stories !== prev.stories ||
                   d.requirements !== prev.requirements;
-                if (coverageChanged) { self.loadCoverage(); self.loadTrend(); self.loadGaps(); }
+                if (coverageChanged) {
+                  self.loadCoverage(); self.loadTrend(); self.loadGaps();
+                  if (self.traceLoaded) self.loadTraceability(true);
+                }
               }
             } catch (_) {}
           };
@@ -825,6 +873,9 @@ document.addEventListener('alpine:init', function () {
         if (id === 'screens')    { this.loadScreens(); }
         if (id === 'adrs')       { this.loadAdrs(); }
         if (id === 'versions')   { this.loadVersions(); }
+        // Lazy: fetches on first visit, re-measures the edges on later visits
+        // (the panel was display:none, so every node rect was 0×0 until now).
+        if (id === 'traceability') { this.loadTraceability(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -848,8 +899,8 @@ document.addEventListener('alpine:init', function () {
        */
       shiftFocus(dir) {
         var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions']
-          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions'];
+          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'traceability', 'components', 'vcs', 'scenarios', 'versions']
+          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'traceability', 'components', 'vcs', 'scenarios', 'versions'];
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }
@@ -1793,6 +1844,425 @@ document.addEventListener('alpine:init', function () {
 
       scenariosTotalPages() {
         return Math.max(1, Math.ceil(this.scenariosTotal / this.scenariosPageSize));
+      },
+
+      // =========================================================================
+      // Traceability tab — requirement → story → scenario → latest result
+      //
+      // The chain is rendered as three HTML columns of cards (Alpine x-for over
+      // `traceRows`) plus one SVG overlay whose edge paths are measured from the
+      // cards after render. Everything heavy stays in the TRACE closure.
+      // =========================================================================
+
+      /** Same fix as syncCoveragePhaseSelect: re-assert the <select> once x-for
+       *  has produced its options, and drop a phase the new project lacks. */
+      syncTracePhaseSelect() {
+        var want = this.tracePhase;
+        if (want && !this.phases.some(function (p) { return p.id === want; })) {
+          this.tracePhase = null;
+          return;
+        }
+        var self = this;
+        this.$nextTick(function () {
+          var el = document.getElementById('trace-phase');
+          if (el && el.value !== (self.tracePhase || '')) el.value = self.tracePhase || '';
+        });
+      },
+
+      _traceReset() {
+        TRACE.data = null; TRACE.byId = {}; TRACE.parents = {}; TRACE.children = {}; TRACE.edges = [];
+        this.traceLoaded = false;
+        this._traceKey = '';
+        this.tracePhase = null;
+        this.traceSelected = null;
+        this.traceHighlight = { ids: {} };
+        this.traceExpanded = {};
+        this.traceSummary = null;
+        this.traceRows = { cols: [[], [], []], counts: [0, 0, 0], total: 0, truncated: false };
+        var svg = this.$refs.traceEdges;
+        if (svg) svg.innerHTML = '';
+      },
+
+      /**
+       * Fetch the chain for the current phase/mode. When that slice is already
+       * loaded (and `force` is not set) only the edges are re-measured — that is
+       * what navTo() needs when the panel becomes visible again.
+       */
+      async loadTraceability(force) {
+        var self = this;
+        var key = (this.tracePhase || '') + '|' + this.traceMode;
+        if (!force && this.traceLoaded && this._traceKey === key && TRACE.data) {
+          this.$nextTick(function () { self._traceLayout(); });
+          return;
+        }
+        this.loading.traceability = true;
+        this.traceError = null;
+        // Always send phase= (empty => "All phases"), else the server defaults to the active phase.
+        var phase = '&phase=' + encodeURIComponent(this.tracePhase || '');
+        var d = await this._fetch(this.apiUrl('/api/traceability?mode=' + this.traceMode + phase));
+        if (d) {
+          TRACE.data = d;
+          this._traceKey = key;
+          this._traceIndex();
+          this.traceSummary = d.summary;
+          this.traceLoaded = true;
+          if (this.traceSelected && !TRACE.byId[this.traceSelected]) {
+            // The focused node is not part of this slice any more.
+            this.traceSelected = null;
+            this.traceHighlight = { ids: {} };
+          } else if (this.traceSelected) {
+            this.traceHighlight = { ids: this._traceChainIds(this.traceSelected) };
+          }
+          this._traceRebuild();
+          this._traceObserve();
+        } else if (!this.traceLoaded) {
+          this.traceError = 'Could not load the traceability chain.';
+        }
+        this.loading.traceability = false;
+      },
+
+      /** Build byId / parents / children from the raw payload. Unknown story ids
+       *  (dangling @US tags) become synthetic `missing:<id>` nodes. */
+      _traceIndex() {
+        var d = TRACE.data;
+        var byId = {}, parents = {}, children = {};
+        function edge(p, c) {
+          (children[p] = children[p] || []).push(c);
+          (parents[c] = parents[c] || []).push(p);
+        }
+        d.requirements.forEach(function (r) { byId[r.id] = { kind: 'req', item: r }; });
+        d.stories.forEach(function (s) { byId[s.id] = { kind: 'story', item: s }; });
+        d.scenarios.forEach(function (sc) { byId[sc.id] = { kind: 'scenario', item: sc }; });
+        d.requirements.forEach(function (r) {
+          r.storyIds.forEach(function (sid) { if (byId[sid]) edge(r.id, sid); });
+        });
+        d.scenarios.forEach(function (sc) {
+          sc.storyIds.forEach(function (sid) {
+            if (byId[sid] && byId[sid].kind === 'story') { edge(sid, sc.id); return; }
+            var mid = 'missing:' + sid;
+            if (!byId[mid]) byId[mid] = { kind: 'unknown', item: { id: sid } };
+            edge(mid, sc.id);
+          });
+        });
+        TRACE.byId = byId; TRACE.parents = parents; TRACE.children = children;
+      },
+
+      /** Ancestors ∪ descendants of a node (not the whole connected component:
+       *  a story's sibling stories are not part of its chain). */
+      _traceChainIds(id) {
+        var out = {};
+        out[id] = true;
+        function walk(map, start) {
+          var stack = [start];
+          while (stack.length) {
+            var cur = stack.pop();
+            (map[cur] || []).forEach(function (n) { if (!out[n]) { out[n] = true; stack.push(n); } });
+          }
+        }
+        walk(TRACE.parents, id);
+        walk(TRACE.children, id);
+        return out;
+      },
+
+      _traceIsGap(node) {
+        if (node.kind === 'req')      return node.item.status === 'active' && !node.item.hasStory;
+        if (node.kind === 'story')    return !node.item.tested;
+        if (node.kind === 'scenario') return node.item.status !== 'pass';
+        return node.kind === 'unknown';
+      },
+
+      traceStatusLabel(status) {
+        if (status === 'pass') return 'Pass';
+        if (status === 'fail') return 'Fail';
+        if (status === 'pending') return 'Pending';
+        if (status === 'never_run') return 'Never run';
+        return status || '';
+      },
+
+      /**
+       * Turn the indexed payload into the three column arrays + edge list.
+       * Order: requirements by (phase order, id); each requirement's stories
+       * follow it; each story's scenarios follow it. Filters (focus > search >
+       * gaps-only) are applied to id sets first so the graph stays connected.
+       */
+      _traceRebuild() {
+        var d = TRACE.data;
+        if (!d) return;
+        var self = this;
+        var byId = TRACE.byId, children = TRACE.children;
+        var natural = function (a, b) { return String(a).localeCompare(String(b), undefined, { numeric: true }); };
+
+        // 1. Visible id set (null = everything).
+        var visible = null;
+        if (this.traceSelected && byId[this.traceSelected]) {
+          visible = this._traceChainIds(this.traceSelected);
+        } else {
+          var q = (this.traceSearch || '').trim().toLowerCase();
+          if (q) {
+            visible = {};
+            Object.keys(byId).forEach(function (id) {
+              var n = byId[id];
+              if (n.kind === 'unknown') return;
+              var hay = [n.item.id, n.item.title, n.item.feature, n.item.name].join(' ').toLowerCase();
+              if (hay.indexOf(q) !== -1) Object.assign(visible, self._traceChainIds(id));
+            });
+          }
+          if (this.traceGapsOnly) {
+            var gaps = {};
+            Object.keys(byId).forEach(function (id) {
+              if (self._traceIsGap(byId[id])) Object.assign(gaps, self._traceChainIds(id));
+            });
+            if (visible) Object.keys(visible).forEach(function (id) { if (!gaps[id]) delete visible[id]; });
+            else visible = gaps;
+          }
+        }
+        var show = function (id) { return !visible || !!visible[id]; };
+
+        // 2. Placement.
+        var phaseOrder = {};
+        this.phases.forEach(function (p) { phaseOrder[p.id] = p.order; });
+        var orderOf = function (r) { return r.phase && phaseOrder[r.phase] !== undefined ? phaseOrder[r.phase] : Infinity; };
+
+        var col0 = [], col1 = [], col2 = [], edges = [];
+        var placedStory = {}, placedScenario = {};
+        var storyCount = 0, scenarioCount = 0, truncated = false;
+
+        function reqNode(r) {
+          var state = r.verified ? 'Verified' : r.hasStory ? 'Has stories, not all covered' : 'No user story';
+          return {
+            key: 'req:' + r.id, id: r.id, kind: 'req', selectable: true,
+            label: r.title, sub: r.priority + (r.phase ? ' · ' + r.phase : ''),
+            gap: r.status === 'active' && !r.hasStory, ok: r.verified,
+            tip: r.id + ' — ' + r.title + '\n' + state,
+          };
+        }
+        function storyNode(s) {
+          var state = s.covered ? 'Covered' : s.tested ? 'Has scenarios, not all passing' : 'No scenario';
+          return {
+            key: 'story:' + s.id, id: s.id, kind: 'story', selectable: true,
+            label: s.title, sub: s.status,
+            gap: !s.tested, ok: s.covered,
+            tip: s.id + ' — ' + s.title + '\n' + state,
+          };
+        }
+        function scenarioNode(sc) {
+          var run = sc.lastRun
+            ? ' · ' + self.shortDate(sc.lastRun.ranAt) + ' · ' + sc.lastRun.phase + ' · ' + sc.lastRun.source
+            : '';
+          return {
+            key: 'scenario:' + sc.id, id: sc.id, kind: 'scenario', selectable: true,
+            label: sc.name, sub: sc.feature, status: sc.status,
+            gap: sc.status !== 'pass', ok: sc.status === 'pass',
+            tip: sc.feature + ' › ' + sc.name + (sc.file ? '\n' + sc.file : '') + '\n' +
+                 self.traceStatusLabel(sc.status) + run + (sc.valid ? '' : '\nInvalid gherkin'),
+          };
+        }
+        function edgeClass(status) {
+          if (status === 'pass') return '';
+          if (status === 'pending') return 'warn';
+          return 'gap';
+        }
+
+        function placeScenarios(s) {
+          if (!s.tested) {
+            col2.push({ key: 'missing:scenario:' + s.id, kind: 'missing', litId: s.id, gap: true,
+                        label: 'No scenario', tip: s.id + ' has no scenario tagged @' + s.id });
+            edges.push({ from: 'story:' + s.id, to: 'missing:scenario:' + s.id, cls: 'gap', ids: [s.id] });
+            return;
+          }
+          var kids = (children[s.id] || []).filter(function (k) { return byId[k].kind === 'scenario' && show(k); })
+            .sort(function (a, b) {
+              var A = byId[a].item, B = byId[b].item;
+              return A.feature === B.feature ? natural(A.name, B.name) : natural(A.feature, B.feature);
+            });
+          var expanded = !!self.traceExpanded[s.id];
+          var shown = 0, hidden = 0;
+          kids.forEach(function (k) {
+            if (!placedScenario[k]) {
+              if (!expanded && shown >= TRACE_MAX_PER_STORY) { hidden++; return; }
+              if (scenarioCount >= TRACE_MAX_SCENARIOS) { truncated = true; return; }
+              placedScenario[k] = true;
+              col2.push(scenarioNode(byId[k].item));
+              scenarioCount++; shown++;
+            }
+            edges.push({ from: 'story:' + s.id, to: 'scenario:' + k, cls: edgeClass(byId[k].item.status), ids: [s.id, k] });
+          });
+          if (hidden > 0) {
+            col2.push({ key: 'more:' + s.id, kind: 'more', storyId: s.id, litId: s.id,
+                        label: '+' + hidden + ' more scenario' + (hidden > 1 ? 's' : ''),
+                        tip: 'Show every scenario of ' + s.id });
+            edges.push({ from: 'story:' + s.id, to: 'more:' + s.id, cls: 'more', ids: [s.id] });
+          }
+        }
+        function placeStory(s) {
+          if (placedStory[s.id]) return;
+          placedStory[s.id] = true;
+          storyCount++;
+          col1.push(storyNode(s));
+          placeScenarios(s);
+        }
+
+        var reqs = d.requirements.filter(function (r) { return show(r.id); }).sort(function (a, b) {
+          var oa = orderOf(a), ob = orderOf(b);
+          return oa !== ob ? oa - ob : natural(a.id, b.id);
+        });
+        reqs.forEach(function (r) {
+          col0.push(reqNode(r));
+          if (r.status === 'active' && !r.hasStory) {
+            col1.push({ key: 'missing:story:' + r.id, kind: 'missing', litId: r.id, gap: true,
+                        label: 'No user story', tip: r.id + ' has no user story' });
+            edges.push({ from: 'req:' + r.id, to: 'missing:story:' + r.id, cls: 'gap', ids: [r.id] });
+          }
+          var kids = (children[r.id] || []).filter(function (k) { return byId[k].kind === 'story' && show(k); }).sort(natural);
+          kids.forEach(function (sid) {
+            placeStory(byId[sid].item);
+            edges.push({ from: 'req:' + r.id, to: 'story:' + sid, cls: byId[sid].item.covered ? '' : (byId[sid].item.tested ? 'warn' : 'gap'), ids: [r.id, sid] });
+          });
+        });
+        // Stories whose requirements are all out of scope (or filtered away)
+        // still belong to the chain — append them after the linked ones.
+        d.stories.filter(function (s) { return show(s.id) && !placedStory[s.id]; })
+          .sort(function (a, b) { return natural(a.id, b.id); })
+          .forEach(placeStory);
+
+        // Dangling @US tags: a red stub in the Stories column per unknown id.
+        Object.keys(byId).filter(function (id) { return byId[id].kind === 'unknown' && show(id); }).sort(natural)
+          .forEach(function (mid) {
+            var sid = byId[mid].item.id;
+            col1.push({ key: 'unknown:' + sid, kind: 'missing', litId: mid, gap: true,
+                        label: sid + ' — unknown story', tip: 'Scenarios are tagged @' + sid + ' but no such story exists' });
+            (children[mid] || []).filter(show).forEach(function (k) {
+              if (!placedScenario[k]) {
+                if (scenarioCount >= TRACE_MAX_SCENARIOS) { truncated = true; return; }
+                placedScenario[k] = true;
+                col2.push(scenarioNode(byId[k].item));
+                scenarioCount++;
+              }
+              edges.push({ from: 'unknown:' + sid, to: 'scenario:' + k, cls: 'gap', ids: [mid, k] });
+            });
+          });
+
+        // Drop edges to anything that did not make it into a column.
+        var placedKeys = {};
+        col0.concat(col1, col2).forEach(function (n) { placedKeys[n.key] = true; });
+        TRACE.edges = edges.filter(function (e) { return placedKeys[e.from] && placedKeys[e.to]; });
+
+        this.traceRows = {
+          cols: [col0, col1, col2],
+          counts: [col0.length, storyCount, scenarioCount],
+          total: col0.length + col1.length + col2.length,
+          truncated: truncated,
+        };
+        this.$nextTick(function () { self._traceLayout(); });
+      },
+
+      /** Measure the cards and (re)draw every edge into the SVG overlay. */
+      _traceLayout() {
+        var graph = this.$refs.traceGraph, svg = this.$refs.traceEdges;
+        if (!graph || !svg || !this._isLaidOut(graph)) return;
+        var g = graph.getBoundingClientRect();
+        var rects = {};
+        graph.querySelectorAll('[data-trace-node]').forEach(function (el) {
+          var r = el.getBoundingClientRect();
+          rects[el.getAttribute('data-trace-node')] = {
+            left: r.left - g.left, right: r.right - g.left, midY: (r.top + r.bottom) / 2 - g.top,
+          };
+        });
+        var w = graph.scrollWidth, h = graph.scrollHeight;
+        svg.setAttribute('width', w);
+        svg.setAttribute('height', h);
+        svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+        var lit = this.traceHighlight.ids, focused = !!this.traceSelected;
+        var out = [];
+        TRACE.edges.forEach(function (e) {
+          var p = rects[e.from], c = rects[e.to];
+          if (!p || !c) return;
+          var dx = Math.max(12, (c.left - p.right) / 2);
+          var d = 'M' + p.right.toFixed(1) + ',' + p.midY.toFixed(1) +
+                  ' C' + (p.right + dx).toFixed(1) + ',' + p.midY.toFixed(1) +
+                  ' ' + (c.left - dx).toFixed(1) + ',' + c.midY.toFixed(1) +
+                  ' ' + c.left.toFixed(1) + ',' + c.midY.toFixed(1);
+          var cls = 'trace-edge' + (e.cls ? ' trace-edge--' + e.cls : '');
+          if (focused && e.ids.every(function (id) { return lit[id]; })) cls += ' is-lit';
+          out.push('<path class="' + cls + '" d="' + d + '"/>');
+        });
+        svg.innerHTML = out.join('');
+      },
+
+      /** Re-measure when the graph resizes (window, panel reveal, rows added)
+       *  and once webfonts have settled. Installed once. */
+      _traceObserve() {
+        var self = this;
+        if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { self._traceLayout(); });
+        if (TRACE.ro || typeof ResizeObserver === 'undefined') return;
+        var el = this.$refs.traceGraph;
+        if (!el) return;
+        var timer = null;
+        TRACE.ro = new ResizeObserver(function () {
+          clearTimeout(timer);
+          timer = setTimeout(function () { self._traceLayout(); }, 100);
+        });
+        TRACE.ro.observe(el);
+      },
+
+      traceNodeClass(n) {
+        var cls = 'trace-node--' + n.kind;
+        if (n.gap) cls += ' trace-node--gap';
+        if (n.ok) cls += ' trace-node--ok';
+        if (this.traceSelected) {
+          if (this.traceHighlight.ids[n.litId || n.id]) cls += ' is-lit';
+          if (this.traceSelected === n.id) cls += ' is-selected';
+        }
+        return cls;
+      },
+
+      /** Click: expand a "+N more" card, or focus a node (its chain becomes the
+       *  whole graph). Clicking the focused node again clears the focus. */
+      traceSelect(n) {
+        if (n.kind === 'more') {
+          var next = Object.assign({}, this.traceExpanded);
+          next[n.storyId] = true;
+          this.traceExpanded = next;
+          this._traceRebuild();
+          return;
+        }
+        if (!n.selectable) return;
+        if (this.traceSelected === n.id) { this.traceClear(); return; }
+        this._traceFocus(n.id);
+        // One history entry for "a node is focused" so the browser's Back button
+        // returns to the full chain (see the popstate listener in init). Moving
+        // the focus to another node replaces that entry rather than stacking.
+        try {
+          var st = { traceFocus: n.id };
+          if (history.state && history.state.traceFocus) history.replaceState(st, '');
+          else history.pushState(st, '');
+        } catch (_) {}
+      },
+
+      /** Apply a focus without touching history (shared by clicks and popstate). */
+      _traceFocus(id) {
+        this.traceSelected = id;
+        this.traceHighlight = { ids: this._traceChainIds(id) };
+        this._traceRebuild();
+      },
+
+      /** Back to the full chain. From the UI (button, Esc, re-click) this pops the
+       *  focus entry so the history stays in step; popstate then does the clearing. */
+      traceClear(fromHistory) {
+        if (!this.traceSelected) return;
+        if (!fromHistory && history.state && history.state.traceFocus) {
+          try { history.back(); return; } catch (_) {}
+        }
+        this.traceSelected = null;
+        this.traceHighlight = { ids: {} };
+        this._traceRebuild();
+      },
+
+      /** The id inside a card jumps to the entity's own tab, search pre-filled. */
+      traceNavigate(n) {
+        if (n.kind === 'req')      { this.reqSearch = n.id;          this.navTo('requirements'); }
+        if (n.kind === 'story')    { this.storySearch = n.id;        this.navTo('stories'); }
+        if (n.kind === 'scenario') { this.scenariosSearch = n.label; this.navTo('scenarios'); }
       },
 
     }; // end return

@@ -159,6 +159,7 @@
         {id:'stories',      label:'Stories'},
         {id:'screens',      label:'Screens'},
         {id:'coverage',     label:'Coverage'},
+        {id:'traceability', label:'Traceability'},
         {id:'components',   label:'Components'},
         {id:'vcs',          label:'VCS'},
         {id:'scenarios',    label:'Scenarios'},
@@ -1322,6 +1323,198 @@
           </div>
         </template>
       </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           TAB: TRACEABILITY
+      ══════════════════════════════════════════════════════════ -->
+      <div id="panel-traceability" role="tabpanel" aria-labelledby="tab-traceability" tabindex="0"
+           x-show="tab === 'traceability'" class="tab-panel space-y-5"
+           @keydown.escape.window="if (tab === 'traceability') traceClear()">
+
+        <!-- Controls -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center gap-4">
+          <div class="flex items-center gap-2">
+            <label for="trace-phase" class="text-sm font-medium text-slate-600">Phase:</label>
+            <select id="trace-phase" class="filter-select" x-model="tracePhase" aria-label="Select phase for the traceability chain">
+              <option value="">All phases</option>
+              <template x-for="ph in [...phases].sort((a,b) => a.order - b.order)" :key="ph.id">
+                <option :value="ph.id" x-text="ph.name || ph.id"></option>
+              </template>
+            </select>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-slate-600" aria-hidden="true">Mode:</span>
+            <div class="toggle-group" role="group" aria-label="Traceability coverage mode">
+              <button class="toggle-btn" :class="traceMode === 'cumulative' ? 'active' : ''"
+                :aria-pressed="traceMode === 'cumulative'"
+                @click="traceMode = 'cumulative'">Cumulative</button>
+              <button class="toggle-btn" :class="traceMode === 'strict' ? 'active' : ''"
+                :aria-pressed="traceMode === 'strict'"
+                @click="traceMode = 'strict'">Strict</button>
+            </div>
+          </div>
+          <div class="toggle-group" role="group" aria-label="Gap filter">
+            <button class="toggle-btn" :class="traceGapsOnly ? 'active' : ''" :aria-pressed="traceGapsOnly"
+              title="Show only the chains that have a gap. A focused node always shows its whole chain."
+              @click="traceGapsOnly = !traceGapsOnly">Gaps only</button>
+          </div>
+          <input type="search" class="search-input" style="min-width:220px;"
+            placeholder="Search id, title, feature…"
+            x-model.debounce.200ms="traceSearch"
+            aria-label="Search the traceability chain">
+          <button class="btn-primary ml-auto" @click="loadTraceability(true)" :disabled="loading.traceability">
+            <template x-if="loading.traceability">
+              <span class="spinner" style="width:13px;height:13px;border-width:2px;"></span>
+            </template>
+            <template x-if="!loading.traceability">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+            </template>
+            Refresh
+          </button>
+        </div>
+        <p x-show="traceError" class="text-xs text-red-500" x-text="traceError"></p>
+
+        <!-- Chain health -->
+        <template x-if="traceSummary">
+          <div class="section-card">
+            <div class="section-card-header">Chain health</div>
+            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 divide-x divide-slate-100">
+              <div class="cov-stat">
+                <div class="value text-green-700" x-text="traceSummary.requirementsVerified + '/' + traceSummary.requirementsTotal"></div>
+                <div class="label">Verified requirements</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value" :class="traceSummary.requirementsWithoutStory ? 'text-red-600' : 'text-slate-400'" x-text="traceSummary.requirementsWithoutStory"></div>
+                <div class="label">Without story</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value" :class="traceSummary.storiesWithoutScenario ? 'text-red-600' : 'text-slate-400'" x-text="traceSummary.storiesWithoutScenario"></div>
+                <div class="label">Stories without scenario</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value" :class="traceSummary.scenariosNeverRun ? 'text-red-600' : 'text-slate-400'" x-text="traceSummary.scenariosNeverRun"></div>
+                <div class="label">Never run</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value" :class="traceSummary.scenariosFailing ? 'text-red-600' : 'text-slate-400'" x-text="traceSummary.scenariosFailing"></div>
+                <div class="label">Failing</div>
+              </div>
+              <div class="cov-stat">
+                <div class="value" :class="traceSummary.danglingTags ? 'text-red-600' : 'text-slate-400'" x-text="traceSummary.danglingTags"></div>
+                <div class="label">Dangling @US tags</div>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <!-- Loading (first load only) -->
+        <template x-if="loading.traceability && !traceLoaded">
+          <div class="section-card p-5 space-y-3">
+            <div class="skeleton skeleton-lg"></div>
+            <div class="skeleton skeleton-md"></div>
+            <div class="skeleton skeleton-md"></div>
+          </div>
+        </template>
+
+        <!-- Empty -->
+        <template x-if="traceLoaded && traceRows.total === 0">
+          <div class="empty-state">
+            <p class="font-medium text-slate-600">Nothing to trace here.</p>
+            <p class="text-xs text-slate-400 mt-1" x-text="traceSelected || traceSearch || traceGapsOnly ? 'No chain matches the current focus, search or gap filter.' : 'No requirement is in scope for this phase and mode.'"></p>
+            <button class="btn-secondary text-xs mt-3" x-show="traceSelected" @click="traceClear()">← Back to the full chain</button>
+          </div>
+        </template>
+
+        <!-- Graph -->
+        <div class="section-card" x-show="traceLoaded && traceRows.total > 0">
+          <div class="section-card-header flex items-center justify-between gap-3 flex-wrap">
+            <div class="flex items-center gap-3">
+              <button class="btn-secondary text-xs" x-show="traceSelected" @click="traceClear()"
+                aria-label="Back to the full chain">← Back</button>
+              <span x-show="!traceSelected">Traceability chain</span>
+              <span class="font-normal" x-show="traceSelected">
+                Chain of <span class="font-mono font-semibold" x-text="traceSelected"></span>
+              </span>
+            </div>
+            <span class="text-xs font-normal text-slate-500" x-show="traceSelected">
+              Esc or the browser's Back button also return to the full chain
+            </span>
+          </div>
+          <div class="trace-banner" x-show="traceRows.truncated">
+            Showing the first 1500 scenarios. Narrow the view with the phase, search or “Gaps only”.
+          </div>
+
+          <div class="trace-graph" x-ref="traceGraph">
+            <svg class="trace-edges" aria-hidden="true" x-ref="traceEdges"></svg>
+
+            <div class="trace-col">
+              <div class="trace-col-header">Requirements <span class="count" x-text="traceRows.counts[0]"></span></div>
+              <template x-for="n in traceRows.cols[0]" :key="n.key">
+                <div class="trace-node" :class="traceNodeClass(n)" :data-trace-node="n.key"
+                     role="button" tabindex="0" :aria-pressed="traceSelected === n.id" :title="n.tip"
+                     @click="traceSelect(n)" @keydown.enter.prevent="if ($event.target === $event.currentTarget) traceSelect(n)" @keydown.space.prevent="if ($event.target === $event.currentTarget) traceSelect(n)">
+                  <span class="trace-node__main">
+                    <button type="button" class="trace-node__id" x-text="n.id" @click.stop="traceNavigate(n)" :aria-label="'Open ' + n.id + ' in the Requirements tab'"></button>
+                    <span class="trace-node__label" x-text="n.label"></span>
+                    <span class="trace-node__sub" x-text="n.sub"></span>
+                  </span>
+                </div>
+              </template>
+            </div>
+
+            <div class="trace-col">
+              <div class="trace-col-header">User stories <span class="count" x-text="traceRows.counts[1]"></span></div>
+              <template x-for="n in traceRows.cols[1]" :key="n.key">
+                <div class="trace-node" :class="traceNodeClass(n)" :data-trace-node="n.key"
+                     :role="n.selectable ? 'button' : null" :tabindex="n.selectable ? 0 : null"
+                     :aria-pressed="n.selectable ? traceSelected === n.id : null" :title="n.tip"
+                     @click="traceSelect(n)" @keydown.enter.prevent="if ($event.target === $event.currentTarget) traceSelect(n)" @keydown.space.prevent="if ($event.target === $event.currentTarget) traceSelect(n)">
+                  <span class="trace-node__main">
+                    <template x-if="n.kind === 'story'">
+                      <button type="button" class="trace-node__id" x-text="n.id" @click.stop="traceNavigate(n)" :aria-label="'Open ' + n.id + ' in the Stories tab'"></button>
+                    </template>
+                    <span class="trace-node__label" x-text="n.label"></span>
+                    <template x-if="n.sub"><span class="trace-node__sub" x-text="n.sub"></span></template>
+                  </span>
+                </div>
+              </template>
+            </div>
+
+            <div class="trace-col">
+              <div class="trace-col-header">Scenarios <span class="count" x-text="traceRows.counts[2]"></span> <span class="text-slate-300 mx-1">→</span> Latest result</div>
+              <template x-for="n in traceRows.cols[2]" :key="n.key">
+                <div class="trace-node" :class="traceNodeClass(n)" :data-trace-node="n.key"
+                     :role="(n.selectable || n.kind === 'more') ? 'button' : null" :tabindex="(n.selectable || n.kind === 'more') ? 0 : null"
+                     :aria-pressed="n.selectable ? traceSelected === n.id : null" :title="n.tip"
+                     @click="traceSelect(n)" @keydown.enter.prevent="if ($event.target === $event.currentTarget) traceSelect(n)" @keydown.space.prevent="if ($event.target === $event.currentTarget) traceSelect(n)">
+                  <span class="trace-node__main">
+                    <template x-if="n.kind === 'scenario'">
+                      <button type="button" class="trace-node__id" x-text="n.sub" @click.stop="traceNavigate(n)" :aria-label="'Open this scenario in the Scenarios tab'"></button>
+                    </template>
+                    <span class="trace-node__label" x-text="n.label"></span>
+                  </span>
+                  <template x-if="n.kind === 'scenario'">
+                    <span class="trace-node__result">
+                      <span class="trace-connector" :class="'trace-connector--' + n.status"></span>
+                      <span class="trace-chip" :class="'trace-chip--' + n.status" x-text="traceStatusLabel(n.status)"></span>
+                    </span>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div class="trace-legend" aria-label="Legend">
+            <span><i style="background:#16a34a"></i> pass / verified</span>
+            <span><i style="background:#f59e0b"></i> pending</span>
+            <span><i style="background:#ef4444"></i> fail</span>
+            <span><i style="border:1px dashed #f87171;background:white"></i> never run</span>
+            <span><i style="border:1px dashed #f87171;background:#fef2f2"></i> missing link (no story · no scenario · unknown @US tag)</span>
+            <span><i style="background:#6366f1"></i> focused chain</span>
+          </div>
+        </div>
+      </div>
+
 
       <!-- ══════════════════════════════════════════════════════
            TAB: COMPONENTS
