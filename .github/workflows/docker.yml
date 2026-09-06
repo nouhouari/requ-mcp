@@ -1,0 +1,176 @@
+name: Docker
+
+# Builds the requ-mcp container image and publishes it to GitHub Container
+# Registry (ghcr.io/<owner>/requ-mcp).
+#
+#   pull_request      → build + smoke-test only (nothing is pushed)
+#   push to main      → push `latest`, `sha-<short>`, and the package.json
+#                       version (`2.0.0`, `2.0`, `2`) when that version is
+#                       not already published to the registry
+#   push tag v*       → push the same semver tags (manual-release fallback)
+#   workflow_dispatch → same as a push to the selected ref
+#
+# Note: the tag created by publish.yml uses GITHUB_TOKEN, and events produced
+# with that token do not trigger other workflows — which is why the version
+# tags are derived from package.json on every push to main instead.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read package.json version
+        id: pkg
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      # -------------------------------------------------------------------
+      # 1. Build a single-platform image for the runner and smoke-test it:
+      #    boot the container with a throwaway SQLite project, then hit the
+      #    version endpoint and the MCP endpoint the way a real client does.
+      # -------------------------------------------------------------------
+      - name: Build (runner platform, for testing)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: requ-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/requ-smoke/demo/e2e/features
+          printf '@US-001\nFeature: Demo\n  Scenario: It works\n    Given a thing\n' \
+            > /tmp/requ-smoke/demo/e2e/features/demo.feature
+
+          docker run -d --name requ-ci -p 8788:8788 \
+            -e REQU_PROJECTS=/workspace/demo \
+            -e REQU_DB=/data/requ.db \
+            -v /tmp/requ-smoke:/workspace:ro \
+            requ-mcp:ci
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8788/api/version >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          echo "::group::GET /api/version"
+          curl -fsS http://127.0.0.1:8788/api/version | tee /tmp/version.json
+          echo "::endgroup::"
+          grep -q "\"${{ steps.pkg.outputs.version }}\"" /tmp/version.json
+
+          echo "::group::GET /api/projects"
+          curl -fsS http://127.0.0.1:8788/api/projects | tee /tmp/projects.json
+          echo "::endgroup::"
+          grep -q '"demo"' /tmp/projects.json
+
+          echo "::group::MCP initialize"
+          curl -fsS -D /tmp/headers.txt http://127.0.0.1:8788/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | tee /tmp/init.txt
+          echo "::endgroup::"
+          grep -qi '"serverInfo"' /tmp/init.txt
+
+          echo "::group::Container health"
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect -f '{{.State.Health.Status}}' requ-ci)
+            [ "$STATUS" = "healthy" ] && break
+            sleep 1
+          done
+          echo "health=$STATUS"
+          [ "$STATUS" = "healthy" ]
+          echo "::endgroup::"
+
+      - name: Container logs
+        if: always()
+        run: docker logs requ-ci 2>&1 || true
+
+      - name: Stop test container
+        if: always()
+        run: docker rm -f requ-ci >/dev/null 2>&1 || true
+
+      # -------------------------------------------------------------------
+      # 2. Publish (not on pull requests).
+      # -------------------------------------------------------------------
+      - name: Log in to ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this version is already in the registry
+        id: check
+        if: github.event_name != 'pull_request'
+        run: |
+          if docker manifest inspect "${{ steps.pkg.outputs.image }}:${{ steps.pkg.outputs.version }}" >/dev/null 2>&1; then
+            echo "::notice::${{ steps.pkg.outputs.image }}:${{ steps.pkg.outputs.version }} already exists — version tags will not be re-pushed."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Image tags
+        id: meta
+        if: github.event_name != 'pull_request'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.pkg.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}},value=v${{ steps.pkg.outputs.version }},enable=${{ steps.check.outputs.published == 'false' }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.pkg.outputs.version }},enable=${{ steps.check.outputs.published == 'false' }}
+            type=semver,pattern={{major}},value=v${{ steps.pkg.outputs.version }},enable=${{ steps.check.outputs.published == 'false' }}
+          labels: |
+            org.opencontainers.image.title=requ-mcp
+            org.opencontainers.image.description=MCP server that tracks requirements coverage across phases and releases
+            org.opencontainers.image.version=${{ steps.pkg.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        if: github.event_name != 'pull_request' && steps.meta.outputs.tags != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true

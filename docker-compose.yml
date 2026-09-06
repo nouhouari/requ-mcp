@@ -20,8 +20,8 @@ services:
   requ-mcp:
     build:
       context: .
-      dockerfile: Dockerfile.requ
-    image: requ-mcp:local
+      dockerfile: Dockerfile
+    image: ${REQU_IMAGE:-requ-mcp:local}
     container_name: requ-mcp-http
     restart: unless-stopped
     depends_on:
