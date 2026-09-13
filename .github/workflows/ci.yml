@@ -14,6 +14,24 @@ jobs:
       matrix:
         node-version: [20.x, 22.x]
 
+    # PostgreSQL is how requ actually runs in production, and the SQLite suites
+    # cannot stand in for it: they differ in JSONB round-tripping, in BIGSERIAL
+    # ids coming back as strings, and in how strictly NOT NULL is enforced.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: requ_mcp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -44,5 +62,13 @@ jobs:
       - name: Smoke test — scenario search
         run: npm run smoke:search
 
-      - name: Smoke test — authentication, RBAC and audit
+      - name: Smoke test — specification versions
+        run: npm run smoke:versions
+
+      - name: Smoke test — authentication, RBAC, 2FA and audit
         run: npm run smoke:auth
+
+      - name: Smoke test — PostgreSQL backend
+        run: npm run smoke:pg
+        env:
+          REQU_PG_URL: postgresql://postgres:postgres@localhost:5432/requ_mcp_test
