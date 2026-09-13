@@ -258,6 +258,15 @@ body {
   transition: border-color 0.15s;
 }
 .filter-select:focus { border-color: #6366f1; }
+/* The same box on a text field: no dropdown arrow to promise a menu that is
+   not there, and a text cursor rather than a pointer. */
+input.filter-select,
+textarea.filter-select {
+  background-image: none;
+  padding-right: 10px;
+  cursor: text;
+}
+textarea.filter-select { line-height: 1.45; }
 .filter-select--dark {
   background-color: transparent;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23cbd5e1' d='M6 8L1 3h10z'/%3E%3C/svg%3E");

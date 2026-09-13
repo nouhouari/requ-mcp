@@ -258,6 +258,26 @@ document.addEventListener('alpine:init', function () {
       memberForm: { username: '', role: 'viewer' },
       memberBusy: false,
 
+      // ── The role catalogue ──
+      //
+      // Two scopes: the shared roles the server defines, and the ones a project
+      // defines for itself. Both lists are kept because the pickers need every
+      // role that can be *assigned* here, while the editor only ever writes to
+      // one scope at a time.
+      sharedRoles: [],
+      projectRoles: [],
+      permissionCatalogue: [],
+      permissionGroups: [],
+      canEditSharedRoles: false,
+      canEditProjectRoles: false,
+      rolesLoading: false,
+      rolesError: '',
+      roleScope: 'project',
+      roleEditorOpen: false,
+      roleEditorMode: 'create',
+      roleForm: { id: '', name: '', description: '', permissions: [], builtIn: false, projectId: null },
+      roleBusy: false,
+
       // =========================================================================
       // Lifecycle
       // =========================================================================
@@ -931,6 +951,201 @@ document.addEventListener('alpine:init', function () {
         return bits.join(' · ');
       },
 
+      // ── The role catalogue ──────────────────────────────────────────────────
+
+      /**
+       * Load both scopes.
+       *
+       * The shared catalogue is readable by anyone signed in — you cannot be
+       * asked to choose a role without being told what the choices mean — so
+       * this runs for every user, not only administrators.
+       */
+      async loadRoles() {
+        this.rolesLoading = true;
+        this.rolesError = '';
+        try {
+          var shared = await this._fetch('/api/roles');
+          if (shared) {
+            this.sharedRoles = shared.roles || [];
+            this.permissionCatalogue = shared.permissions || [];
+            this.permissionGroups = shared.permissionGroups || [];
+            this.canEditSharedRoles = !!shared.canEdit;
+          }
+          var project = this.memberProject();
+          if (project && this.can('project:members')) {
+            var own = await this._fetch('/api/projects/' + encodeURIComponent(project) + '/roles');
+            if (own) {
+              this.projectRoles = own.roles || [];
+              this.canEditProjectRoles = !!own.canEdit;
+            }
+          } else {
+            this.projectRoles = [];
+            this.canEditProjectRoles = false;
+          }
+          if (!this.canEditProjectRoles && this.canEditSharedRoles) this.roleScope = 'shared';
+        } finally {
+          this.rolesLoading = false;
+        }
+      },
+
+      /** Every role that can be given to someone on the project in view. */
+      assignableRoles() {
+        return this.projectRoles.length ? this.projectRoles : this.sharedRoles;
+      },
+
+      /** The list the editor is currently showing. */
+      visibleRoles() {
+        return this.roleScope === 'shared' ? this.sharedRoles : this.projectRoles;
+      },
+
+      canEditScope() {
+        return this.roleScope === 'shared' ? this.canEditSharedRoles : this.canEditProjectRoles;
+      },
+
+      /** A role's human name, falling back to the id for one that is gone. */
+      roleName(id) {
+        var all = this.assignableRoles();
+        for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i].name;
+        return id;
+      },
+
+      /** What a role grants, in words, for a title attribute. */
+      roleSummary(role) {
+        var self = this;
+        return (role.permissions || [])
+          .map(function (p) { return self.permissionLabel(p); })
+          .join(', ') || 'nothing';
+      },
+
+      permissionLabel(id) {
+        for (var i = 0; i < this.permissionCatalogue.length; i++) {
+          if (this.permissionCatalogue[i].id === id) return this.permissionCatalogue[i].label;
+        }
+        return id;
+      },
+
+      permissionsInGroup(groupId) {
+        return this.permissionCatalogue.filter(function (p) { return p.group === groupId; });
+      },
+
+      /**
+       * A project cannot confer a server-wide permission, so the editor does not
+       * offer one — refusing the save afterwards would be a worse way to say it.
+       */
+      permissionOfferedHere(permission) {
+        return !(this.roleScope === 'project' && permission.id === 'admin:users');
+      },
+
+      newRole() {
+        this.roleEditorMode = 'create';
+        this.roleForm = { id: '', name: '', description: '', permissions: ['spec:read'], builtIn: false, projectId: null };
+        this.rolesError = '';
+        this.roleEditorOpen = true;
+      },
+
+      editRole(role) {
+        this.roleEditorMode = 'edit';
+        this.roleForm = {
+          id: role.id,
+          name: role.name,
+          description: role.description || '',
+          permissions: (role.permissions || []).slice(),
+          builtIn: !!role.builtIn,
+          projectId: role.projectId,
+        };
+        this.rolesError = '';
+        this.roleEditorOpen = true;
+      },
+
+      /** Start from an existing role — the usual way a team's own role begins. */
+      copyRole(role) {
+        this.roleEditorMode = 'create';
+        this.roleForm = {
+          id: '',
+          name: role.name + ' (copy)',
+          description: role.description || '',
+          permissions: (role.permissions || []).slice(),
+          builtIn: false,
+          projectId: null,
+        };
+        this.rolesError = '';
+        this.roleEditorOpen = true;
+      },
+
+      closeRoleEditor() {
+        this.roleEditorOpen = false;
+        this.rolesError = '';
+      },
+
+      roleHasPermission(id) {
+        return this.roleForm.permissions.indexOf(id) !== -1;
+      },
+
+      toggleRolePermission(id) {
+        var at = this.roleForm.permissions.indexOf(id);
+        if (at === -1) this.roleForm.permissions.push(id);
+        else this.roleForm.permissions.splice(at, 1);
+      },
+
+      roleScopeBase() {
+        if (this.roleScope === 'shared') return '/api/roles';
+        return '/api/projects/' + encodeURIComponent(this.memberProject() || '') + '/roles';
+      },
+
+      async saveRole() {
+        if (!this.roleForm.name.trim()) { this.rolesError = 'Give the role a name.'; return; }
+        this.roleBusy = true;
+        this.rolesError = '';
+        try {
+          var creating = this.roleEditorMode === 'create';
+          var url = this.roleScopeBase() + (creating ? '' : '/' + encodeURIComponent(this.roleForm.id));
+          var payload = {
+            name: this.roleForm.name.trim(),
+            description: this.roleForm.description.trim(),
+            permissions: this.roleForm.permissions,
+          };
+          // The id is settled when the role is created and never moves: grants,
+          // tokens and the directory group map all point at it.
+          if (creating && this.roleForm.id.trim()) payload.id = this.roleForm.id.trim();
+          var res = await window.fetch(url, {
+            method: creating ? 'POST' : 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.rolesError = body.error || 'Could not save that role.'; return; }
+          this.roleEditorOpen = false;
+          await this.loadRoles();
+          await this.loadMembers();
+        } catch (e) {
+          this.rolesError = 'Could not reach the server.';
+        } finally {
+          this.roleBusy = false;
+        }
+      },
+
+      async deleteRole(role) {
+        if (!window.confirm('Delete the role "' + role.name + '"?')) return;
+        this.rolesError = '';
+        var url = this.roleScopeBase() + '/' + encodeURIComponent(role.id);
+        try {
+          var res = await window.fetch(url, { method: 'DELETE' });
+          var body = await res.json().catch(function () { return {}; });
+          // A role people still hold is refused first, and only deleted once the
+          // consequence — losing that access — has been said out loud.
+          if (res.status === 409) {
+            if (!window.confirm(body.error + '\n\nDelete it anyway and revoke those grants?')) return;
+            res = await window.fetch(url + '?force=true', { method: 'DELETE' });
+            body = await res.json().catch(function () { return {}; });
+          }
+          if (!res.ok) { this.rolesError = body.error || 'Could not delete that role.'; return; }
+          await this.loadRoles();
+          await this.loadMembers();
+        } catch (e) {
+          this.rolesError = 'Could not reach the server.';
+        }
+      },
+
       // ── Access administration ───────────────────────────────────────────────
 
       async loadAdminUsers() {
@@ -1577,7 +1792,7 @@ document.addEventListener('alpine:init', function () {
         if (id === 'adrs')       { this.loadAdrs(); }
         if (id === 'versions')   { this.loadVersions(); }
         if (id === 'audit')      { this.auditPage = 1; this.loadAudit(); this.loadActivity(); }
-        if (id === 'access')     { this.loadMembers(); this.loadAdminUsers(); }
+        if (id === 'access')     { this.loadMembers(); this.loadRoles(); this.loadAdminUsers(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
