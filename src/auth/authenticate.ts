@@ -14,6 +14,7 @@ import {
   buildPrincipal,
   devPrincipal,
   UnauthorizedError,
+  type Permission,
   type Principal,
   type Role,
 } from "./model.js";
@@ -100,11 +101,16 @@ export async function login(
     lastLoginAt: now(),
   });
 
-  // A login with no mapped role and no default is a rejection, not an empty
+  // A login with no role anywhere and no default is a rejection, not an empty
   // session: better a clear message now than a dashboard where nothing works.
+  //
+  // "Anywhere" is the point: someone added to a single project holds no global
+  // role at all, and resolving only the global scope here would refuse the
+  // sign-in of every person who was invited to one project.
   const bindings = await store.listBindings(id);
-  const { roles } = resolveRoles({ cfg, username: user.username, groups: user.groups, bindings, projectId: null });
-  if (roles.length === 0) {
+  const globalRoles = resolveRoles({ cfg, username: user.username, groups: user.groups, bindings, projectId: null }).roles;
+  const hasAnyAccess = globalRoles.length > 0 || bindings.length > 0;
+  if (!hasAnyAccess) {
     throw new LoginError(
       "Your account authenticated, but no requ role is mapped to it. Ask an administrator for access.",
       true,
@@ -140,6 +146,10 @@ export async function logout(sessionId: string): Promise<boolean> {
 /**
  * Build the principal for an already-identified user, with roles resolved for
  * one project.
+ *
+ * `projectKey` of null is the *global* scope: only grants that apply everywhere
+ * count. That distinction is what keeps a project's administrator from being a
+ * server administrator.
  */
 async function principalForUser(
   user: AuthUser,
@@ -165,6 +175,74 @@ async function principalForUser(
     ...extra,
     roles: capRoles(roles, ceiling),
   });
+}
+
+/**
+ * The same principal, with its roles recomputed for a named scope.
+ *
+ * Permission checks that decide *administrative* questions must say which scope
+ * they mean rather than trusting the roles the request happened to be
+ * authenticated with: a caller who is `admin` on one project arrives holding
+ * every permission, and asking "may they?" without naming a scope would answer
+ * yes for the whole server.
+ *
+ * `projectId` null means the global scope.
+ */
+export async function principalInScope(
+  principal: Principal,
+  projectId: string | null,
+): Promise<Principal> {
+  const cfg = authConfig();
+  // With authentication off there is one principal and it may do everything;
+  // there is no scope to narrow it to.
+  if (!cfg.enabled || principal.kind === "anonymous") return principal;
+
+  const user = await authStore().getUser(principal.userId);
+  if (!user) throw new UnauthorizedError("Your account no longer exists.");
+  if (user.disabled) throw new UnauthorizedError("Your account is disabled.");
+
+  let ceiling: Role | null = null;
+  if (principal.kind === "token" && principal.tokenId) {
+    const row = await authStore().getTokenWithHash(principal.tokenId);
+    if (!row) throw new UnauthorizedError("This access token no longer exists.");
+    if (row.revokedAt) throw new UnauthorizedError("This access token has been revoked.");
+    if (row.expiresAt && row.expiresAt < now()) throw new UnauthorizedError("This access token has expired.");
+    if (row.projects !== null && projectId !== null && !row.projects.includes(projectId)) {
+      throw new UnauthorizedError(`This access token is not scoped to project '${projectId}'.`);
+    }
+    ceiling = row.maxRole;
+  }
+
+  return principalForUser(
+    user,
+    projectId,
+    {
+      kind: principal.kind,
+      tokenId: principal.tokenId,
+      tokenName: principal.tokenName,
+      sessionId: principal.sessionId,
+    },
+    ceiling,
+  );
+}
+
+/**
+ * Whether the caller holds a permission *in a named scope*.
+ *
+ * Never throws for an ordinary refusal — a caller whose account or token has
+ * gone away simply cannot do the thing.
+ */
+export async function canInScope(
+  principal: Principal,
+  permission: Permission,
+  projectId: string | null,
+): Promise<boolean> {
+  try {
+    const scoped = await principalInScope(principal, projectId);
+    return scoped.permissions.has(permission);
+  } catch {
+    return false;
+  }
 }
 
 export type AuthAttempt =
@@ -252,38 +330,13 @@ export async function authenticateRequest(
  *
  * MCP calls carry the project key in the tool arguments, which is only known
  * after the request has been authenticated, so the first resolution uses global
- * grants and this narrows (or widens) it once the project is known.
+ * grants and this narrows (or widens) it once the project is known. A null key
+ * means nothing was named, so the principal stands as authenticated.
  */
 export async function reauthorizeForProject(
   principal: Principal,
   projectKey: string | null,
 ): Promise<Principal> {
-  const cfg = authConfig();
-  if (!cfg.enabled || principal.kind === "anonymous") return principal;
   if (projectKey === null) return principal;
-  const user = await authStore().getUser(principal.userId);
-  if (!user) throw new UnauthorizedError("Your account no longer exists.");
-
-  let ceiling: Role | null = null;
-  if (principal.kind === "token" && principal.tokenId) {
-    const row = await authStore().getTokenWithHash(principal.tokenId);
-    if (!row) throw new UnauthorizedError("This access token no longer exists.");
-    if (row.revokedAt) throw new UnauthorizedError("This access token has been revoked.");
-    if (row.projects !== null && !row.projects.includes(projectKey)) {
-      throw new UnauthorizedError(`This access token is not scoped to project '${projectKey}'.`);
-    }
-    ceiling = row.maxRole;
-  }
-
-  return principalForUser(
-    user,
-    projectKey,
-    {
-      kind: principal.kind,
-      tokenId: principal.tokenId,
-      tokenName: principal.tokenName,
-      sessionId: principal.sessionId,
-    },
-    ceiling,
-  );
+  return principalInScope(principal, projectKey);
 }

@@ -30,7 +30,22 @@ export const PERMISSIONS = [
   "history:read",
   /** Read the server-wide audit log, including denied attempts. */
   "audit:read",
-  /** Grant and revoke roles, and revoke other users' tokens. */
+  /**
+   * Decide who may reach *this* project, and with which role.
+   *
+   * Project-scoped on purpose: it is resolved against the project being
+   * administered, so a project's admin runs that project's membership without
+   * gaining anything anywhere else.
+   */
+  "project:members",
+  /**
+   * Server-wide administration: grants that apply to every project, disabling
+   * accounts, listing everyone's tokens.
+   *
+   * Always resolved in the *global* scope. Resolving it against a project would
+   * make anyone holding `admin` on one project a server administrator, which is
+   * an escalation rather than a delegation.
+   */
   "admin:users",
 ] as const;
 
@@ -70,6 +85,9 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     "project:manage",
     "audit:read",
   ],
+  // `admin` carries every permission, including both administrative ones. Which
+  // project that actually lets them administer is decided by *where* the role
+  // was resolved — see the comments on `project:members` and `admin:users`.
   admin: [...PERMISSIONS],
 };
 

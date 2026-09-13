@@ -46,6 +46,21 @@ All notable changes to this project will be documented here.
   DN-template direct bind, LDAPS over a generated certificate, and the full
   sign-in → session → token → MCP round trip.
 
+- **Project membership.** Roles already resolved per project; there is now a way
+  to manage them. The **Access** tab's *Members* panel — and
+  `GET|POST /api/projects/:slug/members`, `DELETE …/members/:userId` — adds
+  someone to one project by their directory username, with a role that applies
+  there and nowhere else. They need not have signed in first: the grant waits
+  for them, they show as *invited*, and the directory fills in their details on
+  first sign-in. The list shows **where each role came from** — granted here,
+  inherited from a directory group, granted server-wide, or the configured
+  default — and only the first is editable.
+
+  A project's `admin` manages that project's members and nothing else; server-wide
+  administration remains separate. The new `project:members` permission is
+  resolved against the project being administered, while `admin:users` is always
+  resolved globally.
+
 - **New REST endpoints** — `GET /api/auth/config`, `POST /api/auth/login`,
   `POST /api/auth/logout`, `GET /api/auth/me`, `GET|POST /api/auth/tokens`,
   `DELETE /api/auth/tokens/:id`, `GET /api/audit`, `GET /api/history`,
@@ -94,6 +109,19 @@ All notable changes to this project will be documented here.
   version registry; import restores every version with its lock state.
 
 ### Fixed
+- **A project administrator could grant themselves server-wide administration.**
+  `/api/admin/*` checked `admin:users` against the roles the request had been
+  authenticated with, and a caller holding `admin` on one project arrives
+  carrying every permission — so `POST /api/admin/roles` with
+  `projectId: "*"` succeeded. Server-wide administration is now always evaluated
+  in the global scope, where a project-scoped grant does not apply.
+- **A user whose only role was on one project could not sign in.** Sign-in
+  resolved roles globally and refused when the result was empty, so with
+  `REQU_AUTH_DEFAULT_ROLE=none` anyone invited to a single project was turned
+  away at the door. Access on any project now counts.
+- **A role could not be granted to anyone who had not already signed in**, which
+  is the wrong way round for setting a team up. Grants now create a placeholder
+  account, shown as *invited* until the directory fills it in.
 - **LDAP attributes are now read case-insensitively.** Attribute descriptions
   are case-insensitive per RFC 4512, and directories disagree in practice. An
   exact-key lookup silently found nothing on a directory that returns

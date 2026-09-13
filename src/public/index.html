@@ -232,8 +232,8 @@
         {id:'scenarios',    label:'Scenarios'},
         {id:'versions',     label:'Versions'},
       ].concat(
-        can('audit:read')  ? [{id:'audit',  label:'Audit'}]  : [],
-        can('admin:users') ? [{id:'access', label:'Access'}] : []
+        can('audit:read') ? [{id:'audit',  label:'Audit'}]  : [],
+        canSeeAccess()    ? [{id:'access', label:'Access'}] : []
       )" :key="t.id">
         <button
           :id="'tab-' + t.id"
@@ -2264,6 +2264,111 @@
         <div x-show="adminError" x-cloak role="alert"
              class="card p-3 text-sm text-red-700 bg-red-50 border-red-200" x-text="adminError"></div>
 
+        <!-- ── Project members ──────────────────────────────────────────── -->
+        <div x-show="can('project:members')" x-cloak class="card">
+          <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+            <div>
+              <h2 class="text-sm font-semibold text-slate-800">
+                Members of <span class="font-mono" x-text="memberProject() || 'this project'"></span>
+              </h2>
+              <p class="text-xs text-slate-500">Who can reach this project, and what they may do in it.</p>
+            </div>
+            <button @click="loadMembers()" class="btn-secondary text-xs">Refresh</button>
+          </div>
+
+          <div x-show="membersError" x-cloak role="alert"
+               class="mx-4 mt-3 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2"
+               x-text="membersError"></div>
+
+          <!-- Add someone -->
+          <div class="px-4 py-3 flex flex-wrap items-end gap-3 border-b border-slate-100">
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Directory username</span>
+              <input type="text" x-model="memberForm.username" @keydown.enter="addMember()"
+                     placeholder="e.g. jdupont" class="filter-select" style="width:200px;">
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Role on this project</span>
+              <select x-model="memberForm.role" class="filter-select" style="width:150px;">
+                <option value="viewer">viewer — read only</option>
+                <option value="contributor">contributor — record progress</option>
+                <option value="maintainer">maintainer — edit the spec</option>
+                <option value="admin">admin — manage members</option>
+              </select>
+            </label>
+            <button @click="addMember()" :disabled="memberBusy" class="btn-primary text-xs disabled:opacity-60"
+                    x-text="memberBusy ? 'Adding…' : 'Add member'"></button>
+            <p class="text-xs text-slate-400 basis-full">
+              They do not need to have signed in yet — the role waits for them, and their name and
+              groups are filled in from the directory the first time they do.
+            </p>
+          </div>
+
+          <div x-show="membersDefaultRole" x-cloak
+               class="px-4 py-2 text-xs text-slate-500 bg-slate-50 border-b border-slate-100">
+            This server grants every signed-in user
+            <span class="chip chip-slate" x-text="membersDefaultRole"></span>
+            by default, so people outside this list can still reach the project with that role.
+          </div>
+
+          <div x-show="membersLoading" class="px-4 py-6 text-sm text-slate-400">Loading…</div>
+          <template x-if="!membersLoading && members.length === 0">
+            <p class="px-4 py-6 text-sm text-slate-400 italic">Nobody has access to this project yet.</p>
+          </template>
+
+          <div x-show="!membersLoading && members.length > 0" class="data-table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th scope="col">Member</th>
+                  <th scope="col" style="width:170px;">Role here</th>
+                  <th scope="col">Where their access comes from</th>
+                  <th scope="col" style="width:110px;">Status</th>
+                  <th scope="col" style="width:90px;"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="m in members" :key="m.userId">
+                  <tr>
+                    <td>
+                      <span class="font-medium text-slate-800" x-text="m.displayName || m.userId"></span>
+                      <span class="block text-xs text-slate-400 font-mono" x-text="m.userId"></span>
+                    </td>
+                    <td>
+                      <select class="filter-select text-xs" style="width:150px;"
+                              :value="m.projectRole || ''"
+                              @change="setMemberRole(m, $event.target.value)"
+                              :aria-label="'Role for ' + (m.displayName || m.userId)">
+                        <option value="" disabled x-text="m.projectRole ? '' : '— inherited —'"></option>
+                        <option value="viewer">viewer</option>
+                        <option value="contributor">contributor</option>
+                        <option value="maintainer">maintainer</option>
+                        <option value="admin">admin</option>
+                      </select>
+                    </td>
+                    <td class="text-xs text-slate-500" x-text="memberOrigin(m)"></td>
+                    <td>
+                      <span x-show="m.disabled" class="chip chip-red">disabled</span>
+                      <span x-show="!m.disabled && m.invited" class="chip chip-amber"
+                            title="Added here, but has not signed in yet">invited</span>
+                      <span x-show="!m.disabled && !m.invited" class="chip chip-green">active</span>
+                    </td>
+                    <td class="text-right">
+                      <button x-show="m.removable" @click="removeMember(m)"
+                              class="text-xs text-red-600 hover:text-red-800 transition-colors">Remove</button>
+                      <span x-show="!m.removable" class="text-xs text-slate-300"
+                            title="Their access is granted elsewhere, so it cannot be removed from here">—</span>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ── Server-wide administration ───────────────────────────────── -->
+        <div x-show="canGlobal('admin:users')" x-cloak class="space-y-5">
+
         <div x-show="!auth.enabled" x-cloak class="card p-4 text-sm text-amber-800 bg-amber-50 border-amber-200">
           Authentication is disabled, so every caller already has full access. Role grants made here take effect
           once the server is started with <code class="font-mono">REQU_AUTH_MODE=ldap</code>.
@@ -2281,19 +2386,21 @@
           <div class="px-4 py-3 border-b border-slate-200">
             <h2 class="text-sm font-semibold text-slate-800">Grant a role</h2>
             <p class="text-xs text-slate-500">
-              Directory groups already map to roles via <code class="font-mono">REQU_LDAP_ROLE_MAP</code>.
-              Use this for the exceptions — a user appears here after their first sign-in.
+              Server-wide grants, applying to every project. Directory groups already map to roles via
+              <code class="font-mono">REQU_LDAP_ROLE_MAP</code>, so use this for the exceptions — to put
+              someone on one project, use the members panel above.
             </p>
           </div>
           <div class="px-4 py-3 flex flex-wrap items-end gap-3">
             <label class="text-xs text-slate-600">
               <span class="block mb-1">User</span>
-              <select x-model="grantForm.userId" class="filter-select" style="width:180px;">
-                <option value="">Select a user…</option>
+              <input type="text" x-model="grantForm.userId" list="known-users" placeholder="directory username"
+                     class="filter-select" style="width:200px;">
+              <datalist id="known-users">
                 <template x-for="u in adminUsers" :key="u.id">
-                  <option :value="u.id" x-text="u.displayName + ' (' + u.id + ')'"></option>
+                  <option :value="u.id" x-text="u.displayName"></option>
                 </template>
-              </select>
+              </datalist>
             </label>
             <label class="text-xs text-slate-600">
               <span class="block mb-1">Role</span>
@@ -2366,10 +2473,11 @@
                         x-text="(u.groups || []).length ? (u.groups || []).length + ' group(s)' : '—'"></td>
                     <td class="text-xs text-slate-500" x-text="u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : '—'"></td>
                     <td>
-                      <button class="chip" :class="u.disabled ? 'chip-red' : 'chip-green'"
+                      <button class="chip"
+                              :class="u.disabled ? 'chip-red' : (u.lastLoginAt ? 'chip-green' : 'chip-amber')"
                               @click="setUserDisabled(u.id, !u.disabled)"
                               :title="u.disabled ? 'Re-enable this account' : 'Disable this account and end its sessions'"
-                              x-text="u.disabled ? 'disabled' : 'active'"></button>
+                              x-text="u.disabled ? 'disabled' : (u.lastLoginAt ? 'active' : 'invited')"></button>
                     </td>
                   </tr>
                 </template>
@@ -2377,6 +2485,8 @@
             </table>
           </div>
         </div>
+
+        </div><!-- /server-wide administration -->
       </div>
 
       </div><!-- /tab panels -->

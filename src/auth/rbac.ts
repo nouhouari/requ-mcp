@@ -97,6 +97,10 @@ export function permissionForRoute(method: string, pathname: string): Permission
   const m = method.toUpperCase();
   if (isPublicRoute(m, pathname)) return null;
   if (/^\/api\/auth\/tokens(\/|$)/.test(pathname)) return null;
+  // Membership routes authorise themselves against the project named in the
+  // URL. A blanket check here could only ask about the project the *request*
+  // was authenticated for, which is a different question.
+  if (/^\/api\/projects\/[^/]+\/members(\/|$)/.test(pathname)) return null;
   if (/^\/api\/admin\//.test(pathname)) return "admin:users";
 
   const explicit = ROUTE_PERMISSIONS.find((r) => r.method === m && r.pattern.test(pathname));

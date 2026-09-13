@@ -99,7 +99,7 @@ when running under Docker Compose).
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
 | **Audit** | Recent specification changes with their field-level diffs, and the audit log of every tool call and API request — denials included. Needs `audit:read`; see [Authentication](#authentication-roles-and-the-audit-trail) |
-| **Access** | Users the directory has seen, their effective roles, explicit grants, and account enable/disable. Administrators only |
+| **Access** | *Members* — who can reach this project, with what role, and where that role came from; add, change and remove (project admins). Plus server-wide user and role administration (server admins only) |
 | **Decisions** | Architecture decisions (ADRs) with status badges and their requirement/component links; open one to read the record with its mermaid diagrams rendered |
 | **Versions** | Specification baselines: the version history with lock state, parent and audit trail, plus a side-by-side comparison of any two versions showing additions, removals and field-level changes |
 
@@ -289,11 +289,46 @@ A user's roles come from three places, unioned:
 2. `REQU_LDAP_ROLE_MAP` — directory group → role, so the directory stays the
    source of truth for who is on the team. Groups match on either the bare name
    (`requ-leads`) or the full DN;
-3. explicit grants made in the dashboard's **Access** tab, globally or on one
-   project, for the exceptions the directory cannot express.
+3. explicit grants — either on one project (the **Access** tab's members panel,
+   see below) or server-wide.
 
 Anyone matched by none of them gets `REQU_AUTH_DEFAULT_ROLE` (viewer), or is
 refused the sign-in when that is set to `none`.
+
+### Adding people to a project
+
+Roles resolve **per project**, so the same person can be a maintainer on one and
+a viewer on another. The **Access** tab's *Members* panel is where that is
+decided — add someone by their directory username, pick their role, and they
+have it on that project and nowhere else:
+
+```jsonc
+// POST /api/projects/<slug>/members
+{ "username": "jdupont", "role": "maintainer" }
+```
+
+They do **not** need to have signed in first. The grant waits for them, they show
+as *invited*, and their real name, mail and groups are filled in from the
+directory the first time they sign in. Someone whose only role is on one project
+can still sign in — they simply see that project.
+
+The panel lists everyone who can reach the project and **where each role came
+from**: granted here, inherited from a directory group, granted server-wide, or
+handed out by `REQU_AUTH_DEFAULT_ROLE`. Only the first is editable — removing a
+member drops the grant made on this project and says so if they still reach it
+another way, rather than offering a button that could not work.
+
+Two scopes, kept apart deliberately:
+
+| | granted by | can do |
+|---|---|---|
+| **Project admin** — `admin` on one project | that project's admins | manage that project's members; nothing elsewhere |
+| **Server admin** — `admin` globally (`REQU_AUTH_ADMINS`, a mapped group, or a server-wide grant) | server admins | everything above, plus server-wide grants, disabling accounts, and every token |
+
+A project's admin genuinely cannot reach past it: server-wide administration is
+always evaluated in the global scope, so holding `admin` on one project never
+adds up to holding it everywhere. The last administrator of a project also
+cannot remove themselves, since that would leave a project nobody can administer.
 
 ### Access tokens for MCP clients
 

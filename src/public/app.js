@@ -197,6 +197,10 @@ document.addEventListener('alpine:init', function () {
         userId: '', username: '', displayName: '', email: null,
         kind: '', tokenName: '',
         roles: [], permissions: [], groups: [],
+        // What the caller may do server-wide, as opposed to on the project
+        // currently in view. A project's admin has project:members here but no
+        // admin:users, which is what keeps the two panels apart.
+        globalPermissions: [],
       },
       login: { username: '', password: '', error: '', busy: false },
 
@@ -231,6 +235,13 @@ document.addEventListener('alpine:init', function () {
       adminError: '',
       grantForm: { userId: '', role: 'viewer', projectId: '' },
       ldapStatus: null,
+
+      members: [],
+      membersLoading: false,
+      membersError: '',
+      membersDefaultRole: null,
+      memberForm: { username: '', role: 'viewer' },
+      memberBusy: false,
 
       // =========================================================================
       // Lifecycle
@@ -315,9 +326,19 @@ document.addEventListener('alpine:init', function () {
       // Authentication, roles, tokens and the audit trail
       // =========================================================================
 
-      /** True when the signed-in principal holds a permission. */
+      /** True when the signed-in principal holds a permission on this project. */
       can(permission) {
         return (this.auth.permissions || []).indexOf(permission) !== -1;
+      },
+
+      /** True when they hold it server-wide, which is a stronger claim. */
+      canGlobal(permission) {
+        return (this.auth.globalPermissions || []).indexOf(permission) !== -1;
+      },
+
+      /** Whether the Access tab has anything to show this caller. */
+      canSeeAccess() {
+        return this.can('project:members') || this.canGlobal('admin:users');
       },
 
       /** Strongest role held, for the badge in the header. */
@@ -356,11 +377,13 @@ document.addEventListener('alpine:init', function () {
           this.auth.tokenName = me.tokenName || '';
           this.auth.roles = me.roles || [];
           this.auth.permissions = me.permissions || [];
+          this.auth.globalPermissions = me.globalPermissions || [];
           this.auth.groups = me.groups || [];
         } else {
           this.auth.authenticated = false;
           this.auth.roles = [];
           this.auth.permissions = [];
+          this.auth.globalPermissions = [];
         }
         this.auth.loaded = true;
       },
@@ -581,10 +604,113 @@ document.addEventListener('alpine:init', function () {
           : 'chip-indigo';
       },
 
+      // ── Project membership ──────────────────────────────────────────────────
+
+      /** The project the membership panel is about. */
+      memberProject() {
+        return this.activeProject ? this.activeProject.slug : null;
+      },
+
+      async loadMembers() {
+        var project = this.memberProject();
+        if (!project || !this.can('project:members')) return;
+        this.membersLoading = true;
+        this.membersError = '';
+        try {
+          var d = await this._fetch('/api/projects/' + encodeURIComponent(project) + '/members');
+          this.members = (d && d.members) || [];
+          this.membersDefaultRole = d ? d.defaultRole : null;
+        } finally {
+          this.membersLoading = false;
+        }
+      },
+
+      async addMember() {
+        var project = this.memberProject();
+        if (!project) return;
+        if (!this.memberForm.username.trim()) { this.membersError = 'Enter a username.'; return; }
+        this.memberBusy = true;
+        this.membersError = '';
+        try {
+          var res = await window.fetch('/api/projects/' + encodeURIComponent(project) + '/members', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: this.memberForm.username.trim(), role: this.memberForm.role }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.membersError = body.error || 'Could not add that member.'; return; }
+          this.memberForm.username = '';
+          await this.loadMembers();
+        } catch (e) {
+          this.membersError = 'Could not reach the server.';
+        } finally {
+          this.memberBusy = false;
+        }
+      },
+
+      /** Changing a role is the same call as adding: one role per person here. */
+      async setMemberRole(member, role) {
+        var project = this.memberProject();
+        if (!project || role === member.projectRole) return;
+        this.membersError = '';
+        try {
+          var res = await window.fetch('/api/projects/' + encodeURIComponent(project) + '/members', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: member.userId, role: role }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.membersError = body.error || 'Could not change that role.'; }
+          await this.loadMembers();
+        } catch (e) {
+          this.membersError = 'Could not reach the server.';
+        }
+      },
+
+      async removeMember(member) {
+        var project = this.memberProject();
+        if (!project) return;
+        if (!window.confirm('Remove ' + (member.displayName || member.userId) + ' from ' + project + '?')) return;
+        this.membersError = '';
+        try {
+          var res = await window.fetch(
+            '/api/projects/' + encodeURIComponent(project) + '/members/' + encodeURIComponent(member.userId),
+            { method: 'DELETE' },
+          );
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.membersError = body.error || 'Could not remove that member.'; return; }
+          // Access inherited from a group or a server-wide grant survives, and
+          // saying so beats a row that stubbornly refuses to disappear.
+          if (body.stillHasAccess) {
+            this.membersError =
+              (member.displayName || member.userId) +
+              ' still reaches this project through ' +
+              (body.remainingRoles || []).join(', ') +
+              ' granted elsewhere. Remove that grant to revoke access entirely.';
+          }
+          await this.loadMembers();
+        } catch (e) {
+          this.membersError = 'Could not reach the server.';
+        }
+      },
+
+      /** Explains, in words, where a member's access comes from. */
+      memberOrigin(member) {
+        var bits = [];
+        if (member.projectRole) bits.push('added here as ' + member.projectRole);
+        (member.inherited || []).forEach(function (i) {
+          if (i.source === 'group') bits.push(i.role + ' from a directory group');
+          else if (i.source === 'global') bits.push(i.role + ' on all projects');
+          else if (i.source === 'bootstrap') bits.push('server administrator');
+          else if (i.source === 'default') bits.push(i.role + ' by default');
+        });
+        return bits.join(' · ');
+      },
+
       // ── Access administration ───────────────────────────────────────────────
 
       async loadAdminUsers() {
-        if (!this.can('admin:users')) return;
+        if (!this.canGlobal('admin:users')) return;
         this.adminLoading = true;
         this.adminError = '';
         try {
@@ -1227,7 +1353,7 @@ document.addEventListener('alpine:init', function () {
         if (id === 'adrs')       { this.loadAdrs(); }
         if (id === 'versions')   { this.loadVersions(); }
         if (id === 'audit')      { this.auditPage = 1; this.loadAudit(); this.loadActivity(); }
-        if (id === 'access')     { this.loadAdminUsers(); }
+        if (id === 'access')     { this.loadMembers(); this.loadAdminUsers(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -1255,7 +1381,7 @@ document.addEventListener('alpine:init', function () {
         // The last two tabs exist only for the roles that may open them, so the
         // arrow-key ring has to match what is actually rendered.
         if (this.can('audit:read')) tabs.push('audit');
-        if (this.can('admin:users')) tabs.push('access');
+        if (this.canSeeAccess()) tabs.push('access');
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }

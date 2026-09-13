@@ -653,6 +653,195 @@ async function main() {
   }
 
   // =========================================================================
+  console.log("\n— project membership —");
+  // =========================================================================
+  //
+  // Adding someone to one project must delegate exactly that: the right to work
+  // on it, and — for an admin — the right to decide who else can. Nothing about
+  // any other project, and nothing server-wide.
+  {
+    const root = path.join(tmp, "memberproj");
+    const other = path.join(tmp, "otherproj");
+    await fs.mkdir(root, { recursive: true });
+    await fs.mkdir(other, { recursive: true });
+    const slug = slugFor(root);
+    const otherSlug = slugFor(other);
+    const authDb = path.join(tmp, "members-auth.db");
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+
+    // vera is a reader in the directory. Make her admin of this project only.
+    process.env.REQU_AUTH_DB = authDb;
+    process.env.REQU_AUTH_SECRET = SECRET;
+    process.env.REQU_AUTH_MODE = "disabled";
+    const { resetAuthConfig } = await import("../src/auth/config.js");
+    const { authStore, setAuthStore } = await import("../src/auth/store.js");
+    resetAuthConfig();
+    setAuthStore(null);
+    await authStore().init();
+    await authStore().grantRole({
+      userId: "vera", projectId: slug, role: "admin", grantedBy: "smoke", grantedAt: new Date().toISOString(),
+    });
+
+    const env = {
+      REQU_AUTH_MODE: "ldap",
+      REQU_AUTH_SECRET: SECRET,
+      REQU_AUTH_DB: authDb,
+      REQU_AUDIT: "on",
+      REQU_LDAP_URL: fixture.url,
+      REQU_LDAP_ALLOW_PLAINTEXT: "true",
+      REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN,
+      REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=maintainer",
+      REQU_AUTH_DEFAULT_ROLE: "none",
+    };
+
+    const h = await startHarness([root, other], "smoke-auth-members", { env, connectMcp: false });
+    try {
+      const signIn = async (username: string, password: string) => {
+        const res = await fetch(`${h.base}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        return {
+          status: res.status,
+          body: await res.json().catch(() => ({})),
+          cookie: (res.headers.get("set-cookie") ?? "").split(";")[0],
+        };
+      };
+      const post = async (url: string, cookie: string, payload: unknown) => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: cookie },
+          body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json().catch(() => ({})) };
+      };
+
+      const vera = await signIn("vera", "vera-secret");
+      check("membership: a project-scoped admin can sign in", vera.status === 200, vera.body);
+
+      // --- the escalation this design exists to prevent ---
+      const escalate = await post(`${h.base}/api/admin/roles?project=${slug}`, vera.cookie, {
+        userId: "vera", projectId: "*", role: "admin",
+      });
+      check("membership: a project admin cannot grant themselves a server-wide role",
+        escalate.status === 403, escalate);
+      const stillNotGlobal = await getJson(`${h.base}/api/auth/me`, { Cookie: vera.cookie });
+      check("membership: and does not hold server-wide administration",
+        (stillNotGlobal.body.globalPermissions ?? []).includes("admin:users") === false,
+        stillNotGlobal.body.globalPermissions);
+      check("membership: while still administering their own project",
+        (await getJson(`${h.base}/api/auth/me?project=${slug}`, { Cookie: vera.cookie })).body.permissions?.includes("project:members") === true);
+
+      const serverAdminRoutes = await getJson(`${h.base}/api/admin/users?project=${slug}`, { Cookie: vera.cookie });
+      check("membership: server administration stays closed to them", serverAdminRoutes.status === 403, serverAdminRoutes.status);
+
+      // --- adding someone who has never signed in ---
+      const added = await post(`${h.base}/api/projects/${slug}/members`, vera.cookie, {
+        username: "nora", role: "maintainer",
+      });
+      check("membership: a member can be added before they have ever signed in", added.status === 200, added.body);
+      check("membership: they are listed as invited", added.body.invited === true, added.body);
+      check("membership: with the role they were given", added.body.projectRole === "maintainer", added.body);
+
+      const listed = await getJson(`${h.base}/api/projects/${slug}/members`, { Cookie: vera.cookie });
+      const names = (listed.body.members ?? []).map((x: any) => x.userId);
+      check("membership: the members list includes both of them", names.includes("vera") && names.includes("nora"), names);
+      const veraRow = (listed.body.members ?? []).find((x: any) => x.userId === "vera");
+      check("membership: a directory group shows as inherited, not as a grant made here",
+        (veraRow?.inherited ?? []).some((i: any) => i.source === "group"), veraRow);
+
+      // --- the invited user can now actually sign in ---
+      const nora = await signIn("nora", "nora-secret");
+      check("membership: someone whose only role is on one project can sign in", nora.status === 200, nora.body);
+      const noraHere = await getJson(`${h.base}/api/auth/me?project=${slug}`, { Cookie: nora.cookie });
+      check("membership: and holds their role on that project", noraHere.body.roles?.includes("maintainer") === true, noraHere.body.roles);
+      check("membership: with nothing server-wide", (noraHere.body.globalPermissions ?? []).length === 0, noraHere.body.globalPermissions);
+      const noraElsewhere = await getJson(`${h.base}/api/auth/me?project=${otherSlug}`, { Cookie: nora.cookie });
+      check("membership: and nothing on another project", (noraElsewhere.body.roles ?? []).length === 0, noraElsewhere.body.roles);
+
+      const noraWrite = await fetch(`${h.base}/api/config?project=${slug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: nora.cookie },
+        body: JSON.stringify({ brief: "a maintainer may write here" }),
+      });
+      check("membership: the granted role really works on that project", noraWrite.status !== 403, noraWrite.status);
+      const noraWriteElsewhere = await fetch(`${h.base}/api/config?project=${otherSlug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: nora.cookie },
+        body: JSON.stringify({ brief: "but not here" }),
+      });
+      check("membership: and nowhere else", noraWriteElsewhere.status === 403, noraWriteElsewhere.status);
+
+      // --- a member is not an administrator of the project ---
+      const noraAdds = await post(`${h.base}/api/projects/${slug}/members`, nora.cookie, {
+        username: "mika", role: "admin",
+      });
+      check("membership: a maintainer cannot change who else is a member", noraAdds.status === 403, noraAdds);
+
+      // --- an admin of one project is not an admin of another ---
+      const veraElsewhere = await getJson(`${h.base}/api/projects/${otherSlug}/members`, { Cookie: vera.cookie });
+      check("membership: a project admin cannot read another project's members", veraElsewhere.status === 403, veraElsewhere.status);
+
+      // --- changing a role replaces it rather than stacking ---
+      const demoted = await post(`${h.base}/api/projects/${slug}/members`, vera.cookie, {
+        username: "nora", role: "viewer",
+      });
+      check("membership: changing a role replaces the old one", demoted.body.projectRole === "viewer", demoted.body);
+      check("membership: the old role is really gone",
+        JSON.stringify(demoted.body.roles) === JSON.stringify(["viewer"]), demoted.body.roles);
+
+      // --- removal ---
+      const removed = await fetch(`${h.base}/api/projects/${slug}/members/nora`, {
+        method: "DELETE", headers: { Cookie: vera.cookie },
+      });
+      const removedBody = await removed.json().catch(() => ({}));
+      check("membership: a member can be removed", removed.status === 200 && removedBody.removed === true, removedBody);
+      check("membership: and then has no access at all", removedBody.stillHasAccess === false, removedBody);
+      const afterRemoval = await getJson(`${h.base}/api/auth/me?project=${slug}`, { Cookie: nora.cookie });
+      check("membership: their existing session loses the role immediately",
+        (afterRemoval.body.roles ?? []).length === 0, afterRemoval.body.roles);
+
+      // --- the last administrator cannot lock everyone out ---
+      const selfRemove = await fetch(`${h.base}/api/projects/${slug}/members/vera`, {
+        method: "DELETE", headers: { Cookie: vera.cookie },
+      });
+      check("membership: the only administrator cannot remove themselves", selfRemove.status === 400, selfRemove.status);
+
+      // --- inherited access cannot be removed from the project ---
+      await post(`${h.base}/api/projects/${slug}/members`, vera.cookie, { username: "mika", role: "admin" });
+      const mika = await signIn("mika", "mika-secret");
+      check("membership: a second administrator can be added", mika.status === 200, mika.body);
+      const withMika = await getJson(`${h.base}/api/projects/${slug}/members`, { Cookie: vera.cookie });
+      const mikaRow = (withMika.body.members ?? []).find((x: any) => x.userId === "mika");
+      check("membership: their directory role is shown alongside the one granted here",
+        (mikaRow?.inherited ?? []).some((i: any) => i.role === "maintainer" && i.source === "group"), mikaRow);
+      const dropMika = await fetch(`${h.base}/api/projects/${slug}/members/mika`, {
+        method: "DELETE", headers: { Cookie: vera.cookie },
+      });
+      const dropBody = await dropMika.json().catch(() => ({}));
+      check("membership: removing them drops only the grant made here",
+        dropBody.removed === true && dropBody.stillHasAccess === true, dropBody);
+      check("membership: their directory-granted role survives",
+        (dropBody.remainingRoles ?? []).includes("maintainer"), dropBody.remainingRoles);
+
+      // --- the audit trail records membership decisions ---
+      const auditRes = await getJson(`${h.base}/api/audit?project=${slug}&limit=200`, { Cookie: vera.cookie });
+      const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
+      check("membership: adding a member is audited", actions.includes("members.add"), actions.slice(0, 10));
+      check("membership: removing one is audited", actions.includes("members.remove"), actions.slice(0, 10));
+      const refused = (auditRes.body.entries ?? []).find((e: any) => e.outcome === "denied" && e.actorId === "nora");
+      check("membership: a refused membership change is audited", Boolean(refused), refused);
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+  }
+
+  // =========================================================================
   console.log("\n— login throttling —");
   // =========================================================================
   {

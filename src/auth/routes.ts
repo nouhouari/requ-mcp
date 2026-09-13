@@ -10,7 +10,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { authConfig } from "./config.js";
 import { clearSessionCookie, serializeSessionCookie } from "./cookies.js";
-import { clientIp, login, logout, userIdFor } from "./authenticate.js";
+import { canInScope, clientIp, login, logout, principalInScope, userIdFor } from "./authenticate.js";
 import { checkLdapConnection } from "./ldap.js";
 import {
   can,
@@ -21,6 +21,7 @@ import {
   type Principal,
   type Role,
 } from "./model.js";
+import { addProjectMember, listProjectMembers, MemberError, removeProjectMember } from "./members.js";
 import { ALL_PROJECTS, resolveRoles } from "./roles.js";
 import { authStore } from "./store.js";
 import { clearLoginFailures, loginRetryAfterMs, recordLoginFailure } from "./throttle.js";
@@ -250,10 +251,23 @@ export async function handleAuthRoutes(
       send(res, 200, { authenticated: false, mode: cfg.mode });
       return true;
     }
+    // `permissions` answers "what may I do here?" for the project in scope;
+    // `globalPermissions` answers "am I a server administrator?". The dashboard
+    // needs both, because a project's admin sees a members panel but not the
+    // server administration one.
+    let globalPermissions: string[] = [];
+    try {
+      const global = await principalInScope(ctx.principal, null);
+      globalPermissions = [...global.permissions].sort();
+    } catch {
+      // The account or token went away between authenticating and here; the
+      // caller simply has no global rights.
+    }
     send(res, 200, {
       authenticated: true,
       mode: cfg.mode,
       ...principalPayload(ctx.principal),
+      globalPermissions,
     });
     return true;
   }
@@ -261,7 +275,11 @@ export async function handleAuthRoutes(
   // Everything below needs an identified caller.
   const principal = ctx.principal;
   if (!principal) {
-    if (pathname.startsWith("/api/auth/") || pathname.startsWith("/api/admin/")) {
+    if (
+      pathname.startsWith("/api/auth/") ||
+      pathname.startsWith("/api/admin/") ||
+      /^\/api\/projects\/[^/]+\/members(\/|$)/.test(pathname)
+    ) {
       fail(res, 401, "Authentication required.", "UNAUTHENTICATED");
       return true;
     }
@@ -365,13 +383,135 @@ export async function handleAuthRoutes(
   }
 
   // -------------------------------------------------------------------------
-  // Administration — every route below needs `admin:users`
+  // Project membership — who can reach one project, and with what role
+  // -------------------------------------------------------------------------
+  //
+  // Authorised against the project in the URL, not against whatever project the
+  // request happened to be authenticated for. A project's admin administers that
+  // project; nothing else follows from it.
+
+  const membersMatch = /^\/api\/projects\/([^/]+)\/members$/.exec(pathname);
+  const memberMatch = /^\/api\/projects\/([^/]+)\/members\/([^/]+)$/.exec(pathname);
+
+  if (membersMatch || memberMatch) {
+    const targetProject = decodeURIComponent((membersMatch ?? memberMatch)![1]);
+    if (!(await canInScope(principal, "project:members", targetProject))) {
+      audit({
+        action: `members:${m} ${targetProject}`,
+        outcome: "denied",
+        source: "web",
+        permission: "project:members",
+        projectId: targetProject,
+      });
+      fail(res, 403, `You need the admin role on project '${targetProject}' to manage its members.`);
+      return true;
+    }
+
+    // --- GET /api/projects/:slug/members
+    if (membersMatch && m === "GET") {
+      send(res, 200, {
+        project: targetProject,
+        members: await listProjectMembers(targetProject),
+        roles: ROLES,
+        // A server-wide default role means everyone with an account reaches
+        // every project; the UI needs to say so rather than imply the list is
+        // the whole story.
+        defaultRole: cfg.defaultRole,
+      });
+      return true;
+    }
+
+    // --- POST /api/projects/:slug/members  { username, role }
+    if (membersMatch && m === "POST") {
+      let payload: Record<string, unknown>;
+      try {
+        payload = await body(req);
+      } catch (e) {
+        fail(res, 400, (e as Error).message);
+        return true;
+      }
+      const username = str(payload.username) ?? str(payload.userId);
+      const role = str(payload.role) ?? "viewer";
+      if (!username) {
+        fail(res, 400, "`username` is required.");
+        return true;
+      }
+      try {
+        const member = await addProjectMember({
+          projectId: targetProject,
+          username,
+          role,
+          grantedBy: principal.userId,
+        });
+        audit({
+          action: "members.add",
+          outcome: "ok",
+          source: "web",
+          permission: "project:members",
+          projectId: targetProject,
+          detail: { userId: member.userId, role, invited: member.invited },
+        });
+        send(res, 200, member);
+      } catch (e) {
+        const status = e instanceof MemberError ? e.status : 500;
+        audit({
+          action: "members.add",
+          outcome: "error",
+          source: "web",
+          projectId: targetProject,
+          detail: { username, role, error: (e as Error).message },
+        });
+        fail(res, status, (e as Error).message);
+      }
+      return true;
+    }
+
+    // --- DELETE /api/projects/:slug/members/:userId
+    if (memberMatch && m === "DELETE") {
+      const targetUser = userIdFor(decodeURIComponent(memberMatch[2]));
+      // Removing your own last way in leaves a project nobody can administer.
+      if (targetUser === principal.userId) {
+        const others = (await listProjectMembers(targetProject)).filter(
+          (x) => x.userId !== principal.userId && x.roles.includes("admin"),
+        );
+        if (others.length === 0) {
+          fail(res, 400, "You are the only administrator of this project; add another before removing yourself.");
+          return true;
+        }
+      }
+      const result = await removeProjectMember({
+        projectId: targetProject,
+        userId: targetUser,
+        actorId: principal.userId,
+      });
+      audit({
+        action: "members.remove",
+        outcome: "ok",
+        source: "web",
+        permission: "project:members",
+        projectId: targetProject,
+        detail: { userId: targetUser, ...result },
+      });
+      send(res, 200, result);
+      return true;
+    }
+
+    fail(res, 405, `Method ${m} is not supported here.`);
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Administration — server-wide, and checked in the global scope
   // -------------------------------------------------------------------------
 
   if (pathname.startsWith("/api/admin/")) {
-    if (!can(principal, "admin:users")) {
+    // Resolved globally on purpose: `can(principal, …)` would answer from the
+    // roles this request was authenticated with, and a caller who is admin on
+    // one project arrives holding every permission. Asking in the global scope
+    // is what keeps that a delegation rather than an escalation.
+    if (!(await canInScope(principal, "admin:users", null))) {
       audit({ action: `admin:${pathname}`, outcome: "denied", source: "web", permission: "admin:users" });
-      fail(res, 403, "Administrator access is required.");
+      fail(res, 403, "Server administrator access is required.");
       return true;
     }
 
@@ -448,10 +588,21 @@ export async function handleAuthRoutes(
         fail(res, 400, `Unknown role '${role}'. Known: ${ROLES.join(", ")}.`);
         return true;
       }
+      // A grant may be made before the person has ever signed in — that is the
+      // normal case when a team is being set up — so a placeholder account is
+      // recorded and their first sign-in fills in the real details.
       const target = userIdFor(userId);
-      if (!(await authStore().getUser(target))) {
-        fail(res, 404, `No such user '${target}'. Users appear here after their first sign-in.`);
-        return true;
+      const invited = !(await authStore().getUser(target));
+      if (invited) {
+        await authStore().upsertUser({
+          id: target,
+          username: userId,
+          displayName: userId,
+          email: null,
+          dn: null,
+          groups: [],
+          disabled: false,
+        });
       }
       await authStore().grantRole({
         userId: target,
@@ -460,8 +611,8 @@ export async function handleAuthRoutes(
         grantedBy: principal.userId,
         grantedAt: now(),
       });
-      audit({ action: "admin:role.grant", outcome: "ok", source: "web", detail: { userId: target, projectId, role } });
-      send(res, 200, { ok: true });
+      audit({ action: "admin:role.grant", outcome: "ok", source: "web", detail: { userId: target, projectId, role, invited } });
+      send(res, 200, { ok: true, invited });
       return true;
     }
 

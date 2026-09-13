@@ -92,6 +92,26 @@ flushed once, so a tool that writes five entities costs one insert.
 Both tables live in requ's own database — PostgreSQL when configured, SQLite
 otherwise — so the audit trail is not a separate operational concern.
 
+### Scope is part of the question, not part of the answer
+
+Roles resolve per project, so a principal arrives at a handler already carrying
+the permissions it holds *for the project the request named*. That is right for
+ordinary work and wrong for administration: someone who is `admin` on one
+project arrives holding every permission, including the one that guards
+server-wide grants. Asking `can(principal, "admin:users")` there answers "yes"
+for the whole server — which is how a project administrator could grant
+themselves a global role.
+
+So administrative checks name their scope explicitly. `project:members` is
+resolved against the project in the URL, and `admin:users` is always resolved
+globally, where a project-scoped binding does not apply. Delegating a project
+now delegates exactly that project.
+
+The same split runs through the UI: `/api/auth/me` returns the caller's
+permissions for the project in view *and* their global permissions, so the
+dashboard can show a members panel to a project's admin without showing them
+server administration.
+
 ### The directory is tested for real, in-process
 
 Public test directories are unreachable from CI and a container is a heavy
