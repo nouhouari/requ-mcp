@@ -422,6 +422,50 @@ async function authStoreChecks(): Promise<void> {
     })());
     check("pg: a binding can be revoked", (await store.revokeRole(uid, pid, "admin")) && (await store.listBindings(uid)).length === 1);
 
+    // --- the role catalogue ---
+    //
+    // A shared role is stored with a NULL project, but the primary key needs a
+    // value, so the column holds '*' and the row mapper translates. That
+    // translation is invisible on SQLite (which was written the same way from
+    // the start) and is exactly the kind of thing that only breaks in
+    // production, so it is checked here against the real database.
+    await store.putRole({
+      id: "pg-release-manager", name: "Release Manager", description: "Cuts the baselines.",
+      permissions: ["spec:read", "version:manage"], projectId: null,
+      builtIn: false, createdAt: iso(), updatedAt: iso(), createdBy: uid,
+    });
+    await store.putRole({
+      id: "pg-release-manager", name: "Release Manager (here)", description: "",
+      permissions: ["spec:read", "version:manage", "project:export"], projectId: pid,
+      builtIn: false, createdAt: iso(), updatedAt: iso(), createdBy: uid,
+    });
+    const catalogue = (await store.listRoles()).filter((r) => r.id === "pg-release-manager");
+    check("pg: the same role id can exist shared and on a project", catalogue.length === 2, catalogue.map((r) => r.projectId));
+    const sharedRole = catalogue.find((r) => r.projectId === null);
+    check("pg: a shared role reads back with a null project", Boolean(sharedRole), catalogue);
+    check("pg: its permissions survive the round trip",
+      JSON.stringify(sharedRole?.permissions) === JSON.stringify(["spec:read", "version:manage"]), sharedRole);
+    check("pg: a project-scoped role keeps its project",
+      catalogue.find((r) => r.projectId === pid)?.permissions.length === 3, catalogue);
+
+    await store.putRole({
+      id: "pg-release-manager", name: "Release Manager", description: "Edited.",
+      permissions: ["spec:read"], projectId: null,
+      builtIn: false, createdAt: iso(), updatedAt: iso(), createdBy: uid,
+    });
+    check("pg: putting a role again replaces it rather than duplicating",
+      (await store.listRoles()).filter((r) => r.id === "pg-release-manager" && r.projectId === null).length === 1);
+    check("pg: and the edit took", (await store.listRoles())
+      .find((r) => r.id === "pg-release-manager" && r.projectId === null)?.description === "Edited.");
+
+    check("pg: deleting the shared one leaves the project's alone",
+      (await store.deleteRole("pg-release-manager", null)) &&
+      (await store.listRoles()).filter((r) => r.id === "pg-release-manager").length === 1);
+    check("pg: deleting a role that is not there says so",
+      (await store.deleteRole("pg-release-manager", null)) === false);
+    check("pg: the project's own can be deleted too",
+      (await store.deleteRole("pg-release-manager", pid)) === true);
+
     // --- tokens ---
     const minted = mintToken(process.env.REQU_AUTH_SECRET!);
     await store.createToken({
@@ -539,6 +583,7 @@ async function authStoreChecks(): Promise<void> {
     await pool.query("DELETE FROM auth_sessions WHERE user_id = $1", [uid]);
     await pool.query("DELETE FROM auth_totp WHERE user_id = $1", [uid]);
     await pool.query("DELETE FROM auth_role_bindings WHERE user_id = $1", [uid]);
+    await pool.query("DELETE FROM auth_roles WHERE created_by = $1", [uid]);
     await pool.query("DELETE FROM auth_users WHERE id = $1", [uid]);
     await pool.end();
   }

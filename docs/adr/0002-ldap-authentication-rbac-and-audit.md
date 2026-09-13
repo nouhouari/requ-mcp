@@ -1,6 +1,6 @@
 # 2. LDAP authentication, role-based access control, and an audit trail
 
-- **Status:** accepted
+- **Status:** accepted, amended by [ADR 0003](0003-roles-as-editable-permission-sets.md)
 - **Date:** 2026-09-13
 
 ## Context
@@ -32,7 +32,9 @@ the existing tests — are unchanged.
 
 Configuration is validated at boot and refuses to start on anything ambiguous: no
 `REQU_AUTH_SECRET` in ldap mode, a plaintext `ldap://` URL without an explicit
-acknowledgement, an unknown role in the group map. A half-configured
+acknowledgement, a malformed role id in the group map (an *unknown* one is now a
+startup warning instead — see ADR 0003, since the catalogue lives in the
+database). A half-configured
 authentication layer is worse than none, because it looks secure.
 
 ### LDAP is the only directory, and it is never the authority on permissions
@@ -51,11 +53,19 @@ injection.
 
 Each user mints tokens from the dashboard; an MCP client presents one as a bearer
 token. Only a peppered SHA-256 of the secret is stored, and the plaintext is
-shown exactly once. A token may be capped below its owner's role, limited to
-named projects, and given an expiry — so a read-only CI token stays read-only
-even after its owner is promoted.
+shown exactly once. A token may be capped at a role, limited to named projects,
+and given an expiry — so a restricted CI token stays restricted even after its
+owner is promoted. (ADR 0003 makes the cap an intersection rather than a ceiling
+on a ladder.)
 
 ### Permissions derived, not annotated
+
+> **Amended by ADR 0003.** The three write permissions below proved too coarse to
+> describe a real team — with one `spec:write`, "may write test scenarios" and
+> "may rewrite the requirements being tested" are the same grant. Permissions are
+> now split per entity and roles are editable sets of them. The derivation
+> described here survives as a fallback for a tool the table does not name.
+
 
 Every tool already declared what it does to the data (`mutates: "spec" |
 "progress" | undefined`) for version resolution. That maps directly onto

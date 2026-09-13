@@ -99,7 +99,7 @@ when running under Docker Compose).
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
 | **Audit** | Recent specification changes with their field-level diffs, and the audit log of every tool call and API request — denials included. Needs `audit:read`; see [Authentication](#authentication-roles-and-the-audit-trail) |
-| **Access** | *Members* — who can reach this project, with what role, and where that role came from; add, change and remove (project admins). Plus server-wide user and role administration (server admins only) |
+| **Access** | *Members* — who can reach this project, with what role, and where that role came from; add, change and remove (project admins). *Roles* — what each role allows, as a permission checklist, for the shared catalogue and the project's own. Plus server-wide user and grant administration (server admins only) |
 | **Decisions** | Architecture decisions (ADRs) with status badges and their requirement/component links; open one to read the record with its mermaid diagrams rendered |
 | **Versions** | Specification baselines: the version history with lock state, parent and audit trail, plus a side-by-side comparison of any two versions showing additions, removals and field-level changes |
 
@@ -265,35 +265,103 @@ Changing it signs everyone out and invalidates every access token, so keep it
 with your other secrets. Every setting is listed in
 [`.env.example`](.env.example); Docker Compose passes them all through.
 
-### Roles
+### Permissions and roles
 
-Four roles, and a permission matrix that is checked identically for an MCP tool
-call and for the REST endpoint that does the same thing:
+Permissions are split by entity, and checked identically for an MCP tool call
+and for the REST endpoint that does the same thing:
 
-| Permission | viewer | contributor | maintainer | admin |
-|---|:--:|:--:|:--:|:--:|
-| `spec:read` — read requirements, stories, screens, coverage | ✓ | ✓ | ✓ | ✓ |
-| `history:read` — see an entity's change history | ✓ | ✓ | ✓ | ✓ |
-| `project:export` — export project data | ✓ | ✓ | ✓ | ✓ |
-| `progress:write` — record executions, scenario results, VCS refs | | ✓ | ✓ | ✓ |
-| `spec:write` — create and edit specification entities | | | ✓ | ✓ |
-| `version:manage` — create, lock, unlock, activate baselines | | | ✓ | ✓ |
-| `project:manage` — create a project, edit its configuration | | | ✓ | ✓ |
-| `project:import` — import over a project's data | | | ✓ | ✓ |
-| `audit:read` — read the server-wide audit log | | | ✓ | ✓ |
-| `admin:users` — grant roles, revoke other people's tokens | | | | ✓ |
+| Group | Permission | What holding it allows |
+|---|---|---|
+| Reading | `spec:read` | Requirements, stories, screens, scenarios, coverage, decisions |
+| | `history:read` | What changed on an entity, and who changed it |
+| | `audit:read` | The server-wide audit log, refusals included |
+| Specification | `requirement:write` | Create, change and remove requirements; assign them to phases |
+| | `story:write` | User stories and their acceptance criteria |
+| | `scenario:write` | The cucumber scenarios that verify a story |
+| | `screen:write` | UI specifications, and their links to stories |
+| | `adr:write` | Architecture decision records |
+| | `component:write` | The component breakdown |
+| | `phase:write` | Phases, and which one is active |
+| Delivery | `execution:write` | Scenario runs, by hand or from a cucumber report |
+| | `vcs:write` | Branch and merge-request links |
+| Lifecycle | `version:manage` | Create, lock, unlock and activate baselines |
+| | `project:manage` | Create a project; edit its configuration and brief |
+| | `project:export` | Take a full export |
+| | `project:import` | Import over the project's data |
+| Administration | `project:members` | Who can reach *this* project, and the roles it defines |
+| | `admin:users` | Server-wide grants, shared roles, accounts, everyone's tokens |
+
+The split is what lets a role mean something in the language of the team: a QA
+engineer owns `scenario:write` and `execution:write` without `requirement:write`,
+so they write and run the tests for a requirement they cannot quietly rewrite —
+and an analyst has exactly the opposite.
+
+**A role is a named set of those permissions, stored in the database**, so the
+roles a deployment has are its own. Eight are seeded on first boot:
+
+| Role | For |
+|---|---|
+| `viewer` | Reads the specification and its history. Changes nothing. |
+| `contributor` | Reads everything and reports delivery progress, but does not change scope. |
+| `maintainer` | Edits the whole specification and manages versions. |
+| `admin` | Everything, including who may reach the project. |
+| `product-owner` | Scope and release planning: requirements, stories, phases, baselines. Writes no tests. |
+| `requirements-analyst` | Writes the specification. Does not freeze a baseline or report on delivery. |
+| `qa` | Owns verification: writes scenarios and records their results. |
+| `developer` | Implements stories: scenarios, runs, branches and merge requests. |
+
+All eight can be **edited** — what QA may do in your team is yours to decide —
+but not deleted, because grants, access tokens and `REQU_LDAP_ROLE_MAP` entries
+point at them by id. For the same reason, no role's id ever changes.
+
+#### Defining your own
+
+The **Access** tab's *Roles* card is a permission checklist; the same thing over
+the API:
+
+```jsonc
+// POST /api/roles                              — shared with every project
+// POST /api/projects/<slug>/roles              — this project's own
+{
+  "name": "Release Manager",
+  "description": "Cuts and freezes the baselines.",
+  "permissions": ["spec:read", "history:read", "version:manage", "project:export"]
+}
+// → 201 { "id": "release-manager", ... }   PATCH to edit, DELETE to remove
+```
+
+Two scopes. A **shared** role is defined once and assignable anywhere: editing it
+changes what it means everywhere it is already granted. A **project** role
+belongs to one project, and one that reuses a shared role's id replaces it there
+and nowhere else — which is how "QA means something different on this project"
+gets said. A project's own role may not name `admin:users`: a project cannot
+confer it, and a role listing a permission it does not grant is a lie the next
+reader has to discover for themselves.
+
+> **You cannot give away what you do not have.** Defining, editing, deleting or
+> assigning a role is refused if it would hand out a permission the caller does
+> not hold in that scope. Without that rule, "define your project's own roles"
+> would be a complete bypass of everything else. Editing checks only the
+> permissions being *added*, so an administrator whose own rights were narrowed
+> can still take permissions away from a role. Deleting one that people still
+> hold needs `?force=true`, which revokes those grants rather than leaving them
+> pointing at nothing.
 
 A user's roles come from three places, unioned:
 
 1. `REQU_AUTH_ADMINS` — usernames that are always admin;
 2. `REQU_LDAP_ROLE_MAP` — directory group → role, so the directory stays the
    source of truth for who is on the team. Groups match on either the bare name
-   (`requ-leads`) or the full DN;
+   (`requ-leads`) or the full DN, and the role may be any role id, including one
+   you defined;
 3. explicit grants — either on one project (the **Access** tab's members panel,
    see below) or server-wide.
 
 Anyone matched by none of them gets `REQU_AUTH_DEFAULT_ROLE` (viewer), or is
-refused the sign-in when that is set to `none`.
+refused the sign-in when that is set to `none`. Role ids in the configuration are
+checked for shape at boot and against the catalogue once the database is
+reachable; one that names no role is warned about on startup rather than
+refused, since a deployment may wire up its directory before defining its roles.
 
 ### Adding people to a project
 
@@ -399,9 +467,12 @@ with the client configuration to paste:
 
 A token acts as its owner and can be narrowed further:
 
-- **capped at a role** — a `viewer` token for a CI job stays read-only even
-  though its owner is a maintainer, and stays read-only if its owner is later
-  promoted;
+- **capped at a role** — a `qa` token for a CI job gets what its owner and the
+  `qa` role *both* allow, so a maintainer's token can record test results
+  without being able to rewrite the requirements, and gains nothing if its owner
+  is later promoted. Capping is an intersection rather than a ceiling on a
+  ladder: with roles a team defines for itself there is no "at or below", since
+  nothing says whether QA outranks a requirements analyst;
 - **limited to projects** — refused on anything else;
 - **expiring** — after `expiresInDays`, or `REQU_AUTH_TOKEN_TTL_DAYS` by default.
 

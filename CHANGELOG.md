@@ -20,14 +20,16 @@ All notable changes to this project will be documented here.
   REQU_LDAP_ROLE_MAP='requ-admins=admin;requ-leads=maintainer;requ-devs=contributor'
   ```
 
-  - **Four roles** — viewer, contributor, maintainer, admin — over a permission
-    matrix that is applied identically to an MCP tool call and to the REST
-    endpoint that does the same thing. Roles come from directory groups, from
+  - **Roles you define yourself** — a role is a named set of per-entity
+    permissions, applied identically to an MCP tool call and to the REST
+    endpoint that does the same thing. Eight are seeded (viewer, contributor,
+    maintainer, admin, product owner, requirements analyst, QA, developer) and
+    a team can edit them or add its own. Roles come from directory groups, from
     `REQU_AUTH_ADMINS`, and from explicit grants made in the dashboard.
   - **Personal access tokens** for MCP clients, minted from the dashboard and
     shown exactly once (only a peppered hash is stored). A token can be capped
-    below its owner's role, limited to named projects, given an expiry, and
-    revoked — which takes effect on the next call.
+    at a role, limited to named projects, given an expiry, and revoked — which
+    takes effect on the next call.
   - **Audit log** — one row per tool call and API request, *including refused
     ones*, with the actor, source, project, version and the permission that was
     missing.
@@ -85,10 +87,55 @@ All notable changes to this project will be documented here.
   resolved against the project being administered, while `admin:users` is always
   resolved globally.
 
+- **Roles built from permissions.** A role is now a named set of permissions
+  stored in the database, not one of four names in the source. That exists
+  because of one thing the old model could not say: *a QA engineer writes the
+  scenarios that verify a requirement and records their results, but must not be
+  able to rewrite the requirement they are testing.* With a single `spec:write`
+  permission those are the same grant.
+
+  Permissions are therefore split per entity — `requirement:write`,
+  `story:write`, `scenario:write`, `screen:write`, `adr:write`,
+  `component:write`, `phase:write`, `execution:write`, `vcs:write`, alongside the
+  reads and the lifecycle and administration permissions.
+
+  Eight roles are seeded on first boot. The original four keep their meaning
+  exactly, so existing grants, tokens and `REQU_LDAP_ROLE_MAP` entries are
+  unaffected by the upgrade; `product-owner`, `requirements-analyst`, `qa` and
+  `developer` join them as a starting vocabulary. All eight can be edited but
+  not deleted, and no role's id ever changes, because grants and tokens point at
+  it by id.
+
+  The **Access** tab's *Roles* card is a permission checklist, grouped by area,
+  each permission carrying the sentence explaining what holding it lets someone
+  do. Over the API: `GET|POST /api/roles` and `PATCH|DELETE /api/roles/:id` for
+  the shared catalogue, and `/api/projects/:slug/roles…` for the roles one
+  project defines for itself — which shadow a shared role of the same id, so
+  "QA means something different on this project" can be said without renaming
+  anything.
+
+  **You cannot give away what you do not have:** defining, editing, deleting or
+  assigning a role is refused when it would hand out a permission the caller
+  does not hold in that scope. Editing checks only the permissions being
+  *added*, so rights can always be taken away. Deleting a role people still hold
+  needs `force`, which revokes those grants rather than leaving them pointing at
+  nothing.
+
+  Capping an access token is now an **intersection** rather than a ceiling on a
+  ladder — with roles a team defines, nothing says whether QA outranks a
+  requirements analyst — so a capped token gets what its owner and the ceiling
+  role both allow. A maintainer can now mint a token that records test results
+  and cannot touch requirements. `/api/auth/me` reports the ceiling beside the
+  owner's roles.
+
+  See [Permissions and roles](README.md#permissions-and-roles) and
+  [ADR-0003](docs/adr/0003-roles-as-editable-permission-sets.md).
+
 - **New REST endpoints** — `GET /api/auth/config`, `POST /api/auth/login`,
   `POST /api/auth/logout`, `GET /api/auth/me`, `GET|POST /api/auth/tokens`,
   `DELETE /api/auth/tokens/:id`, `GET /api/audit`, `GET /api/history`,
-  `GET /api/history/:entity/:id`, and `/api/admin/*` for role administration.
+  `GET /api/history/:entity/:id`, `/api/roles…` and `/api/projects/:slug/roles…`
+  for the role catalogue, and `/api/admin/*` for role administration.
 
 - **Audit and Access dashboard tabs** — recent changes with their field-level
   diffs, a filterable audit log, and user/role administration. A **History**

@@ -1094,6 +1094,15 @@ async function main() {
       const qaAfter = (afterDelete.body.roles ?? []).find((r: any) => r.id === "qa");
       check("roles: the shared role shows through again once the project's is gone", qaAfter?.projectId === null, qaAfter);
 
+      const dropShared = await send("DELETE", `${h.base}/api/roles/release-manager`, mika.cookie);
+      check("roles: a shared role nobody holds is deleted outright", dropShared.status === 200, dropShared.body);
+      const sharedAfter = await send("GET", `${h.base}/api/roles`, mika.cookie);
+      check(
+        "roles: and is gone from the shared catalogue",
+        !(sharedAfter.body.roles ?? []).some((r: any) => r.id === "release-manager"),
+        (sharedAfter.body.roles ?? []).map((r: any) => r.id),
+      );
+
       // --- the audit trail ---
       const auditRes = await send("GET", `${h.base}/api/audit?scope=all&limit=300`, mika.cookie);
       const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
