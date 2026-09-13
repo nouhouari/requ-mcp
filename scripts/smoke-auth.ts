@@ -847,6 +847,269 @@ async function main() {
     }
   }
 
+
+  // =========================================================================
+  console.log("\n— custom roles —");
+  // =========================================================================
+  //
+  // A team that works in product owners, analysts and QA engineers should be
+  // able to say so. That means roles are data, which means they can be written
+  // — and the moment they can be written, the question that decides whether the
+  // whole feature is safe is: can someone write themselves a role that grants
+  // more than they have? Every check below is ultimately about that.
+  {
+    const root = path.join(tmp, "roleproj");
+    await fs.mkdir(root, { recursive: true });
+    const slug = slugFor(root);
+    const authDb = path.join(tmp, "roles-auth.db");
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+
+    process.env.REQU_AUTH_DB = authDb;
+    process.env.REQU_AUTH_SECRET = SECRET;
+    process.env.REQU_AUTH_MODE = "disabled";
+    const { resetAuthConfig } = await import("../src/auth/config.js");
+    const { authStore, setAuthStore } = await import("../src/auth/store.js");
+    resetAuthConfig();
+    setAuthStore(null);
+    await authStore().init();
+    // vera administers this one project; mika is a server administrator.
+    await authStore().grantRole({
+      userId: "vera", projectId: slug, role: "admin", grantedBy: "smoke", grantedAt: new Date().toISOString(),
+    });
+
+    const env = {
+      REQU_AUTH_MODE: "ldap",
+      REQU_AUTH_SECRET: SECRET,
+      REQU_AUTH_DB: authDb,
+      REQU_AUDIT: "on",
+      REQU_AUTH_ADMINS: "mika",
+      REQU_LDAP_URL: fixture.url,
+      REQU_LDAP_ALLOW_PLAINTEXT: "true",
+      REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN,
+      REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer",
+      REQU_AUTH_DEFAULT_ROLE: "none",
+    };
+
+    const h = await startHarness([root], "smoke-auth-roles", { env, connectMcp: false });
+    try {
+      const signIn = async (username: string, password: string) => {
+        const res = await fetch(`${h.base}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        return { status: res.status, cookie: (res.headers.get("set-cookie") ?? "").split(";")[0] };
+      };
+      const send = async (method: string, url: string, cookie: string, payload?: unknown) => {
+        const res = await fetch(url, {
+          method,
+          headers: { "Content-Type": "application/json", Cookie: cookie },
+          ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
+        });
+        return { status: res.status, body: (await res.json().catch(() => ({}))) as any };
+      };
+
+      const mika = await signIn("mika", "mika-secret");
+      const vera = await signIn("vera", "vera-secret");
+      check("roles: the server administrator signs in", mika.status === 200, mika.status);
+      check("roles: the project administrator signs in", vera.status === 200, vera.status);
+
+      // --- reading the catalogue ---
+      const anon = await getJson(`${h.base}/api/roles`);
+      check("roles: the catalogue needs a signed-in caller", anon.status === 401, anon.status);
+
+      const asVera = await send("GET", `${h.base}/api/roles`, vera.cookie);
+      check("roles: any signed-in caller can read the catalogue", asVera.status === 200, asVera.status);
+      check(
+        "roles: the presets are there",
+        ["viewer", "qa", "product-owner", "requirements-analyst"].every((id: string) =>
+          (asVera.body.roles ?? []).some((r: any) => r.id === id)),
+        (asVera.body.roles ?? []).map((r: any) => r.id),
+      );
+      check("roles: reading it says whether you may edit it", asVera.body.canEdit === false, asVera.body.canEdit);
+      check(
+        "roles: the permission catalogue comes with it",
+        (asVera.body.permissions ?? []).some((p: any) => p.id === "scenario:write" && p.label),
+        (asVera.body.permissions ?? []).length,
+      );
+
+      // --- who may change the shared catalogue ---
+      const veraWrites = await send("POST", `${h.base}/api/roles`, vera.cookie, {
+        name: "Sneaky", permissions: ["admin:users"],
+      });
+      check("roles: a project administrator cannot change the shared catalogue", veraWrites.status === 403, veraWrites.body);
+
+      const created = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Release Manager",
+        description: "Cuts the baselines.",
+        permissions: ["spec:read", "history:read", "version:manage"],
+      });
+      check("roles: a server administrator can define one", created.status === 201, created.body);
+      check("roles: the id is derived from the name", created.body.id === "release-manager", created.body.id);
+      check("roles: it is not marked built-in", created.body.builtIn === false, created.body);
+      check("roles: it records who made it", created.body.createdBy === "mika", created.body.createdBy);
+
+      const dup = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Release Manager", permissions: ["spec:read"],
+      });
+      check("roles: the same id twice is refused", dup.status === 409, dup.body);
+
+      const bogus = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Wizard", permissions: ["spec:read", "everything:write"],
+      });
+      check(
+        "roles: an unknown permission is refused rather than dropped",
+        bogus.status === 400 && String(bogus.body.error).includes("everything:write"),
+        bogus.body,
+      );
+
+      // --- editing ---
+      const edited = await send("PATCH", `${h.base}/api/roles/release-manager`, mika.cookie, {
+        name: "Release Manager",
+        description: "Cuts the baselines and exports them.",
+        permissions: ["spec:read", "history:read", "version:manage", "project:export"],
+      });
+      check("roles: it can be edited", edited.status === 200 && edited.body.permissions.includes("project:export"), edited.body);
+
+      const renamed = await send("PATCH", `${h.base}/api/roles/release-manager`, mika.cookie, {
+        id: "release-boss", name: "Release Manager", permissions: ["spec:read"],
+      });
+      check("roles: the id cannot change under a live grant", renamed.status === 400, renamed.body);
+
+      // A built-in role is the team's to reinterpret, but not to remove.
+      const builtIn = await send("PATCH", `${h.base}/api/roles/qa`, mika.cookie, {
+        name: "QA Engineer",
+        description: "Here, QA also maintains the screens.",
+        permissions: ["spec:read", "history:read", "project:export", "scenario:write", "execution:write", "screen:write"],
+      });
+      check("roles: a built-in role can be reinterpreted", builtIn.status === 200, builtIn.body);
+      check("roles: and stays built-in", builtIn.body.builtIn === true, builtIn.body);
+      const deleteBuiltIn = await send("DELETE", `${h.base}/api/roles/qa`, mika.cookie);
+      check("roles: a built-in role cannot be deleted", deleteBuiltIn.status === 400, deleteBuiltIn.body);
+
+      // --- the escalation guard ---
+      //
+      // nora is given just enough to administer the project's members. She must
+      // not be able to turn that into anything more, by any route.
+      const delegate = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Team Lead",
+        description: "Decides who is on the team, and nothing else.",
+        permissions: ["spec:read", "project:members"],
+      });
+      check("roles: a narrow delegating role can be defined", delegate.status === 201, delegate.body);
+      const grantNora = await send("POST", `${h.base}/api/admin/roles`, mika.cookie, {
+        userId: "nora", projectId: slug, role: "team-lead",
+      });
+      check("roles: it can be granted on one project", grantNora.status === 200, grantNora.body);
+
+      // Only now can she sign in: with no directory group mapped and no default
+      // role, that one grant is her whole reason to be let in at all.
+      const nora = await signIn("nora", "nora-secret");
+      check("roles: a grant on one project is enough to sign in", nora.status === 200, nora.status);
+
+      const escalateDefine = await send("POST", `${h.base}/api/projects/${slug}/roles`, nora.cookie, {
+        name: "Super Lead", permissions: ["spec:read", "project:members", "requirement:write"],
+      });
+      check(
+        "roles: you cannot define a role granting more than you hold",
+        escalateDefine.status === 403 && escalateDefine.body.code === "ROLE_ESCALATION",
+        escalateDefine.body,
+      );
+      check(
+        "roles: and the refusal names the permission that was out of reach",
+        String(escalateDefine.body.error).includes("requirement:write"),
+        escalateDefine.body.error,
+      );
+
+      const escalateAssign = await send("POST", `${h.base}/api/projects/${slug}/members`, nora.cookie, {
+        username: "nora", role: "maintainer",
+      });
+      check(
+        "roles: nor assign one that grants more than you hold",
+        escalateAssign.status === 403,
+        escalateAssign.body,
+      );
+
+      const withinReach = await send("POST", `${h.base}/api/projects/${slug}/roles`, nora.cookie, {
+        name: "Team Reader", permissions: ["spec:read"],
+      });
+      check("roles: what you do hold, you can pass on", withinReach.status === 201, withinReach.body);
+
+      const globalInProject = await send("POST", `${h.base}/api/projects/${slug}/roles`, vera.cookie, {
+        name: "Project Overlord", permissions: ["spec:read", "admin:users"],
+      });
+      check(
+        "roles: a project's own role cannot claim a server-wide permission",
+        globalInProject.status === 400 && globalInProject.body.code === "ROLE_SCOPE",
+        globalInProject.body,
+      );
+
+      // Appointing a second administrator of a project is not an escalation,
+      // even though the admin role names a server-wide permission it cannot
+      // confer here.
+      const secondAdmin = await send("POST", `${h.base}/api/projects/${slug}/members`, vera.cookie, {
+        username: "nora", role: "admin",
+      });
+      check("roles: a project administrator can appoint another", secondAdmin.status === 200, secondAdmin.body);
+
+      // --- project-scoped roles ---
+      const projectQa = await send("POST", `${h.base}/api/projects/${slug}/roles`, vera.cookie, {
+        id: "qa",
+        name: "QA (this project)",
+        description: "Here, QA also writes the requirements it tests.",
+        permissions: ["spec:read", "scenario:write", "execution:write", "requirement:write"],
+      });
+      check("roles: a project can redefine a shared role for itself", projectQa.status === 201, projectQa.body);
+
+      const projectList = await send("GET", `${h.base}/api/projects/${slug}/roles`, vera.cookie);
+      const qaHere = (projectList.body.roles ?? []).find((r: any) => r.id === "qa");
+      check("roles: the project's version is the one it sees", qaHere?.projectId === slug, qaHere);
+      check("roles: which is editable there", qaHere?.editable === true, qaHere);
+      const sharedHere = (projectList.body.roles ?? []).find((r: any) => r.id === "release-manager");
+      check("roles: a shared role is assignable but not editable there", sharedHere && sharedHere.editable === false, sharedHere);
+
+      // What it grants must actually follow the project's definition.
+      await send("POST", `${h.base}/api/projects/${slug}/members`, vera.cookie, { username: "dup1", role: "qa" });
+      const dupMembers = await send("GET", `${h.base}/api/projects/${slug}/members`, vera.cookie);
+      const dupRow = (dupMembers.body.members ?? []).find((x: any) => x.userId === "dup1");
+      check(
+        "roles: a member gets the project's reading of the role",
+        (dupRow?.permissions ?? []).includes("requirement:write"),
+        dupRow?.permissions,
+      );
+
+      // --- deleting ---
+      const inUse = await send("DELETE", `${h.base}/api/projects/${slug}/roles/qa`, vera.cookie);
+      check("roles: one that people still hold is not deleted by accident", inUse.status === 409, inUse.body);
+      check("roles: and the refusal says who holds it", String(inUse.body.error).includes("dup1"), inUse.body.error);
+
+      const forced = await send("DELETE", `${h.base}/api/projects/${slug}/roles/qa?force=true`, vera.cookie);
+      check("roles: forcing it through deletes the role", forced.status === 200 && forced.body.deleted === true, forced.body);
+      check("roles: and revokes the grants that pointed at it", (forced.body.revoked ?? []).includes("dup1"), forced.body);
+
+      const afterDelete = await send("GET", `${h.base}/api/projects/${slug}/roles`, vera.cookie);
+      const qaAfter = (afterDelete.body.roles ?? []).find((r: any) => r.id === "qa");
+      check("roles: the shared role shows through again once the project's is gone", qaAfter?.projectId === null, qaAfter);
+
+      // --- the audit trail ---
+      const auditRes = await send("GET", `${h.base}/api/audit?scope=all&limit=300`, mika.cookie);
+      const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
+      check("roles: defining a role is audited", actions.includes("roles.create"), actions.slice(0, 12));
+      check("roles: editing one is audited", actions.includes("roles.update"), actions.slice(0, 12));
+      check("roles: deleting one is audited", actions.includes("roles.delete"), actions.slice(0, 12));
+      const denied = (auditRes.body.entries ?? []).find(
+        (e: any) => e.outcome === "denied" && e.actorId === "nora" && String(e.action).startsWith("roles"),
+      );
+      check("roles: a refused escalation is audited", Boolean(denied), denied);
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+  }
+
   // =========================================================================
   console.log("\n— two-factor authentication —");
   // =========================================================================

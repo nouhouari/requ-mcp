@@ -16,10 +16,12 @@ import {
   can,
   PERMISSION_CATALOGUE,
   PERMISSION_GROUPS,
+  type Permission,
   type Principal,
   type Role,
 } from "./model.js";
-import { roleExists, rolesFor } from "./role-catalogue.js";
+import { ensureSeeded, RoleError, roleExists, roleFor, rolesFor } from "./role-catalogue.js";
+import { assertMayGrant, createRole, deleteRole, grantsOf, updateRole } from "./role-admin.js";
 import { addProjectMember, listProjectMembers, MemberError, removeProjectMember } from "./members.js";
 import { ALL_PROJECTS, resolveRoles } from "./roles.js";
 import { authStore } from "./store.js";
@@ -316,7 +318,8 @@ export async function handleAuthRoutes(
     if (
       pathname.startsWith("/api/auth/") ||
       pathname.startsWith("/api/admin/") ||
-      /^\/api\/projects\/[^/]+\/members(\/|$)/.test(pathname)
+      /^\/api\/roles(\/|$)/.test(pathname) ||
+      /^\/api\/projects\/[^/]+\/(members|roles)(\/|$)/.test(pathname)
     ) {
       fail(res, 401, "Authentication required.", "UNAUTHENTICATED");
       return true;
@@ -574,6 +577,18 @@ export async function handleAuthRoutes(
         return true;
       }
       try {
+        // Assigning a role is another way of handing out its permissions, so it
+        // is held to the same rule as defining one: a project administrator
+        // cannot make someone else more capable than they are themselves.
+        const definition = await roleFor(role, targetProject);
+        if (definition) {
+          await assertMayGrant(
+            principal,
+            definition.permissions,
+            targetProject,
+            `give '${username}' the ${definition.name} role`,
+          );
+        }
         const member = await addProjectMember({
           projectId: targetProject,
           username,
@@ -590,10 +605,10 @@ export async function handleAuthRoutes(
         });
         send(res, 200, member);
       } catch (e) {
-        const status = e instanceof MemberError ? e.status : 500;
+        const status = e instanceof MemberError || e instanceof RoleError ? e.status : 500;
         audit({
           action: "members.add",
-          outcome: "error",
+          outcome: e instanceof RoleError ? "denied" : "error",
           source: "web",
           projectId: targetProject,
           detail: { username, role, error: (e as Error).message },
@@ -608,8 +623,10 @@ export async function handleAuthRoutes(
       const targetUser = userIdFor(decodeURIComponent(memberMatch[2]));
       // Removing your own last way in leaves a project nobody can administer.
       if (targetUser === principal.userId) {
+        // "Another administrator" means someone else who can manage members —
+        // which, with custom roles, is not necessarily anyone called 'admin'.
         const others = (await listProjectMembers(targetProject)).filter(
-          (x) => x.userId !== principal.userId && x.roles.includes("admin"),
+          (x) => x.userId !== principal.userId && x.permissions.includes("project:members"),
         );
         if (others.length === 0) {
           fail(res, 400, "You are the only administrator of this project; add another before removing yourself.");
@@ -630,6 +647,148 @@ export async function handleAuthRoutes(
         detail: { userId: targetUser, ...result },
       });
       send(res, 200, result);
+      return true;
+    }
+
+    fail(res, 405, `Method ${m} is not supported here.`);
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // The role catalogue — what roles exist, and what each one grants
+  // -------------------------------------------------------------------------
+  //
+  // Two scopes, the same handler: `/api/roles` for the shared catalogue, which
+  // is the server's to manage, and `/api/projects/:slug/roles` for the roles one
+  // project defines for itself, which its administrators manage. Reading is open
+  // to any signed-in caller — you cannot be asked to pick a role without being
+  // told what the choices mean — and every write goes through the escalation
+  // guard in role-admin.ts.
+
+  const projectRolesMatch = /^\/api\/projects\/([^/]+)\/roles$/.exec(pathname);
+  const projectRoleMatch = /^\/api\/projects\/([^/]+)\/roles\/([^/]+)$/.exec(pathname);
+  const sharedRoleMatch = /^\/api\/roles\/([^/]+)$/.exec(pathname);
+  const isRolesRoute =
+    pathname === "/api/roles" || sharedRoleMatch || projectRolesMatch || projectRoleMatch;
+
+  if (isRolesRoute) {
+    const scope: string | null = projectRolesMatch || projectRoleMatch
+      ? decodeURIComponent((projectRolesMatch ?? projectRoleMatch)![1])
+      : null;
+    const roleId = projectRoleMatch
+      ? decodeURIComponent(projectRoleMatch[2])
+      : sharedRoleMatch
+        ? decodeURIComponent(sharedRoleMatch[1])
+        : null;
+
+    // Editing the shared catalogue is a server-wide act; editing a project's own
+    // roles belongs to whoever administers that project.
+    const writePermission: Permission = scope === null ? "admin:users" : "project:members";
+    const mayWrite = await canInScope(principal, writePermission, scope);
+    if (m !== "GET" && !mayWrite) {
+      audit({
+        action: `roles:${m} ${scope ?? "*"}`,
+        outcome: "denied",
+        source: "web",
+        permission: writePermission,
+        ...(scope ? { projectId: scope } : {}),
+      });
+      fail(
+        res,
+        403,
+        scope === null
+          ? "Managing the shared roles needs server administration rights."
+          : `You need to be able to manage members of project '${scope}' to change its roles.`,
+      );
+      return true;
+    }
+
+    try {
+      await ensureSeeded();
+
+      // --- GET: the catalogue, with how many grants point at each role
+      if (m === "GET" && (pathname === "/api/roles" || projectRolesMatch)) {
+        const roles = await rolesFor(scope);
+        const withUsage = await Promise.all(
+          roles.map(async (r) => ({
+            ...r,
+            grants: (await grantsOf(r.id, r.projectId)).length,
+            // A project sees the shared roles it may assign, but they are not
+            // its to edit — that is the server's catalogue.
+            editable: mayWrite && (scope === null || r.projectId === scope),
+          })),
+        );
+        send(res, 200, {
+          scope,
+          roles: withUsage,
+          permissions: PERMISSION_CATALOGUE,
+          permissionGroups: PERMISSION_GROUPS,
+          canEdit: mayWrite,
+        });
+        return true;
+      }
+
+      // --- POST: define a new role
+      if (m === "POST" && (pathname === "/api/roles" || projectRolesMatch)) {
+        const payload = await body(req);
+        const role = await createRole({ principal, projectId: scope, input: payload });
+        audit({
+          action: "roles.create",
+          outcome: "ok",
+          source: "web",
+          permission: writePermission,
+          ...(scope ? { projectId: scope } : {}),
+          detail: { role: role.id, permissions: role.permissions },
+        });
+        send(res, 201, role);
+        return true;
+      }
+
+      if (roleId && (m === "PATCH" || m === "PUT")) {
+        const payload = await body(req);
+        const role = await updateRole({ principal, projectId: scope, id: roleId, input: payload });
+        audit({
+          action: "roles.update",
+          outcome: "ok",
+          source: "web",
+          permission: writePermission,
+          ...(scope ? { projectId: scope } : {}),
+          detail: { role: role.id, permissions: role.permissions },
+        });
+        send(res, 200, role);
+        return true;
+      }
+
+      if (roleId && m === "DELETE") {
+        // A role people still hold is refused unless the caller says to go
+        // ahead; `force` then revokes those grants rather than leaving them
+        // pointing at a role that no longer exists.
+        const force = /[?&]force=(1|true|yes)(&|$)/i.test(req.url ?? "");
+        const result = await deleteRole({ principal, projectId: scope, id: roleId, force });
+        audit({
+          action: "roles.delete",
+          outcome: "ok",
+          source: "web",
+          permission: writePermission,
+          ...(scope ? { projectId: scope } : {}),
+          detail: { role: roleId, ...result },
+        });
+        send(res, 200, { ok: true, ...result });
+        return true;
+      }
+    } catch (e) {
+      if (e instanceof RoleError) {
+        audit({
+          action: `roles:${m}`,
+          outcome: e.status === 403 ? "denied" : "error",
+          source: "web",
+          ...(scope ? { projectId: scope } : {}),
+          detail: { role: roleId, reason: e.message, code: e.code },
+        });
+        fail(res, e.status, e.message, e.code);
+        return true;
+      }
+      fail(res, 400, (e as Error).message);
       return true;
     }
 
@@ -735,6 +894,26 @@ export async function handleAuthRoutes(
         fail(res, 400, `Unknown role '${role}'. Known: ${known}.`);
         return true;
       }
+      // The same rule as everywhere else: a grant cannot hand out more than the
+      // person making it holds. A server administrator normally holds
+      // everything, so this only bites when their own rights were narrowed.
+      const granting = await roleFor(role, roleScope);
+      if (granting) {
+        try {
+          await assertMayGrant(principal, granting.permissions, roleScope, `grant '${granting.name}'`);
+        } catch (e) {
+          const err = e as RoleError;
+          audit({
+            action: "admin:role.grant",
+            outcome: "denied",
+            source: "web",
+            detail: { userId, projectId, role, reason: err.message },
+          });
+          fail(res, err.status ?? 403, err.message, err.code);
+          return true;
+        }
+      }
+
       // A grant may be made before the person has ever signed in — that is the
       // normal case when a team is being set up — so a placeholder account is
       // recorded and their first sign-in fills in the real details.
