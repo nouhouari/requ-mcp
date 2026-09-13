@@ -15,6 +15,7 @@ import path from "node:path";
 import { sharedPool, hasPgPool } from "../postgres-store.js";
 import { authConfig } from "./config.js";
 import type { Role } from "./model.js";
+import type { RoleDefinition } from "./role-catalogue.js";
 import type {
   AuditEntry,
   AuditQuery,
@@ -42,6 +43,11 @@ export interface AuthStore {
   getUser(id: string): Promise<AuthUser | null>;
   listUsers(): Promise<AuthUser[]>;
   setUserDisabled(id: string, disabled: boolean): Promise<boolean>;
+
+  // role catalogue
+  listRoles(): Promise<RoleDefinition[]>;
+  putRole(role: RoleDefinition): Promise<void>;
+  deleteRole(id: string, projectId: string | null): Promise<boolean>;
 
   // role bindings
   listBindings(userId?: string): Promise<RoleBinding[]>;
@@ -133,6 +139,20 @@ const PG_SCHEMA = `
     granted_by TEXT,
     granted_at TEXT NOT NULL,
     PRIMARY KEY (user_id, project_id, role)
+  );
+  CREATE TABLE IF NOT EXISTS auth_roles (
+    id          TEXT NOT NULL,
+    -- '*' rather than NULL so it can sit in the primary key: a shared role and a
+    -- project's own role of the same id are different rows.
+    project_id  TEXT NOT NULL DEFAULT '*',
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    built_in    BOOLEAN NOT NULL DEFAULT false,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    created_by  TEXT,
+    PRIMARY KEY (project_id, id)
   );
   CREATE TABLE IF NOT EXISTS auth_tokens (
     id           TEXT PRIMARY KEY,
@@ -276,6 +296,38 @@ class PgAuthStore implements AuthStore {
 
   async setUserDisabled(id: string, disabled: boolean): Promise<boolean> {
     const rows = await this.q(`UPDATE auth_users SET disabled = $2 WHERE id = $1 RETURNING id`, [id, disabled]);
+    return rows.length > 0;
+  }
+
+  // --- role catalogue ---
+
+  async listRoles(): Promise<RoleDefinition[]> {
+    const rows = await this.q(`SELECT * FROM auth_roles ORDER BY project_id, name`);
+    return rows.map(pgRole);
+  }
+
+  async putRole(role: RoleDefinition): Promise<void> {
+    await this.q(
+      `INSERT INTO auth_roles (id, project_id, name, description, permissions, built_in, created_at, updated_at, created_by)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9)
+       ON CONFLICT (project_id, id) DO UPDATE SET
+         name        = EXCLUDED.name,
+         description = EXCLUDED.description,
+         permissions = EXCLUDED.permissions,
+         updated_at  = EXCLUDED.updated_at`,
+      [
+        role.id, role.projectId ?? "*", role.name, role.description,
+        JSON.stringify(role.permissions ?? []), role.builtIn,
+        role.createdAt, role.updatedAt, role.createdBy,
+      ],
+    );
+  }
+
+  async deleteRole(id: string, projectId: string | null): Promise<boolean> {
+    const rows = await this.q(
+      `DELETE FROM auth_roles WHERE id = $1 AND project_id = $2 RETURNING id`,
+      [id, projectId ?? "*"],
+    );
     return rows.length > 0;
   }
 
@@ -533,6 +585,22 @@ function pgUser(r: any): AuthUser {
   };
 }
 
+function pgRole(r: any): RoleDefinition {
+  return {
+    id: r.id,
+    // '*' is how "shared across every project" is stored, so it can be part of
+    // the primary key; null is how the rest of the code says it.
+    projectId: r.project_id === "*" ? null : r.project_id,
+    name: r.name,
+    description: r.description ?? "",
+    permissions: asJson<string[]>(r.permissions, []) as RoleDefinition["permissions"],
+    builtIn: Boolean(r.built_in),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    createdBy: r.created_by ?? null,
+  };
+}
+
 function pgBinding(r: any): RoleBinding {
   return {
     userId: r.user_id,
@@ -640,6 +708,20 @@ const SQLITE_SCHEMA = `
     granted_by TEXT,
     granted_at TEXT NOT NULL,
     PRIMARY KEY (user_id, project_id, role)
+  );
+  CREATE TABLE IF NOT EXISTS auth_roles (
+    id          TEXT NOT NULL,
+    -- '*' rather than NULL so it can sit in the primary key: a shared role and a
+    -- project's own role of the same id are different rows.
+    project_id  TEXT NOT NULL DEFAULT '*',
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    permissions TEXT NOT NULL DEFAULT '[]',
+    built_in    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    created_by  TEXT,
+    PRIMARY KEY (project_id, id)
   );
   CREATE TABLE IF NOT EXISTS auth_tokens (
     id           TEXT PRIMARY KEY,
@@ -769,6 +851,35 @@ class SqliteAuthStore implements AuthStore {
   async setUserDisabled(id: string, disabled: boolean): Promise<boolean> {
     const db = await this.handle();
     return db.prepare(`UPDATE auth_users SET disabled = ? WHERE id = ?`).run(disabled ? 1 : 0, id).changes > 0;
+  }
+
+  // --- role catalogue ---
+
+  async listRoles(): Promise<RoleDefinition[]> {
+    const db = await this.handle();
+    return db.prepare(`SELECT * FROM auth_roles ORDER BY project_id, name`).all().map(pgRole);
+  }
+
+  async putRole(role: RoleDefinition): Promise<void> {
+    const db = await this.handle();
+    db.prepare(
+      `INSERT INTO auth_roles (id, project_id, name, description, permissions, built_in, created_at, updated_at, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(project_id, id) DO UPDATE SET
+         name        = excluded.name,
+         description = excluded.description,
+         permissions = excluded.permissions,
+         updated_at  = excluded.updated_at`,
+    ).run(
+      role.id, role.projectId ?? "*", role.name, role.description,
+      JSON.stringify(role.permissions ?? []), role.builtIn ? 1 : 0,
+      role.createdAt, role.updatedAt, role.createdBy,
+    );
+  }
+
+  async deleteRole(id: string, projectId: string | null): Promise<boolean> {
+    const db = await this.handle();
+    return db.prepare(`DELETE FROM auth_roles WHERE id = ? AND project_id = ?`).run(id, projectId ?? "*").changes > 0;
   }
 
   // --- role bindings ---

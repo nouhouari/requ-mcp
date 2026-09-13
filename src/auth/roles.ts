@@ -11,10 +11,15 @@
  *
  * A user matched by none of them gets `REQU_AUTH_DEFAULT_ROLE` (viewer by
  * default), or is refused entirely when that is set to `none`.
+ *
+ * What each role *grants* is not decided here — that is the catalogue's job, so
+ * a deployment can define its own roles. This module only answers "which role
+ * names apply to this person, on this project, and why".
  */
 
 import { rdnValue } from "./ldap.js";
-import { ROLE_RANK, type Role } from "./model.js";
+import { permissionsForRoles } from "./role-catalogue.js";
+import type { Permission, Role } from "./model.js";
 import type { AuthConfig } from "./config.js";
 import type { RoleBinding } from "./types.js";
 
@@ -91,19 +96,24 @@ export function resolveRoles(args: {
 }
 
 /**
- * Cap a role set at `ceiling`, dropping anything stronger.
+ * The permissions a role set grants, capped by a ceiling role.
  *
- * A token may be issued weaker than its owner — "read-only token for CI" — and
- * must stay weaker even if the owner is later promoted. Roles at or below the
- * ceiling are kept as they are; a user with no role at or below it gets the
- * ceiling itself only when they hold something stronger, so a viewer issuing a
- * maintainer-capped token still ends up a viewer.
+ * Capping is an intersection, not a comparison. When roles were a fixed ladder a
+ * ceiling could be "anything at or below maintainer"; a catalogue of custom
+ * roles has no total order — is "QA" above or below "Requirements Analyst"? —
+ * so a capped token gets exactly the permissions both its owner and the ceiling
+ * role hold. That keeps the guarantee that matters: a token can never do more
+ * than its owner, nor more than the role it was capped to.
  */
-export function capRoles(roles: readonly Role[], ceiling: Role | null): Role[] {
-  if (!ceiling) return [...roles];
-  const limit = ROLE_RANK[ceiling];
-  const kept = roles.filter((r) => ROLE_RANK[r] <= limit);
-  const hasStronger = roles.some((r) => ROLE_RANK[r] > limit);
-  if (hasStronger && !kept.includes(ceiling)) kept.push(ceiling);
-  return kept;
+export async function effectivePermissions(args: {
+  roles: readonly Role[];
+  projectId: string | null;
+  ceiling: Role | null;
+}): Promise<Set<Permission>> {
+  const granted = await permissionsForRoles(args.roles, args.projectId);
+  if (!args.ceiling) return granted;
+  const allowed = await permissionsForRoles([args.ceiling], args.projectId);
+  const out = new Set<Permission>();
+  for (const p of granted) if (allowed.has(p)) out.add(p);
+  return out;
 }

@@ -463,7 +463,7 @@ async function authStoreChecks(): Promise<void> {
       await store.appendAudit({
         at: iso(i), actorId: uid, actorName: "PG User", actorKind: "token", source: "mcp",
         action: "create_requirement", projectId: pid, version: "1.0.0", outcome,
-        permission: "spec:write", detail: { title: "Audited", n: i }, ip: "127.0.0.1", tokenId: minted.id,
+        permission: "requirement:write", detail: { title: "Audited", n: i }, ip: "127.0.0.1", tokenId: minted.id,
       });
     }
     const audited = await store.queryAudit({ projectId: pid });

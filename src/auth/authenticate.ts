@@ -18,7 +18,7 @@ import {
   type Principal,
   type Role,
 } from "./model.js";
-import { capRoles, resolveRoles } from "./roles.js";
+import { effectivePermissions, resolveRoles } from "./roles.js";
 import { authStore } from "./store.js";
 import { bearerFromHeaders, hashesEqual, hashTokenSecret, parseToken } from "./tokens.js";
 import { newSessionId, parseCookies, verifySessionCookie } from "./cookies.js";
@@ -202,6 +202,9 @@ async function principalForUser(
     bindings,
     projectId: projectKey,
   });
+  // The roles stay as assigned; the *ceiling* narrows what they grant. Reporting
+  // the real roles keeps "why can I do this?" answerable, while the permission
+  // set is what any check actually reads.
   return buildPrincipal({
     userId: user.id,
     username: user.username,
@@ -209,7 +212,9 @@ async function principalForUser(
     email: user.email,
     groups: user.groups,
     ...extra,
-    roles: capRoles(roles, ceiling),
+    roles,
+    cappedTo: ceiling,
+    permissions: await effectivePermissions({ roles, projectId: projectKey, ceiling }),
   });
 }
 

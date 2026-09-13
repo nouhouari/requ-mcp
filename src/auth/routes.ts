@@ -14,13 +14,12 @@ import { canInScope, clientIp, login, logout, principalInScope, userIdFor } from
 import { checkLdapConnection } from "./ldap.js";
 import {
   can,
-  isRole,
-  PERMISSIONS,
-  ROLES,
-  ROLE_PERMISSIONS,
+  PERMISSION_CATALOGUE,
+  PERMISSION_GROUPS,
   type Principal,
   type Role,
 } from "./model.js";
+import { roleExists, rolesFor } from "./role-catalogue.js";
 import { addProjectMember, listProjectMembers, MemberError, removeProjectMember } from "./members.js";
 import { ALL_PROJECTS, resolveRoles } from "./roles.js";
 import { authStore } from "./store.js";
@@ -85,6 +84,9 @@ export function principalPayload(p: Principal): Record<string, unknown> {
     permissions: [...p.permissions].sort(),
     groups: p.groups,
     ...(p.tokenName ? { tokenName: p.tokenName } : {}),
+    // Only meaningful for a capped token; absent otherwise so the dashboard can
+    // treat its presence as "this token is limited".
+    ...(p.cappedTo ? { cappedTo: p.cappedTo } : {}),
   };
 }
 
@@ -137,9 +139,12 @@ export async function handleAuthRoutes(
       mode: cfg.mode,
       enabled: cfg.enabled,
       auditEnabled: cfg.auditEnabled,
-      roles: ROLES,
-      permissions: PERMISSIONS,
-      rolePermissions: ROLE_PERMISSIONS,
+      // The permission catalogue is a property of the software, so it is safe
+      // to serve before sign-in — it is the same everywhere requ runs, and the
+      // login form needs nothing from it. Which *roles* exist is deployment
+      // data and names real teams, so that is behind `/api/roles` instead.
+      permissions: PERMISSION_CATALOGUE,
+      permissionGroups: PERMISSION_GROUPS,
       // A development server says so out loud, so nobody mistakes an open
       // instance for a secured one.
       twoFactor: cfg.twoFactor,
@@ -433,20 +438,26 @@ export async function handleAuthRoutes(
       return true;
     }
 
-    let maxRole: Role | null = null;
-    const rawRole = str(payload.maxRole);
-    if (rawRole) {
-      if (!isRole(rawRole)) {
-        fail(res, 400, `Unknown role '${rawRole}'. Known: ${ROLES.join(", ")}.`);
-        return true;
-      }
-      maxRole = rawRole;
-    }
-
     let projects: string[] | null = null;
     if (Array.isArray(payload.projects)) {
       projects = payload.projects.filter((p): p is string => typeof p === "string" && p.trim() !== "");
       if (projects.length === 0) projects = null;
+    }
+
+    // The ceiling role is checked where the token will actually be used: a
+    // token limited to one project may be capped to a role that project
+    // defines, while an unrestricted token can only be capped to a shared one.
+    let maxRole: Role | null = null;
+    const rawRole = str(payload.maxRole);
+    if (rawRole) {
+      const scopes: Array<string | null> = projects && projects.length === 1 ? [projects[0]] : [null];
+      for (const scope of scopes) {
+        if (await roleExists(rawRole, scope)) continue;
+        const known = (await rolesFor(scope)).map((r) => r.id).join(", ");
+        fail(res, 400, `Unknown role '${rawRole}'. Known: ${known}.`);
+        return true;
+      }
+      maxRole = rawRole;
     }
 
     const requestedDays = Number(payload.expiresInDays ?? cfg.tokenTtlDays);
@@ -537,7 +548,8 @@ export async function handleAuthRoutes(
       send(res, 200, {
         project: targetProject,
         members: await listProjectMembers(targetProject),
-        roles: ROLES,
+        // Assignable here means shared plus this project's own roles.
+        roles: await rolesFor(targetProject),
         // A server-wide default role means everyone with an account reaches
         // every project; the UI needs to say so rather than imply the list is
         // the whole story.
@@ -715,8 +727,12 @@ export async function handleAuthRoutes(
         fail(res, 400, "`userId` and `role` are required.");
         return true;
       }
-      if (!isRole(role)) {
-        fail(res, 400, `Unknown role '${role}'. Known: ${ROLES.join(", ")}.`);
+      // A grant with `projectId: "*"` applies everywhere, so it may only name a
+      // shared role; a grant on one project may also name that project's own.
+      const roleScope = projectId === ALL_PROJECTS ? null : projectId;
+      if (!(await roleExists(role, roleScope))) {
+        const known = (await rolesFor(roleScope)).map((r) => r.id).join(", ");
+        fail(res, 400, `Unknown role '${role}'. Known: ${known}.`);
         return true;
       }
       // A grant may be made before the person has ever signed in — that is the
@@ -759,8 +775,11 @@ export async function handleAuthRoutes(
       const userId = str(payload.userId);
       const role = str(payload.role);
       const projectId = str(payload.projectId) ?? ALL_PROJECTS;
-      if (!userId || !role || !isRole(role)) {
-        fail(res, 400, "`userId` and a valid `role` are required.");
+      // Deliberately not checked against the catalogue: a role deleted while
+      // people still held it must stay revocable, or the stale grants could
+      // never be cleaned up.
+      if (!userId || !role) {
+        fail(res, 400, "`userId` and `role` are required.");
         return true;
       }
       const removed = await authStore().revokeRole(userIdFor(userId), projectId, role);

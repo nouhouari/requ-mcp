@@ -98,6 +98,7 @@ import { authenticateRequest, clientIp, reauthorizeForProject } from "./auth/aut
 import { devPrincipal, ForbiddenError, requirePermission, UnauthorizedError } from "./auth/model.js";
 import { permissionForTool } from "./auth/rbac.js";
 import { authStore } from "./auth/store.js";
+import { ensureSeeded, warnUnknownConfiguredRoles } from "./auth/role-catalogue.js";
 
 const now = () => new Date().toISOString();
 
@@ -3511,7 +3512,13 @@ async function startHttpServer(): Promise<void> {
   loadProjectsFromEnv();
 
   const auth = authConfig();
-  if (auth.enabled || auth.auditEnabled) await authStore().init();
+  if (auth.enabled || auth.auditEnabled) {
+    await authStore().init();
+    // Seed the role catalogue and say so when the directory map points at a
+    // role that does not exist — otherwise the mapping silently grants nothing.
+    await ensureSeeded();
+    await warnUnknownConfiguredRoles(auth);
+  }
 
   const httpServer = createHttpServer(async (req, res) => {
     // Web dashboard routes (REST API + static files)

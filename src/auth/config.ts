@@ -14,7 +14,7 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { isRole, type Role } from "./model.js";
+import { isValidRoleId, type Role } from "./model.js";
 
 export type AuthMode = "disabled" | "ldap";
 
@@ -161,10 +161,13 @@ function parseRoleMap(raw: string | undefined): Map<string, Role> {
     const group = trimmed.slice(0, eq).trim().toLowerCase();
     const role = trimmed.slice(eq + 1).trim().toLowerCase();
     if (!group) throw new AuthConfigError(`REQU_LDAP_ROLE_MAP entry '${trimmed}' has an empty group.`);
-    if (!isRole(role)) {
+    // Only the *shape* is checked here. Which roles exist lives in the database
+    // and this runs at boot, before it is reachable; a name that matches no role
+    // simply grants nothing, which the members panel shows plainly.
+    if (!isValidRoleId(role)) {
       throw new AuthConfigError(
-        `REQU_LDAP_ROLE_MAP entry '${trimmed}' names an unknown role '${role}'. ` +
-          `Known roles: viewer, contributor, maintainer, admin.`,
+        `REQU_LDAP_ROLE_MAP entry '${trimmed}' has an invalid role id '${role}'. ` +
+          `Use lower-case letters, digits and hyphens, e.g. 'requirements-analyst'.`,
       );
     }
     map.set(group, role);
@@ -242,11 +245,12 @@ export function loadAuthConfig(): AuthConfig {
   let defaultRole: Role | null;
   if (rawDefaultRole === "none" || rawDefaultRole === "deny") {
     defaultRole = null;
-  } else if (isRole(rawDefaultRole)) {
+  } else if (isValidRoleId(rawDefaultRole)) {
     defaultRole = rawDefaultRole;
   } else {
     throw new AuthConfigError(
-      `REQU_AUTH_DEFAULT_ROLE must be one of viewer, contributor, maintainer, admin, none — got '${rawDefaultRole}'.`,
+      `REQU_AUTH_DEFAULT_ROLE must be a role id or 'none' — got '${rawDefaultRole}'. ` +
+        `Built-in roles: viewer, contributor, maintainer, admin, product-owner, requirements-analyst, qa, developer.`,
     );
   }
 
@@ -262,9 +266,10 @@ export function loadAuthConfig(): AuthConfig {
   const twoFactorRequiredRoles: Role[] = [];
   for (const raw of envList("REQU_2FA_REQUIRED_ROLES")) {
     const role = raw.toLowerCase();
-    if (!isRole(role)) {
+    if (!isValidRoleId(role)) {
       throw new AuthConfigError(
-        `REQU_2FA_REQUIRED_ROLES names an unknown role '${raw}'. Known: viewer, contributor, maintainer, admin.`,
+        `REQU_2FA_REQUIRED_ROLES has an invalid role id '${raw}'. ` +
+          `Use lower-case letters, digits and hyphens, e.g. 'product-owner'.`,
       );
     }
     twoFactorRequiredRoles.push(role);

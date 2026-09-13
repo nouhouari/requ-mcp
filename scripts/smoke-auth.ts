@@ -22,6 +22,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startHarness, slugFor } from "./lib/http-harness.js";
+import type { AuthConfig } from "../src/auth/config.js";
 import {
   BASE_DN,
   GROUP_BASE_DN,
@@ -178,7 +179,7 @@ async function main() {
       check("audit recorded the tool calls", actions.includes("create_requirement") && actions.includes("update_requirement"), actions.slice(0, 10));
       const createEntry = (auditRes.body.entries ?? []).find((e: any) => e.action === "create_requirement");
       check("audit entry carries the outcome", createEntry?.outcome === "ok", createEntry);
-      check("audit entry carries the permission checked", createEntry?.permission === "spec:write", createEntry?.permission);
+      check("audit entry carries the permission checked", createEntry?.permission === "requirement:write", createEntry?.permission);
       check("audit entry carries the project", createEntry?.projectId === slug, createEntry?.projectId);
       check("audit entry summarises the arguments", createEntry?.detail?.title === "Audited requirement", createEntry?.detail);
 
@@ -281,7 +282,7 @@ async function main() {
       check("a token identifies its owner", me.body.username === "vera" && me.body.kind === "token", me.body);
       check("the group mapping granted the viewer role", me.body.roles?.includes("viewer") === true, me.body.roles);
       check("a viewer may read", me.body.permissions?.includes("spec:read") === true, me.body.permissions);
-      check("a viewer may not write", me.body.permissions?.includes("spec:write") !== true, me.body.permissions);
+      check("a viewer may not write", me.body.permissions?.includes("requirement:write") !== true, me.body.permissions);
       check("/api/auth/me names the token", me.body.tokenName === "vera laptop", me.body.tokenName);
 
       const init = await viewer.call("init_project", { key: slug, name: "Prod Project", initialPhase: "v1.0", force: true });
@@ -343,8 +344,13 @@ async function main() {
     });
     try {
       const me = await getJson(`${capped.base}/api/auth/me`, { Authorization: `Bearer ${cappedToken}` });
-      check("a capped token drops its owner's higher role", me.body.roles?.includes("maintainer") !== true, me.body.roles);
-      check("a capped token keeps the role it was capped to", me.body.roles?.includes("viewer") === true, me.body.roles);
+      // The owner's roles are reported as assigned — that is what makes "why
+      // can I do this?" answerable — and the ceiling is reported beside them.
+      // What the token may actually do is the intersection of the two.
+      check("a capped token reports its owner's roles", me.body.roles?.includes("maintainer") === true, me.body.roles);
+      check("a capped token says what it was capped to", me.body.cappedTo === "viewer", me.body.cappedTo);
+      check("a capped token loses the permissions the ceiling lacks", me.body.permissions?.includes("requirement:write") !== true, me.body.permissions);
+      check("a capped token keeps the permissions both hold", me.body.permissions?.includes("spec:read") === true, me.body.permissions);
 
       const write = await capped.call("create_requirement", { key: slug, title: "Should not exist", priority: "medium" });
       check("a capped token cannot write even though its owner can", write.isError === true, write.data);
@@ -578,7 +584,7 @@ async function main() {
 
       const me = await getJson(`${h.base}/api/auth/me`, { Cookie: cookie });
       check("session: the cookie identifies the user", me.body.username === "mika" && me.body.kind === "session", me.body);
-      check("session: it carries the maintainer permissions", me.body.permissions?.includes("spec:write") === true, me.body.permissions);
+      check("session: it carries the maintainer permissions", me.body.permissions?.includes("requirement:write") === true, me.body.permissions);
 
       // A session can mint a token, and that token drives MCP.
       const mint = await fetch(`${h.base}/api/auth/tokens`, {
@@ -1107,12 +1113,21 @@ async function main() {
       "2fa: it cannot be switched on without authentication",
       (tryCfg({ REQU_2FA: "required", REQU_AUTH_MODE: "disabled" }) ?? "").includes("REQU_AUTH_MODE=ldap"),
     );
+    // Roles live in the database, which is not reachable at boot, so config
+    // checks the id's shape and the catalogue decides the rest.
     check(
-      "2fa: an unknown role in the required-roles list is refused",
+      "2fa: a malformed role id in the required-roles list is refused",
       (tryCfg({
         REQU_2FA: "optional", REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET,
-        REQU_LDAP_URL: "ldaps://d", REQU_LDAP_BASE_DN: "dc=x", REQU_2FA_REQUIRED_ROLES: "wizard",
-      }) ?? "").includes("wizard"),
+        REQU_LDAP_URL: "ldaps://d", REQU_LDAP_BASE_DN: "dc=x", REQU_2FA_REQUIRED_ROLES: "Wizard!",
+      }) ?? "").includes("Wizard!"),
+    );
+    check(
+      "2fa: a custom role in the required-roles list is accepted",
+      tryCfg({
+        REQU_2FA: "optional", REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET,
+        REQU_LDAP_URL: "ldaps://d", REQU_LDAP_BASE_DN: "dc=x", REQU_2FA_REQUIRED_ROLES: "release-manager",
+      }) === null,
     );
     check(
       "2fa: requiring it for roles while switched off is refused",
@@ -1194,9 +1209,18 @@ async function main() {
       },
     );
     await withEnv(
-      { REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: "ldaps://dir", REQU_LDAP_BASE_DN: "dc=x", REQU_LDAP_ROLE_MAP: "grp=wizard" },
+      { REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: "ldaps://dir", REQU_LDAP_BASE_DN: "dc=x", REQU_LDAP_ROLE_MAP: "grp=Wizard!" },
       () => {
-        check("an unknown role in the group map is refused", throws(loadAuthConfig)?.includes("wizard") === true);
+        check("a malformed role id in the group map is refused", throws(loadAuthConfig)?.includes("Wizard!") === true);
+      },
+    );
+    // A well-formed id the catalogue does not know is accepted at boot — a
+    // deployment may define its roles after wiring up the directory — and
+    // reported once the database is reachable.
+    await withEnv(
+      { REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: "ldaps://dir", REQU_LDAP_BASE_DN: "dc=x", REQU_LDAP_ROLE_MAP: "grp=release-manager" },
+      () => {
+        check("a custom role in the group map is accepted", throws(loadAuthConfig) === null);
       },
     );
     await withEnv({ REQU_AUTH_MODE: "sometimes" }, () => {
@@ -1208,15 +1232,7 @@ async function main() {
     check("filter escaping neutralises a wildcard", escapeFilterValue("*") === "\\2a");
     check("filter escaping neutralises parentheses", escapeFilterValue(")(uid=admin") === "\\29\\28uid=admin");
 
-    const { capRoles } = await import("../src/auth/roles.js");
-    check("capping keeps roles at or below the ceiling", JSON.stringify(capRoles(["viewer"], "maintainer")) === JSON.stringify(["viewer"]));
-    check("capping drops roles above the ceiling", JSON.stringify(capRoles(["admin"], "viewer")) === JSON.stringify(["viewer"]));
-
-    const { permissionsFor } = await import("../src/auth/model.js");
-    check("a viewer cannot write", !permissionsFor(["viewer"]).has("spec:write"));
-    check("a contributor records progress but not scope", permissionsFor(["contributor"]).has("progress:write") && !permissionsFor(["contributor"]).has("spec:write"));
-    check("a maintainer is not a user administrator", !permissionsFor(["maintainer"]).has("admin:users"));
-    check("an admin has every permission", permissionsFor(["admin"]).has("admin:users") && permissionsFor(["admin"]).has("audit:read"));
+    await roleCatalogueChecks(path.join(tmp, "roles-unit.db"));
 
     const { parseToken, mintToken, hashTokenSecret } = await import("../src/auth/tokens.js");
     const t = mintToken("pepper");
@@ -1243,6 +1259,156 @@ async function main() {
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
+}
+
+/**
+ * The role catalogue, checked directly rather than through a server.
+ *
+ * These are the guarantees a deployment relies on when it starts inventing its
+ * own roles: the presets mean what their names say, a project can redefine a
+ * role for itself without touching anyone else, and capping a token can only
+ * ever remove permissions.
+ */
+async function roleCatalogueChecks(dbPath: string): Promise<void> {
+  const { setAuthStore, authStore } = await import("../src/auth/store.js");
+  const { resetAuthConfig } = await import("../src/auth/config.js");
+  const { resetSeed, rolesFor, permissionsForRoles, roleExists, PRESET_ROLES } =
+    await import("../src/auth/role-catalogue.js");
+  const { effectivePermissions } = await import("../src/auth/roles.js");
+
+  // A database of its own, so the catalogue starts empty and the seed is really
+  // being observed rather than something an earlier suite left behind.
+  const previousDb = process.env.REQU_AUTH_DB;
+  process.env.REQU_AUTH_DB = dbPath;
+  resetAuthConfig();
+  setAuthStore(null);
+  resetSeed();
+  try {
+    const shared = await rolesFor(null);
+    check(
+      "every preset role is seeded",
+      PRESET_ROLES.every((preset) => shared.some((r) => r.id === preset.id)),
+      shared.map((r) => r.id),
+    );
+    check("seeded roles are marked built-in", shared.every((r) => r.builtIn));
+
+    // Seeding twice must not duplicate or overwrite.
+    resetSeed();
+    const again = await rolesFor(null);
+    check("seeding is idempotent", again.length === shared.length, [shared.length, again.length]);
+
+    const qa = await permissionsForRoles(["qa"], null);
+    check(
+      "a QA engineer writes scenarios and records runs",
+      qa.has("scenario:write") && qa.has("execution:write"),
+    );
+    check(
+      "a QA engineer cannot rewrite the requirements being tested",
+      !qa.has("requirement:write") && !qa.has("story:write"),
+    );
+
+    const analyst = await permissionsForRoles(["requirements-analyst"], null);
+    check(
+      "a requirements analyst writes the specification",
+      analyst.has("requirement:write") && analyst.has("story:write") && analyst.has("screen:write"),
+    );
+    check(
+      "a requirements analyst does not report on delivery",
+      !analyst.has("execution:write") && !analyst.has("version:manage"),
+    );
+
+    const po = await permissionsForRoles(["product-owner"], null);
+    check(
+      "a product owner owns scope and baselines",
+      po.has("requirement:write") && po.has("phase:write") && po.has("version:manage"),
+    );
+    check("a product owner does not write tests", !po.has("scenario:write"));
+
+    const viewer = await permissionsForRoles(["viewer"], null);
+    check(
+      "a viewer changes nothing",
+      ![...viewer].some((perm) => perm.endsWith(":write") || perm.endsWith(":manage")),
+      [...viewer],
+    );
+    check("a maintainer is not a server administrator", !(await permissionsForRoles(["maintainer"], null)).has("admin:users"));
+    check("an administrator can administer", (await permissionsForRoles(["admin"], null)).has("admin:users"));
+
+    // Holding two roles adds their permissions up.
+    const both = await permissionsForRoles(["qa", "requirements-analyst"], null);
+    check("roles union", both.has("scenario:write") && both.has("requirement:write"));
+
+    // A role that no longer exists costs the access it granted; it does not
+    // break every request its holder makes.
+    const ghost = await permissionsForRoles(["no-such-role"], null);
+    check("an unknown role grants nothing", ghost.size === 0);
+    check("an unknown role does not exist", !(await roleExists("no-such-role", null)));
+
+    // --- project-scoped roles ---
+    await authStore().putRole({
+      id: "qa",
+      name: "QA (checkout)",
+      description: "This project lets QA edit the requirements it tests.",
+      permissions: ["spec:read", "scenario:write", "execution:write", "requirement:write"],
+      projectId: "checkout",
+      builtIn: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdBy: "mika",
+    });
+    await authStore().putRole({
+      id: "release-manager",
+      name: "Release Manager",
+      description: "Only meaningful on this project.",
+      permissions: ["spec:read", "version:manage"],
+      projectId: "checkout",
+      builtIn: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdBy: "mika",
+    });
+
+    const onCheckout = await permissionsForRoles(["qa"], "checkout");
+    check("a project-scoped role shadows the shared one of the same id", onCheckout.has("requirement:write"));
+    check("the shared role is unchanged elsewhere", !(await permissionsForRoles(["qa"], "storefront")).has("requirement:write"));
+    check("a project's own role is assignable there", await roleExists("release-manager", "checkout"));
+    check("a project's own role is not assignable elsewhere", !(await roleExists("release-manager", "storefront")));
+    check("a project's own role is not shared", !(await roleExists("release-manager", null)));
+
+    // --- capping a token ---
+    //
+    // A catalogue has no ladder, so a ceiling is an intersection: the token gets
+    // what its owner and the ceiling role both hold, and nothing else.
+    const capped = await effectivePermissions({ roles: ["maintainer"], projectId: null, ceiling: "qa" });
+    check("capping keeps what both hold", capped.has("scenario:write") && capped.has("execution:write"));
+    check("capping drops what the ceiling lacks", !capped.has("requirement:write") && !capped.has("version:manage"));
+
+    const raised = await effectivePermissions({ roles: ["viewer"], projectId: null, ceiling: "admin" });
+    check("a ceiling can never add a permission", !raised.has("admin:users") && !raised.has("requirement:write"));
+
+    const uncapped = await effectivePermissions({ roles: ["qa"], projectId: null, ceiling: null });
+    check("no ceiling leaves the role's own permissions", uncapped.has("scenario:write"));
+
+    // --- configuration that names a role the catalogue does not have ---
+    const { warnUnknownConfiguredRoles } = await import("../src/auth/role-catalogue.js");
+    const warnings: string[] = [];
+    const unknown = await warnUnknownConfiguredRoles(
+      {
+        roleMap: new Map([["cn=wizards", "wizard"], ["cn=qa", "qa"]]),
+        defaultRole: "viewer",
+        twoFactorRequiredRoles: [],
+      } as unknown as AuthConfig,
+      (m) => warnings.push(m),
+    );
+    check("a group mapped to no role is reported at startup", unknown.join() === "wizard", unknown);
+    check("the warning says where the id came from", warnings[0]?.includes("REQU_LDAP_ROLE_MAP") === true, warnings);
+    check("a project-scoped role does not count as shared", !(await roleExists("release-manager", null)));
+  } finally {
+    if (previousDb === undefined) delete process.env.REQU_AUTH_DB;
+    else process.env.REQU_AUTH_DB = previousDb;
+    resetAuthConfig();
+    setAuthStore(null);
+    resetSeed();
+  }
 }
 
 main().catch((err) => {

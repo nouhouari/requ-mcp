@@ -14,7 +14,8 @@
  */
 
 import { authConfig } from "./config.js";
-import { highestRole, isRole, ROLE_RANK, type Role } from "./model.js";
+import type { Permission, Role } from "./model.js";
+import { permissionsForRoles, roleExists, rolesFor } from "./role-catalogue.js";
 import { ALL_PROJECTS, resolveRoles } from "./roles.js";
 import { authStore } from "./store.js";
 import type { AuthUser, RoleBinding } from "./types.js";
@@ -36,8 +37,14 @@ export type ProjectMember = {
   invited: boolean;
   /** Every role that applies to them on this project. */
   roles: Role[];
-  /** The strongest of them — what the UI shows as "their role". */
-  effectiveRole: Role | null;
+  /**
+   * What those roles actually let them do here.
+   *
+   * There is no "highest" role to report once roles are a catalogue rather than
+   * a ladder — is QA above or below Requirements Analyst? — so the member list
+   * shows the roles it has and the permissions they add up to.
+   */
+  permissions: Permission[];
   /** The role granted on this project specifically, if any. Editable. */
   projectRole: Role | null;
   /** Roles that reach this project from elsewhere, and where from. */
@@ -111,7 +118,8 @@ export async function listProjectMembers(projectId: string): Promise<ProjectMemb
     if (roles.length === 0) continue;
 
     const projectBindings = bindings.filter((b) => b.projectId === projectId);
-    const projectRole = highestRole(projectBindings.map((b) => b.role));
+    // One role per person per project, so the first is the one.
+    const projectRole = projectBindings[0]?.role ?? null;
     const groupRoles = sources.filter((s) => s.source === "group").map((s) => s.role);
     const isBootstrap = sources.some((s) => s.source === "bootstrap");
     const inherited = inheritedFor(bindings, groupRoles, isBootstrap, cfg.defaultRole);
@@ -125,17 +133,19 @@ export async function listProjectMembers(projectId: string): Promise<ProjectMemb
       lastLoginAt: user.lastLoginAt,
       invited: user.lastLoginAt === null,
       roles,
-      effectiveRole: highestRole(roles),
+      permissions: [...(await permissionsForRoles(roles, projectId))],
       projectRole,
       inherited,
       removable: projectBindings.length > 0,
     });
   }
 
-  members.sort((a, b) => {
-    const rank = (m: ProjectMember) => (m.effectiveRole ? ROLE_RANK[m.effectiveRole] : -1);
-    return rank(b) - rank(a) || a.username.localeCompare(b.username);
-  });
+  // Most capable first, then alphabetically. Permission count is a rough
+  // ordering rather than a ranking — it is only here so the people who can do
+  // the most are not buried at the bottom of a long list.
+  members.sort(
+    (a, b) => b.permissions.length - a.permissions.length || a.username.localeCompare(b.username),
+  );
   return members;
 }
 
@@ -157,8 +167,11 @@ export async function addProjectMember(args: {
   const { projectId, grantedBy } = args;
   const username = args.username.trim();
   if (!username) throw new MemberError("A username is required.");
-  if (!isRole(args.role)) {
-    throw new MemberError(`Unknown role '${args.role}'. Known: viewer, contributor, maintainer, admin.`);
+  // The role must exist *on this project* — either shared, or one the project
+  // defines itself.
+  if (!(await roleExists(args.role, projectId))) {
+    const known = (await rolesFor(projectId)).map((r) => r.id).join(", ");
+    throw new MemberError(`Unknown role '${args.role}' on project '${projectId}'. Known: ${known}.`);
   }
   const role = args.role;
   const userId = username.toLowerCase();
