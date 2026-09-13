@@ -183,11 +183,70 @@ document.addEventListener('alpine:init', function () {
       diffLoading: false,
       diffError: '',
 
+      // ── Authentication, roles and the audit trail ───────────────────────────
+      // `auth.loaded` gates the whole shell: until the server has said whether
+      // it requires a login, neither the dashboard nor the login form is shown,
+      // so a secured instance never flashes its contents at a signed-out visitor.
+      auth: {
+        loaded: false,
+        enabled: false,
+        mode: 'disabled',
+        auditEnabled: false,
+        authenticated: false,
+        warning: null,
+        userId: '', username: '', displayName: '', email: null,
+        kind: '', tokenName: '',
+        roles: [], permissions: [], groups: [],
+      },
+      login: { username: '', password: '', error: '', busy: false },
+
+      accountOpen: false,
+      tokens: [],
+      tokensLoading: false,
+      tokenForm: { name: '', maxRole: '', expiresInDays: '', projects: '' },
+      tokenBusy: false,
+      tokenError: '',
+      /** Shown once, right after minting: the server keeps only a hash. */
+      mintedToken: '',
+      mintedCopied: false,
+
+      auditEntries: [],
+      auditTotal: 0,
+      auditLoading: false,
+      auditFilters: { actor: '', action: '', outcome: '', source: '', scope: 'project' },
+      auditPage: 1,
+      auditPageSize: 50,
+
+      historyOpen: false,
+      historyEntity: '',
+      historyEntityId: '',
+      historyChanges: [],
+      historyLoading: false,
+
+      activity: [],
+      activityLoading: false,
+
+      adminUsers: [],
+      adminLoading: false,
+      adminError: '',
+      grantForm: { userId: '', role: 'viewer', projectId: '' },
+      ldapStatus: null,
+
       // =========================================================================
       // Lifecycle
       // =========================================================================
 
       async init() {
+        // Who am I, and does this server even require a login? Everything else
+        // waits on the answer: loading project data first would just produce a
+        // screenful of 401s on a secured instance.
+        await this.loadAuth();
+        if (this.auth.enabled && !this.auth.authenticated) return;
+        await this.bootDashboard();
+      },
+
+      /** Load the dashboard proper. Split out so signing in can call it. */
+      async bootDashboard() {
         var vd = await this._fetch('/api/version');
         if (vd && vd.version) this.appVersion = vd.version;
         await this.loadProjects();
@@ -230,6 +289,12 @@ document.addEventListener('alpine:init', function () {
       async _fetch(url) {
         try {
           var res = await window.fetch(url);
+          // A session that expired mid-visit must return the user to the login
+          // form rather than quietly emptying every panel.
+          if (res.status === 401 && this.auth.enabled) {
+            this.auth.authenticated = false;
+            return null;
+          }
           if (res.status === 503) {
             var body = await res.json().catch(function () { return {}; });
             if (body && body.code === 'NOT_INITIALIZED') {
@@ -243,6 +308,342 @@ document.addEventListener('alpine:init', function () {
           return await res.json();
         } catch (_) {
           return null;
+        }
+      },
+
+      // =========================================================================
+      // Authentication, roles, tokens and the audit trail
+      // =========================================================================
+
+      /** True when the signed-in principal holds a permission. */
+      can(permission) {
+        return (this.auth.permissions || []).indexOf(permission) !== -1;
+      },
+
+      /** Strongest role held, for the badge in the header. */
+      topRole() {
+        var order = ['viewer', 'contributor', 'maintainer', 'admin'];
+        var best = '';
+        (this.auth.roles || []).forEach(function (r) {
+          if (order.indexOf(r) > order.indexOf(best)) best = r;
+        });
+        return best;
+      },
+
+      roleClass(role) {
+        return role === 'admin' ? 'chip-red'
+          : role === 'maintainer' ? 'chip-indigo'
+          : role === 'contributor' ? 'chip-green'
+          : 'chip-slate';
+      },
+
+      async loadAuth() {
+        var cfg = await this._fetch('/api/auth/config');
+        if (cfg) {
+          this.auth.enabled = !!cfg.enabled;
+          this.auth.mode = cfg.mode || 'disabled';
+          this.auth.auditEnabled = !!cfg.auditEnabled;
+          this.auth.warning = cfg.warning || null;
+        }
+        var me = await this._fetch('/api/auth/me');
+        if (me && me.authenticated) {
+          this.auth.authenticated = true;
+          this.auth.userId = me.userId || '';
+          this.auth.username = me.username || '';
+          this.auth.displayName = me.displayName || me.username || '';
+          this.auth.email = me.email || null;
+          this.auth.kind = me.kind || '';
+          this.auth.tokenName = me.tokenName || '';
+          this.auth.roles = me.roles || [];
+          this.auth.permissions = me.permissions || [];
+          this.auth.groups = me.groups || [];
+        } else {
+          this.auth.authenticated = false;
+          this.auth.roles = [];
+          this.auth.permissions = [];
+        }
+        this.auth.loaded = true;
+      },
+
+      async doLogin() {
+        if (this.login.busy) return;
+        this.login.busy = true;
+        this.login.error = '';
+        try {
+          var res = await window.fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: this.login.username, password: this.login.password }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) {
+            this.login.error = body.error || 'Sign-in failed.';
+            return;
+          }
+          // Never keep the password in the component once it has been used.
+          this.login.password = '';
+          await this.loadAuth();
+          if (this.auth.authenticated) await this.bootDashboard();
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        } finally {
+          this.login.busy = false;
+        }
+      },
+
+      async doLogout() {
+        try {
+          await window.fetch('/api/auth/logout', { method: 'POST' });
+        } catch (_) { /* signing out locally regardless */ }
+        window.location.reload();
+      },
+
+      // ── Personal access tokens ──────────────────────────────────────────────
+
+      async openAccount() {
+        this.accountOpen = true;
+        this.mintedToken = '';
+        this.mintedCopied = false;
+        this.tokenError = '';
+        await this.loadTokens();
+      },
+
+      async loadTokens() {
+        this.tokensLoading = true;
+        try {
+          var d = await this._fetch('/api/auth/tokens');
+          this.tokens = Array.isArray(d) ? d : [];
+        } finally {
+          this.tokensLoading = false;
+        }
+      },
+
+      async createToken() {
+        if (this.tokenBusy) return;
+        this.tokenBusy = true;
+        this.tokenError = '';
+        this.mintedToken = '';
+        this.mintedCopied = false;
+        try {
+          var payload = { name: this.tokenForm.name || 'MCP client' };
+          if (this.tokenForm.maxRole) payload.maxRole = this.tokenForm.maxRole;
+          var days = parseInt(this.tokenForm.expiresInDays, 10);
+          if (days > 0) payload.expiresInDays = days;
+          var projects = (this.tokenForm.projects || '').split(',').map(function (p) { return p.trim(); }).filter(Boolean);
+          if (projects.length) payload.projects = projects;
+
+          var res = await window.fetch('/api/auth/tokens', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.tokenError = body.error || 'Could not create the token.'; return; }
+          this.mintedToken = body.token || '';
+          this.tokenForm = { name: '', maxRole: '', expiresInDays: '', projects: '' };
+          await this.loadTokens();
+        } catch (e) {
+          this.tokenError = 'Could not reach the server.';
+        } finally {
+          this.tokenBusy = false;
+        }
+      },
+
+      async revokeToken(id) {
+        if (!window.confirm('Revoke this token? Any MCP client still using it will stop working immediately.')) return;
+        try {
+          await window.fetch('/api/auth/tokens/' + encodeURIComponent(id), { method: 'DELETE' });
+          await this.loadTokens();
+        } catch (_) { /* the list refresh will show the real state */ }
+      },
+
+      /** The MCP client configuration a freshly minted token goes into. */
+      mcpConfigSnippet() {
+        var origin = window.location.origin;
+        return JSON.stringify({
+          mcpServers: {
+            requ: {
+              type: 'http',
+              url: origin + '/mcp',
+              headers: { Authorization: 'Bearer ' + (this.mintedToken || '<your token>') },
+            },
+          },
+        }, null, 2);
+      },
+
+      async copyMinted(text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          this.mintedCopied = true;
+          var self = this;
+          setTimeout(function () { self.mintedCopied = false; }, 2000);
+        } catch (_) { /* clipboard blocked — the value is on screen to select */ }
+      },
+
+      // ── Audit log ───────────────────────────────────────────────────────────
+
+      async loadAudit() {
+        if (!this.can('audit:read')) return;
+        this.auditLoading = true;
+        try {
+          var params = new URLSearchParams();
+          params.set('limit', String(this.auditPageSize));
+          params.set('offset', String((this.auditPage - 1) * this.auditPageSize));
+          if (this.auditFilters.scope === 'all') params.set('scope', 'all');
+          else if (this.projects.length > 1 && this.activeProject) params.set('project', this.activeProject.slug);
+          if (this.auditFilters.actor)   params.set('actor', this.auditFilters.actor);
+          if (this.auditFilters.action)  params.set('action', this.auditFilters.action);
+          if (this.auditFilters.outcome) params.set('outcome', this.auditFilters.outcome);
+          if (this.auditFilters.source)  params.set('source', this.auditFilters.source);
+          var d = await this._fetch('/api/audit?' + params.toString());
+          this.auditEntries = (d && d.entries) || [];
+          this.auditTotal = (d && d.total) || 0;
+        } finally {
+          this.auditLoading = false;
+        }
+      },
+
+      auditPages() {
+        return Math.max(1, Math.ceil(this.auditTotal / this.auditPageSize));
+      },
+
+      gotoAuditPage(n) {
+        this.auditPage = Math.min(Math.max(1, n), this.auditPages());
+        this.loadAudit();
+      },
+
+      resetAuditFilters() {
+        this.auditFilters = { actor: '', action: '', outcome: '', source: '', scope: 'project' };
+        this.auditPage = 1;
+        this.loadAudit();
+      },
+
+      outcomeClass(outcome) {
+        return outcome === 'ok' ? 'chip-green' : outcome === 'denied' ? 'chip-red' : 'chip-amber';
+      },
+
+      // ── Change history (the Jira-style "what changed" panel) ────────────────
+
+      /** The project-wide activity stream shown alongside the audit log. */
+      async loadActivity() {
+        if (!this.can('history:read')) return;
+        this.activityLoading = true;
+        try {
+          var d = await this._fetch(this.apiUrlNoVersion('/api/history?limit=100'));
+          this.activity = (d && d.changes) || [];
+        } finally {
+          this.activityLoading = false;
+        }
+      },
+
+      /** Like apiUrl(), but without pinning a version: history spans all of them. */
+      apiUrlNoVersion(p) {
+        var out = p;
+        if (this.projects.length > 1 && this.activeProject) {
+          out += (out.indexOf('?') === -1 ? '?' : '&') + 'project=' + this.activeProject.slug;
+        }
+        return out;
+      },
+
+      async openHistory(entity, entityId) {
+        this.historyOpen = true;
+        this.historyEntity = entity;
+        this.historyEntityId = entityId;
+        this.historyChanges = [];
+        this.historyLoading = true;
+        try {
+          var p = '/api/history/' + encodeURIComponent(entity) + '/' + encodeURIComponent(entityId);
+          var d = await this._fetch(this.apiUrlNoVersion(p));
+          this.historyChanges = (d && d.changes) || [];
+        } finally {
+          this.historyLoading = false;
+        }
+      },
+
+      closeHistory() {
+        this.historyOpen = false;
+        this.historyChanges = [];
+      },
+
+      /** A field value rendered for the history table. */
+      historyValue(v) {
+        if (v === null || v === undefined || v === '') return '—';
+        if (Array.isArray(v)) return v.length ? v.join(', ') : '—';
+        if (typeof v === 'object') return JSON.stringify(v);
+        var s = String(v);
+        return s.length > 160 ? s.slice(0, 160) + '…' : s;
+      },
+
+      changeActionClass(action) {
+        return action === 'created' ? 'chip-green'
+          : action === 'deleted' ? 'chip-red'
+          : action === 'restored' ? 'chip-amber'
+          : 'chip-indigo';
+      },
+
+      // ── Access administration ───────────────────────────────────────────────
+
+      async loadAdminUsers() {
+        if (!this.can('admin:users')) return;
+        this.adminLoading = true;
+        this.adminError = '';
+        try {
+          var d = await this._fetch('/api/admin/users');
+          this.adminUsers = Array.isArray(d) ? d : [];
+          this.ldapStatus = await this._fetch('/api/admin/ldap-check');
+        } finally {
+          this.adminLoading = false;
+        }
+      },
+
+      async grantRole() {
+        if (!this.grantForm.userId) { this.adminError = 'Pick a user first.'; return; }
+        this.adminError = '';
+        try {
+          var res = await window.fetch('/api/admin/roles', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId: this.grantForm.userId,
+              role: this.grantForm.role,
+              projectId: this.grantForm.projectId || '*',
+            }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.adminError = body.error || 'Could not grant the role.'; return; }
+          await this.loadAdminUsers();
+        } catch (e) {
+          this.adminError = 'Could not reach the server.';
+        }
+      },
+
+      async revokeBinding(userId, projectId, role) {
+        if (!window.confirm('Revoke ' + role + ' from ' + userId + (projectId === '*' ? ' (all projects)' : ' on ' + projectId) + '?')) return;
+        try {
+          await window.fetch('/api/admin/roles/revoke', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: userId, projectId: projectId, role: role }),
+          });
+          await this.loadAdminUsers();
+        } catch (_) { /* the refresh will show the real state */ }
+      },
+
+      async setUserDisabled(userId, disabled) {
+        var verb = disabled ? 'Disable' : 'Re-enable';
+        if (!window.confirm(verb + ' ' + userId + '?')) return;
+        this.adminError = '';
+        try {
+          var res = await window.fetch('/api/admin/users/' + encodeURIComponent(userId), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disabled: disabled }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.adminError = body.error || 'Could not update the account.'; return; }
+          await this.loadAdminUsers();
+        } catch (e) {
+          this.adminError = 'Could not reach the server.';
         }
       },
 
@@ -825,6 +1226,8 @@ document.addEventListener('alpine:init', function () {
         if (id === 'screens')    { this.loadScreens(); }
         if (id === 'adrs')       { this.loadAdrs(); }
         if (id === 'versions')   { this.loadVersions(); }
+        if (id === 'audit')      { this.auditPage = 1; this.loadAudit(); this.loadActivity(); }
+        if (id === 'access')     { this.loadAdminUsers(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -847,9 +1250,12 @@ document.addEventListener('alpine:init', function () {
        * dir=1 → next, dir=-1 → prev, dir=-999 → first, dir=999 → last.
        */
       shiftFocus(dir) {
-        var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions']
-          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions'];
+        var tabs = ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions'];
+        if (this.projects.length > 1) tabs.unshift('global');
+        // The last two tabs exist only for the roles that may open them, so the
+        // arrow-key ring has to match what is actually rendered.
+        if (this.can('audit:read')) tabs.push('audit');
+        if (this.can('admin:users')) tabs.push('access');
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }

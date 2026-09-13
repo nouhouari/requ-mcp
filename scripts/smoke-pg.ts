@@ -367,8 +367,141 @@ async function main() {
     await cleanupPool.end();
   }
 
+  await authStoreChecks();
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
+}
+
+/**
+ * The auth, audit and change-history tables on PostgreSQL.
+ *
+ * These share requ's own database, and their SQL differs from the SQLite
+ * variant in every place that matters — JSONB round-tripping, BIGSERIAL ids
+ * coming back as strings, `$n` placeholders built up by the query filters. The
+ * SQLite path is covered by `npm run smoke:auth`; this is the other half.
+ */
+async function authStoreChecks(): Promise<void> {
+  console.log("\n— auth, audit and change history on PostgreSQL —");
+  process.env.REQU_AUTH_SECRET ??= "smoke-pg-secret-smoke-pg-secret-0123456789";
+  process.env.REQU_AUTH_MODE = "disabled";
+
+  const { authStore } = await import("../src/auth/store.js");
+  const { mintToken } = await import("../src/auth/tokens.js");
+
+  // A unique project id per run, so repeated runs never see each other's rows.
+  const pid = `pgauth-${Date.now()}`;
+  const uid = `pgauth-${Date.now()}`;
+  const store = authStore();
+  await store.init();
+
+  const iso = (offset = 0) => new Date(Date.now() + offset).toISOString();
+  const pool = new Pool({ connectionString: PG_URL });
+
+  try {
+    // --- users ---
+    await store.upsertUser({
+      id: uid, username: uid, displayName: "PG User", email: "pg@example.test",
+      dn: "uid=pg,ou=people", groups: ["cn=devs,ou=groups"], disabled: false, lastLoginAt: iso(),
+    });
+    const user = await store.getUser(uid);
+    check("pg: a user round-trips with its groups", user?.displayName === "PG User" && user?.groups[0] === "cn=devs,ou=groups", user);
+    check("pg: listUsers finds it", (await store.listUsers()).some((u) => u.id === uid));
+
+    await store.upsertUser({ id: uid, username: uid, displayName: "Renamed", email: null, dn: null, groups: [], disabled: false });
+    check("pg: a second sign-in updates in place", (await store.getUser(uid))?.displayName === "Renamed");
+    check("pg: it keeps the recorded last sign-in", (await store.getUser(uid))?.lastLoginAt !== null);
+
+    // --- role bindings ---
+    await store.grantRole({ userId: uid, projectId: "*", role: "maintainer", grantedBy: "smoke", grantedAt: iso() });
+    await store.grantRole({ userId: uid, projectId: pid, role: "admin", grantedBy: "smoke", grantedAt: iso() });
+    check("pg: role bindings round-trip", (await store.listBindings(uid)).length === 2);
+    check("pg: granting the same role twice is idempotent", await (async () => {
+      await store.grantRole({ userId: uid, projectId: "*", role: "maintainer", grantedBy: "smoke", grantedAt: iso() });
+      return (await store.listBindings(uid)).length === 2;
+    })());
+    check("pg: a binding can be revoked", (await store.revokeRole(uid, pid, "admin")) && (await store.listBindings(uid)).length === 1);
+
+    // --- tokens ---
+    const minted = mintToken(process.env.REQU_AUTH_SECRET!);
+    await store.createToken({
+      id: minted.id, userId: uid, name: "scoped", tokenHash: minted.hash, createdAt: iso(),
+      expiresAt: null, lastUsedAt: null, revokedAt: null, revokedBy: null,
+      maxRole: "viewer", projects: ["alpha", "beta"],
+    });
+    const tok = await store.getTokenWithHash(minted.id);
+    check("pg: a token round-trips with its ceiling and project scope",
+      tok?.maxRole === "viewer" && JSON.stringify(tok?.projects) === JSON.stringify(["alpha", "beta"]), tok);
+    check("pg: the stored hash is the peppered one", tok?.tokenHash === minted.hash);
+    await store.touchToken(minted.id, iso());
+    check("pg: last use is recorded", (await store.getTokenWithHash(minted.id))?.lastUsedAt !== null);
+    check("pg: revoking works once", (await store.revokeToken(minted.id, "smoke")) === true);
+    check("pg: revoking again is a no-op", (await store.revokeToken(minted.id, "smoke")) === false);
+
+    const unscoped = mintToken(process.env.REQU_AUTH_SECRET!);
+    await store.createToken({
+      id: unscoped.id, userId: uid, name: "unscoped", tokenHash: unscoped.hash, createdAt: iso(),
+      expiresAt: null, lastUsedAt: null, revokedAt: null, revokedBy: null, maxRole: null, projects: null,
+    });
+    check("pg: an unscoped token keeps a null project list", (await store.getTokenWithHash(unscoped.id))?.projects === null);
+    check("pg: listTokens returns both", (await store.listTokens(uid)).length === 2);
+
+    // --- sessions ---
+    const session = { id: `sess-${pid}`, userId: uid, createdAt: iso(), expiresAt: iso(3_600_000), revokedAt: null, ip: "127.0.0.1", userAgent: "smoke" };
+    await store.createSession(session);
+    check("pg: a session round-trips", (await store.getSession(session.id))?.userId === uid);
+    check("pg: revoking a session works", (await store.revokeSession(session.id)) === true);
+    check("pg: revoking it again is a no-op", (await store.revokeSession(session.id)) === false);
+    await store.createSession({ ...session, id: `${session.id}-2` });
+    check("pg: every session of a user can be revoked at once", (await store.revokeSessionsForUser(uid)) === 1);
+
+    // --- audit log ---
+    for (const [i, outcome] of (["ok", "denied", "error"] as const).entries()) {
+      await store.appendAudit({
+        at: iso(i), actorId: uid, actorName: "PG User", actorKind: "token", source: "mcp",
+        action: "create_requirement", projectId: pid, version: "1.0.0", outcome,
+        permission: "spec:write", detail: { title: "Audited", n: i }, ip: "127.0.0.1", tokenId: minted.id,
+      });
+    }
+    const audited = await store.queryAudit({ projectId: pid });
+    check("pg: audit rows round-trip", audited.total === 3 && audited.entries.length === 3, audited.total);
+    check("pg: audit detail survives as JSONB", audited.entries[0].detail?.title === "Audited", audited.entries[0].detail);
+    check("pg: the audit log reads newest first", audited.entries[0].outcome === "error", audited.entries.map((e) => e.outcome));
+    check("pg: filtering by outcome works", (await store.queryAudit({ projectId: pid, outcome: "denied" })).total === 1);
+    check("pg: filtering by action works", (await store.queryAudit({ projectId: pid, action: "create_requirement" })).total === 3);
+    check("pg: filtering by source works", (await store.queryAudit({ projectId: pid, source: "web" })).total === 0);
+    check("pg: filtering by actor works", (await store.queryAudit({ projectId: pid, actorId: "nobody" })).total === 0);
+    const page = await store.queryAudit({ projectId: pid, limit: 2, offset: 1 });
+    check("pg: audit pagination works", page.entries.length === 2 && page.total === 3, page.entries.length);
+
+    // --- change history ---
+    await store.appendChanges([
+      { at: iso(), projectId: pid, version: "1.0.0", entity: "requirement", entityId: "REQ-001", action: "created", actorId: uid, actorName: "PG User", source: "mcp", changes: [{ field: "title", from: null, to: "A" }] },
+      { at: iso(1), projectId: pid, version: "1.0.0", entity: "requirement", entityId: "REQ-001", action: "updated", actorId: uid, actorName: "PG User", source: "web", changes: [{ field: "title", from: "A", to: "B" }] },
+      { at: iso(), projectId: pid, version: "1.0.0", entity: "story", entityId: "US-001", action: "created", actorId: uid, actorName: "PG User", source: "mcp", changes: [] },
+    ]);
+    const history = await store.queryChanges({ projectId: pid, entity: "requirement", entityId: "REQ-001" });
+    check("pg: an entity's history round-trips", history.total === 2, history.total);
+    check("pg: history reads newest first", history.changes[0].action === "updated", history.changes.map((c) => c.action));
+    check("pg: field diffs survive as JSONB",
+      history.changes[0].changes[0].from === "A" && history.changes[0].changes[0].to === "B", history.changes[0].changes);
+    check("pg: the project-wide stream returns every entity", (await store.queryChanges({ projectId: pid })).total === 3);
+    check("pg: a change with no field diff round-trips",
+      (await store.queryChanges({ projectId: pid, entity: "story" })).changes[0].changes.length === 0);
+
+    check("pg: disabling a user persists", await (async () => {
+      await store.setUserDisabled(uid, true);
+      return (await store.getUser(uid))?.disabled === true;
+    })());
+  } finally {
+    await pool.query("DELETE FROM audit_log WHERE project_id = $1", [pid]);
+    await pool.query("DELETE FROM entity_changes WHERE project_id = $1", [pid]);
+    await pool.query("DELETE FROM auth_tokens WHERE user_id = $1", [uid]);
+    await pool.query("DELETE FROM auth_sessions WHERE user_id = $1", [uid]);
+    await pool.query("DELETE FROM auth_role_bindings WHERE user_id = $1", [uid]);
+    await pool.query("DELETE FROM auth_users WHERE id = $1", [uid]);
+    await pool.end();
+  }
 }
 
 main().catch((e) => {

@@ -33,6 +33,29 @@ services:
       REQU_HOST: 0.0.0.0
       REQU_PORT: 8788
       REQU_PG_URL: postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
+      # Authentication. Defaults to 'disabled' so a fresh clone comes up without
+      # a directory; set REQU_AUTH_MODE=ldap in .env for a real deployment and
+      # the LDAP_* settings below become required. See .env.example.
+      REQU_AUTH_MODE: ${REQU_AUTH_MODE:-disabled}
+      REQU_AUTH_SECRET: ${REQU_AUTH_SECRET:-}
+      REQU_AUDIT: ${REQU_AUDIT:-auto}
+      REQU_AUTH_DEFAULT_ROLE: ${REQU_AUTH_DEFAULT_ROLE:-viewer}
+      REQU_AUTH_ADMINS: ${REQU_AUTH_ADMINS:-}
+      REQU_AUTH_SESSION_TTL_HOURS: ${REQU_AUTH_SESSION_TTL_HOURS:-12}
+      REQU_AUTH_TOKEN_TTL_DAYS: ${REQU_AUTH_TOKEN_TTL_DAYS:-0}
+      REQU_LDAP_URL: ${REQU_LDAP_URL:-}
+      REQU_LDAP_BASE_DN: ${REQU_LDAP_BASE_DN:-}
+      REQU_LDAP_BIND_DN: ${REQU_LDAP_BIND_DN:-}
+      REQU_LDAP_BIND_PASSWORD: ${REQU_LDAP_BIND_PASSWORD:-}
+      REQU_LDAP_USER_FILTER: ${REQU_LDAP_USER_FILTER:-}
+      REQU_LDAP_USER_DN_TEMPLATE: ${REQU_LDAP_USER_DN_TEMPLATE:-}
+      REQU_LDAP_MEMBEROF_ATTR: ${REQU_LDAP_MEMBEROF_ATTR:-}
+      REQU_LDAP_GROUP_BASE_DN: ${REQU_LDAP_GROUP_BASE_DN:-}
+      REQU_LDAP_GROUP_FILTER: ${REQU_LDAP_GROUP_FILTER:-}
+      REQU_LDAP_GROUP_ATTR: ${REQU_LDAP_GROUP_ATTR:-}
+      REQU_LDAP_ROLE_MAP: ${REQU_LDAP_ROLE_MAP:-}
+      REQU_LDAP_TLS_REJECT_UNAUTHORIZED: ${REQU_LDAP_TLS_REJECT_UNAUTHORIZED:-true}
+      REQU_LDAP_ALLOW_PLAINTEXT: ${REQU_LDAP_ALLOW_PLAINTEXT:-}
     volumes:
       # requ-mcp reads Conductor feature files, mockups and reports from its OWN
       # filesystem. Without this the server cannot see any project's files and

@@ -231,6 +231,21 @@ function runSchema(): Promise<void> {
     });
 }
 
+/**
+ * The shared pool, for modules that keep their own tables in the same database
+ * (the auth and audit stores). Returns null when requ is running on SQLite.
+ */
+export async function sharedPool(): Promise<Pool | null> {
+  if (!_pool) return null;
+  await (_schemaReady ??= runSchema());
+  return _pool;
+}
+
+/** True when the server was configured with PostgreSQL. */
+export function hasPgPool(): boolean {
+  return _pool !== null;
+}
+
 /** Table backing each versioned entity type. */
 const TABLE: Record<VersionedEntity, string> = {
   components:   "components",

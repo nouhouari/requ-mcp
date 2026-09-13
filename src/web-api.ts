@@ -35,6 +35,13 @@ import { ExportPayload, testKey, type CoverageMode, type Scenario, type TestStat
 import { buildExport, applyImport } from "./export-import.js";
 import { checkUiCoverage, isStale, resolveElements, screenExits } from "./screen-coverage.js";
 import { buildOpenApiDocument } from "./openapi.js";
+import { audit, flushChanges, recordingStore } from "./audit.js";
+import { handleAuditRoutes } from "./audit-routes.js";
+import { authenticateRequest, clientIp } from "./auth/authenticate.js";
+import { newContext, runWithContext, type RequestContext } from "./auth/context.js";
+import { can, devPrincipal, type Permission, type Principal } from "./auth/model.js";
+import { isPublicRoute, permissionForRoute } from "./auth/rbac.js";
+import { handleAuthRoutes } from "./auth/routes.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -71,8 +78,11 @@ const MIME: Record<string, string> = {
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
+  // `Authorization` so a script can drive the REST API with a personal access
+  // token. Credentials are deliberately not allowed: the session cookie is
+  // same-origin only, so a wildcard origin cannot be used to ride it.
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requ-Token",
 };
 
 // ---------------------------------------------------------------------------
@@ -522,22 +532,29 @@ async function resolveStore(
   // An unregistered version is not an empty one: writing to it would create a
   // whole baseline that list_versions and the dashboard cannot see, while still
   // consuming ids. Reject it here, as the MCP layer does.
-  const atVersion = async (store: AnyHttpStore): Promise<StoreResult> => {
+  //
+  // Every store handed out is wrapped by the change recorder, so a REST edit
+  // lands in the same history as the equivalent MCP tool call without each
+  // route having to remember to record it.
+  const atVersion = async (store: AnyHttpStore, slug: string): Promise<StoreResult> => {
     const version = searchParams.get("version");
-    if (!version) return { status: "ok", store };
+    if (!version) return { status: "ok", store: recordingStore(store, slug) };
     const known = await store.listVersions();
     if (!known.some((v) => v.version === version)) {
       return { status: "unknown_version", version, known: known.map((v) => v.version) };
     }
-    return { status: "ok", store: store.at(version) as AnyHttpStore };
+    return { status: "ok", store: recordingStore(store.at(version) as AnyHttpStore, slug) };
   };
 
-  if (stores.size === 1) return atVersion([...stores.values()][0]);
+  if (stores.size === 1) {
+    const [only] = [...stores.entries()];
+    return atVersion(only[1], only[0]);
+  }
   const slug = searchParams.get("project");
   if (!slug) return { status: "ambiguous", available: [...stores.keys()] };
   const store = stores.get(slug);
   if (!store) return { status: "unknown_project", slug };
-  return atVersion(store);
+  return atVersion(store, slug);
 }
 
 function handleStoreResult(
@@ -570,6 +587,28 @@ function handleStoreResult(
 // Main export
 // ---------------------------------------------------------------------------
 
+/**
+ * The project a request is about, for authorisation and for the audit trail.
+ *
+ * `?project=` when given; otherwise the only loaded project, since a
+ * single-project server never needs the parameter. Null when neither applies —
+ * the route itself will then report the ambiguity.
+ */
+function projectSlugFor(stores: Map<string, AnyHttpStore>, searchParams: URLSearchParams): string | null {
+  const explicit = searchParams.get("project");
+  if (explicit) return explicit;
+  return stores.size === 1 ? [...stores.keys()][0] : null;
+}
+
+/**
+ * Authenticate the request, enforce the permission its route requires, and run
+ * the rest of the handling inside a context the audit trail and the change
+ * recorder can read.
+ *
+ * Static files — the dashboard shell itself — are served without a check: it is
+ * a login screen until `/api/auth/me` says otherwise, and gating the HTML as
+ * well would only replace that screen with a browser credential box.
+ */
 export async function handleWebRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -585,10 +624,121 @@ export async function handleWebRequest(
     return true;
   }
 
+  // Everything that exposes project data goes through the guard. The Allure
+  // report is project data too — it lists the team's test names and failures —
+  // so it is gated exactly like the API rather than left open because it happens
+  // to be static files.
+  const isGuarded =
+    rawUrl === "/api" ||
+    rawUrl.startsWith("/api?") ||
+    rawUrl.startsWith("/api/") ||
+    rawUrl === "/events" ||
+    rawUrl.startsWith("/events?") ||
+    rawUrl === "/allure" ||
+    rawUrl.startsWith("/allure/") ||
+    rawUrl.startsWith("/allure?");
+  if (!isGuarded) return routeWebRequest(req, res, stores);
+
   // Discover DB-native projects so the dashboard/API see them without env preload.
-  if (rawUrl.startsWith("/api/") || rawUrl === "/events" || rawUrl.startsWith("/events?")) {
-    await ensureDbProjects(stores);
-  }
+  await ensureDbProjects(stores);
+
+  const pathname = rawUrl.split("?")[0];
+  const searchParams = new URL(rawUrl, "http://localhost").searchParams;
+  // /allure/<slug>/… names its project in the path; everything else uses ?project=.
+  const allureSlug = /^\/allure\/([^/?]+)/.exec(pathname)?.[1] ?? null;
+  const projectSlug = allureSlug ?? projectSlugFor(stores, searchParams);
+
+  const attempt = await authenticateRequest(req, projectSlug);
+  const principal: Principal | null = attempt.ok ? attempt.principal : null;
+
+  const ctx: RequestContext = newContext({
+    // An unauthenticated request still needs a context so the denial is audited;
+    // it carries no roles, so it cannot pass any permission check.
+    principal: principal ?? anonymousPrincipal(),
+    source: "web",
+    ip: clientIp(req),
+    userAgent: (req.headers["user-agent"] as string | undefined) ?? null,
+    projectKey: projectSlug,
+  });
+
+  return runWithContext(ctx, async () => {
+    try {
+      // Login, logout and "who am I" are how a caller becomes authenticated, so
+      // they run before the guard.
+      if (await handleAuthRoutes(req, res, pathname, method, { principal, projectSlug, source: "web" })) {
+        return true;
+      }
+
+      if (!principal && !isPublicRoute(method, pathname)) {
+        audit({
+          action: `${method} ${pathname}`,
+          outcome: "denied",
+          source: "web",
+          detail: { reason: attempt.ok ? "no principal" : attempt.reason },
+        });
+        jsonError(res, attempt.ok ? 401 : attempt.status, attempt.ok ? "Authentication required." : attempt.reason, "UNAUTHENTICATED");
+        return true;
+      }
+
+      const permission = permissionForRoute(method, pathname);
+      if (permission && principal && !can(principal, permission)) {
+        audit({ action: `${method} ${pathname}`, outcome: "denied", source: "web", permission });
+        jsonError(
+          res,
+          403,
+          `Permission denied: '${permission}' is required for ${method} ${pathname}.`,
+          "FORBIDDEN",
+        );
+        return true;
+      }
+
+      if (
+        principal &&
+        (await handleAuditRoutes(req, res, pathname, method, searchParams, principal, projectSlug, CORS_HEADERS))
+      ) {
+        return true;
+      }
+
+      const handled = await routeWebRequest(req, res, stores);
+      // Reads are not audited individually: the dashboard polls, and a row per
+      // poll would drown the record. Writes always are.
+      if (handled && method !== "GET" && method !== "HEAD") {
+        audit({
+          action: `${method} ${pathname}`,
+          outcome: res.statusCode >= 400 ? "error" : "ok",
+          source: "web",
+          permission,
+          projectId: projectSlug,
+          detail: { status: res.statusCode },
+        });
+      }
+      return handled;
+    } finally {
+      await flushChanges(ctx.changes);
+    }
+  });
+}
+
+/** A caller who presented nothing, or something invalid: no roles, no rights. */
+function anonymousPrincipal(): Principal {
+  return {
+    ...devPrincipal(),
+    kind: "anonymous",
+    userId: "anonymous",
+    username: "anonymous",
+    displayName: "Unauthenticated",
+    roles: [],
+    permissions: new Set<Permission>(),
+  };
+}
+
+async function routeWebRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  stores: Map<string, AnyHttpStore>,
+): Promise<boolean> {
+  const rawUrl = req.url ?? "/";
+  const method = req.method ?? "GET";
 
   // -------------------------------------------------------------------------
   // SSE — GET /events
@@ -808,6 +958,11 @@ export async function handleWebRequest(
         } else {
           store = [...stores.values()][0];
         }
+
+        // This route resolves its own store (the project may not exist yet), so
+        // it has to opt into the change recorder that resolveStore applies for
+        // every other route.
+        store = recordingStore(store, [...stores.entries()].find(([, s]) => s === store)?.[0] ?? "project");
 
         // Derive / validate key.
         let key: string;

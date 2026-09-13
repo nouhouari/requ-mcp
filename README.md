@@ -98,6 +98,8 @@ when running under Docker Compose).
 | **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
+| **Audit** | Recent specification changes with their field-level diffs, and the audit log of every tool call and API request — denials included. Needs `audit:read`; see [Authentication](#authentication-roles-and-the-audit-trail) |
+| **Access** | Users the directory has seen, their effective roles, explicit grants, and account enable/disable. Administrators only |
 | **Decisions** | Architecture decisions (ADRs) with status badges and their requirement/component links; open one to read the record with its mermaid diagrams rendered |
 | **Versions** | Specification baselines: the version history with lock state, parent and audit trail, plus a side-by-side comparison of any two versions showing additions, removals and field-level changes |
 
@@ -229,6 +231,123 @@ one full set of rows per baseline (see
 [Versions](#versions--lockable-specification-baselines)). Executions, scenarios
 and VCS refs are *not* versioned — they are progress, kept in a single namespace
 and tagged with the version they were produced against.
+
+## Authentication, roles and the audit trail
+
+Out of the box requ-mcp is **open**: there is no login, every caller is an
+admin, and that is deliberate — a development instance should not need a
+directory to start. Production is a single environment variable away.
+
+```bash
+REQU_AUTH_MODE=disabled   # default — no login, full access, no credentials
+REQU_AUTH_MODE=ldap       # users sign in against your directory
+```
+
+### Signing in
+
+In `ldap` mode the dashboard opens on a sign-in form and nothing else loads until
+a session exists. requ binds to the directory as the user to prove the password,
+reads their display name, mail and groups, and never stores the password.
+
+The minimum a deployment needs:
+
+```bash
+REQU_AUTH_MODE=ldap
+REQU_AUTH_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+REQU_LDAP_URL=ldaps://ldap.example.com:636
+REQU_LDAP_BASE_DN=dc=example,dc=com
+REQU_LDAP_ROLE_MAP='requ-admins=admin;requ-leads=maintainer;requ-devs=contributor'
+REQU_AUTH_ADMINS=alice          # a way in before any group mapping exists
+```
+
+`REQU_AUTH_SECRET` signs session cookies and peppers stored token hashes.
+Changing it signs everyone out and invalidates every access token, so keep it
+with your other secrets. Every setting is listed in
+[`.env.example`](.env.example); Docker Compose passes them all through.
+
+### Roles
+
+Four roles, and a permission matrix that is checked identically for an MCP tool
+call and for the REST endpoint that does the same thing:
+
+| Permission | viewer | contributor | maintainer | admin |
+|---|:--:|:--:|:--:|:--:|
+| `spec:read` — read requirements, stories, screens, coverage | ✓ | ✓ | ✓ | ✓ |
+| `history:read` — see an entity's change history | ✓ | ✓ | ✓ | ✓ |
+| `project:export` — export project data | ✓ | ✓ | ✓ | ✓ |
+| `progress:write` — record executions, scenario results, VCS refs | | ✓ | ✓ | ✓ |
+| `spec:write` — create and edit specification entities | | | ✓ | ✓ |
+| `version:manage` — create, lock, unlock, activate baselines | | | ✓ | ✓ |
+| `project:manage` — create a project, edit its configuration | | | ✓ | ✓ |
+| `project:import` — import over a project's data | | | ✓ | ✓ |
+| `audit:read` — read the server-wide audit log | | | ✓ | ✓ |
+| `admin:users` — grant roles, revoke other people's tokens | | | | ✓ |
+
+A user's roles come from three places, unioned:
+
+1. `REQU_AUTH_ADMINS` — usernames that are always admin;
+2. `REQU_LDAP_ROLE_MAP` — directory group → role, so the directory stays the
+   source of truth for who is on the team. Groups match on either the bare name
+   (`requ-leads`) or the full DN;
+3. explicit grants made in the dashboard's **Access** tab, globally or on one
+   project, for the exceptions the directory cannot express.
+
+Anyone matched by none of them gets `REQU_AUTH_DEFAULT_ROLE` (viewer), or is
+refused the sign-in when that is set to `none`.
+
+### Access tokens for MCP clients
+
+An MCP client cannot fill in a login form, so each user mints **personal access
+tokens** from the dashboard (the avatar in the header → *New access token*).
+The token is shown exactly once — only a peppered SHA-256 of it is stored — along
+with the client configuration to paste:
+
+```json
+{
+  "mcpServers": {
+    "requ": {
+      "type": "http",
+      "url": "https://requ.example.com/mcp",
+      "headers": { "Authorization": "Bearer requ_pat_…" }
+    }
+  }
+}
+```
+
+A token acts as its owner and can be narrowed further:
+
+- **capped at a role** — a `viewer` token for a CI job stays read-only even
+  though its owner is a maintainer, and stays read-only if its owner is later
+  promoted;
+- **limited to projects** — refused on anything else;
+- **expiring** — after `expiresInDays`, or `REQU_AUTH_TOKEN_TTL_DAYS` by default.
+
+Revoking a token takes effect on the next call. Give each client its own so one
+can be revoked without disturbing the others.
+
+### Audit log and change history
+
+`REQU_AUDIT` (`auto` by default: on whenever authentication is on) records two
+different things, both on the dashboard's **Audit** tab:
+
+- **Audit log** — one row per tool call or API request: who, when, from where
+  (MCP or dashboard), which project and version, and the outcome. **Refused
+  calls are recorded too**, with the permission that was missing, which is what
+  makes the log useful for answering "who tried to do that?". Filter by actor,
+  action, outcome, source, or across every project at once.
+- **Change history** — "what changed on REQ-014?", the way an issue tracker
+  shows it: one entry per write with the fields that actually differed, old
+  value beside new, attributed to a person. Open it from the **History** button
+  on a requirement or story, or from any entry in *Recent changes*.
+
+Both are produced centrally — the tool dispatcher audits, and the store is
+wrapped by a recorder that diffs every write — so an edit is recorded the same
+way whether it came from an agent over MCP or from a person in the dashboard,
+and a tool added later is covered without being told to.
+
+The tables live wherever requ's own data does: in PostgreSQL when `REQU_PG_URL`
+is set, otherwise in a SQLite file (`REQU_AUTH_DB`, default `~/.requ/auth.db`)
+so a laptop still keeps its history across restarts.
 
 ## Tools
 

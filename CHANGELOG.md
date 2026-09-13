@@ -7,6 +7,47 @@ All notable changes to this project will be documented here.
 ## [2.0.0] – unreleased
 
 ### Added
+- **Authentication, RBAC and an audit trail.** The server can now require users
+  to sign in against an LDAP directory, decide what each of them may do, and
+  record it. Development is unaffected: `REQU_AUTH_MODE` defaults to `disabled`,
+  where there is no login and every caller keeps full access.
+
+  ```bash
+  REQU_AUTH_MODE=ldap
+  REQU_AUTH_SECRET=…                       # signs sessions, peppers token hashes
+  REQU_LDAP_URL=ldaps://ldap.example.com:636
+  REQU_LDAP_BASE_DN=dc=example,dc=com
+  REQU_LDAP_ROLE_MAP='requ-admins=admin;requ-leads=maintainer;requ-devs=contributor'
+  ```
+
+  - **Four roles** — viewer, contributor, maintainer, admin — over a permission
+    matrix that is applied identically to an MCP tool call and to the REST
+    endpoint that does the same thing. Roles come from directory groups, from
+    `REQU_AUTH_ADMINS`, and from explicit grants made in the dashboard.
+  - **Personal access tokens** for MCP clients, minted from the dashboard and
+    shown exactly once (only a peppered hash is stored). A token can be capped
+    below its owner's role, limited to named projects, given an expiry, and
+    revoked — which takes effect on the next call.
+  - **Audit log** — one row per tool call and API request, *including refused
+    ones*, with the actor, source, project, version and the permission that was
+    missing.
+  - **Change history** — per-entity, issue-tracker style: what changed on
+    REQ-014, which fields, from what to what, and by whom. Produced by a recorder
+    wrapped around the store, so an edit is recorded the same way whether it came
+    from an agent over MCP or from a person in the dashboard.
+
+  See [Authentication](README.md#authentication-roles-and-the-audit-trail) and
+  [ADR-0002](docs/adr/0002-ldap-authentication-rbac-and-audit.md).
+
+- **New REST endpoints** — `GET /api/auth/config`, `POST /api/auth/login`,
+  `POST /api/auth/logout`, `GET /api/auth/me`, `GET|POST /api/auth/tokens`,
+  `DELETE /api/auth/tokens/:id`, `GET /api/audit`, `GET /api/history`,
+  `GET /api/history/:entity/:id`, and `/api/admin/*` for role administration.
+
+- **Audit and Access dashboard tabs** — recent changes with their field-level
+  diffs, a filterable audit log, and user/role administration. A **History**
+  button on requirements and stories opens that entity's change log.
+
 - **Specification versioning.** A project can now hold several *versions* of its
   specification — requirements, stories, screens, ADRs, components and phases.
   Locking one freezes it so a delivery team can build against a baseline that

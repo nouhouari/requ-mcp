@@ -27,6 +27,50 @@
   <a href="#main-content" class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-[100] focus:bg-white focus:text-indigo-700 focus:px-4 focus:py-2 focus:rounded focus:shadow-lg focus:font-medium focus:text-sm">Skip to main content</a>
 
   <!-- ═══════════════════════════════════════════════════════════
+       SIGN-IN — replaces the whole dashboard until a session exists
+  ═══════════════════════════════════════════════════════════════ -->
+  <div x-show="auth.loaded && auth.enabled && !auth.authenticated" x-cloak
+       class="fixed inset-0 z-[90] bg-slate-900 flex items-center justify-center p-4">
+    <div class="w-full max-w-sm bg-white rounded-xl shadow-2xl p-8">
+      <div class="flex items-center gap-3 mb-1">
+        <span class="text-indigo-500 font-bold text-2xl select-none" aria-hidden="true">◈</span>
+        <h1 class="font-semibold text-slate-900 text-lg">requ</h1>
+      </div>
+      <p class="text-sm text-slate-500 mb-6">Sign in with your directory account.</p>
+
+      <form @submit.prevent="doLogin()" class="space-y-4">
+        <div>
+          <label for="login-username" class="block text-xs font-medium text-slate-600 mb-1">Username</label>
+          <input id="login-username" type="text" x-model="login.username" autocomplete="username" autofocus required
+                 class="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+        </div>
+        <div>
+          <label for="login-password" class="block text-xs font-medium text-slate-600 mb-1">Password</label>
+          <input id="login-password" type="password" x-model="login.password" autocomplete="current-password" required
+                 class="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+        </div>
+        <p x-show="login.error" x-cloak role="alert"
+           class="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2" x-text="login.error"></p>
+        <button type="submit" :disabled="login.busy"
+                class="w-full btn-primary text-sm py-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                x-text="login.busy ? 'Signing in…' : 'Sign in'"></button>
+      </form>
+
+      <p class="mt-6 text-[11px] text-slate-400 leading-relaxed">
+        Authentication is handled by your organisation's LDAP directory. requ never stores your password —
+        only the groups the directory reports, which decide what you may do.
+      </p>
+    </div>
+  </div>
+
+  <!-- Everything below is hidden until the shell knows whether a login is needed. -->
+  <div x-show="!auth.loaded" x-cloak class="fixed inset-0 z-[89] bg-slate-50 flex items-center justify-center">
+    <span class="text-sm text-slate-400">Loading…</span>
+  </div>
+
+  <div x-show="auth.loaded && (!auth.enabled || auth.authenticated)" x-cloak>
+
+  <!-- ═══════════════════════════════════════════════════════════
        HEADER
   ═══════════════════════════════════════════════════════════════ -->
   <header class="fixed top-0 left-0 right-0 z-50 bg-slate-900 text-white shadow-lg" style="height:56px;">
@@ -124,6 +168,30 @@
           <span class="hidden sm:inline" aria-hidden="true">live</span>
           <span class="sr-only">Live updates active</span>
         </div>
+
+        <!-- Identity: who you are, what you may do, and how to get a token -->
+        <div class="flex items-center gap-2 pl-2 border-l border-slate-700">
+          <span x-show="auth.warning" x-cloak
+                class="hidden lg:inline text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                :title="auth.warning">auth off</span>
+          <button
+            @click="openAccount()"
+            class="flex items-center gap-2 text-xs text-slate-300 hover:text-white transition-colors"
+            :title="auth.enabled ? 'Account and access tokens' : 'Access tokens (authentication is disabled)'"
+            aria-label="Open account and access tokens">
+            <span class="w-6 h-6 rounded-full bg-indigo-500/25 text-indigo-200 flex items-center justify-center text-[10px] font-semibold uppercase"
+                  x-text="(auth.displayName || auth.username || '?').slice(0, 2)"></span>
+            <span class="hidden md:inline max-w-[130px] truncate" x-text="auth.displayName || auth.username || 'Account'"></span>
+            <span x-show="topRole()" x-cloak
+                  class="hidden lg:inline text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300"
+                  x-text="topRole()"></span>
+          </button>
+          <button x-show="auth.enabled" x-cloak @click="doLogout()"
+                  class="text-xs text-slate-400 hover:text-slate-200 transition-colors"
+                  title="Sign out" aria-label="Sign out">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          </button>
+        </div>
       </div>
     </div>
   </header>
@@ -163,7 +231,10 @@
         {id:'vcs',          label:'VCS'},
         {id:'scenarios',    label:'Scenarios'},
         {id:'versions',     label:'Versions'},
-      ]" :key="t.id">
+      ].concat(
+        can('audit:read')  ? [{id:'audit',  label:'Audit'}]  : [],
+        can('admin:users') ? [{id:'access', label:'Access'}] : []
+      )" :key="t.id">
         <button
           :id="'tab-' + t.id"
           role="tab"
@@ -830,6 +901,13 @@
                                   <span>Source: <span class="text-slate-700 font-medium" x-text="req.source || '—'"></span></span>
                                   <span>Status: <span class="text-slate-700 font-medium" x-text="req.status"></span></span>
                                 </div>
+                                <button x-show="can('history:read') && auth.auditEnabled" x-cloak
+                                  class="mt-3 btn-secondary text-xs flex items-center gap-1.5"
+                                  @click.stop="openHistory('requirement', req.id)"
+                                  :aria-label="'Change history for ' + req.id">
+                                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+                                  History
+                                </button>
                                 <div class="mt-2 flex flex-wrap gap-1">
                                   <template x-for="tag in (req.tags || [])" :key="tag">
                                     <span class="chip" x-text="tag"></span>
@@ -2026,6 +2104,281 @@
         </div>
       </div>
 
+      <!-- ═══════════════════════════════════════════════════════════
+           AUDIT TAB — who did what, and what changed
+      ═══════════════════════════════════════════════════════════════ -->
+      <div id="panel-audit" role="tabpanel" aria-labelledby="tab-audit" tabindex="0" x-show="tab === 'audit'" class="tab-panel space-y-5">
+
+        <div x-show="!auth.auditEnabled" x-cloak class="card p-4 text-sm text-amber-800 bg-amber-50 border-amber-200">
+          Auditing is switched off on this server. Set <code class="font-mono">REQU_AUDIT=on</code> to record actions and change history.
+        </div>
+
+        <!-- Activity stream: the project's change history, newest first -->
+        <div class="card">
+          <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+            <div>
+              <h2 class="text-sm font-semibold text-slate-800">Recent changes</h2>
+              <p class="text-xs text-slate-500">Every specification edit, with the fields that changed.</p>
+            </div>
+            <button @click="loadActivity()" class="btn-secondary text-xs">Refresh</button>
+          </div>
+          <div x-show="activityLoading" class="px-4 py-6 text-sm text-slate-400">Loading…</div>
+          <template x-if="!activityLoading && activity.length === 0">
+            <p class="px-4 py-6 text-sm text-slate-400 italic">No changes recorded yet.</p>
+          </template>
+          <ul x-show="!activityLoading && activity.length > 0" class="divide-y divide-slate-100 max-h-96 overflow-y-auto">
+            <template x-for="c in activity" :key="c.id">
+              <li class="px-4 py-2.5">
+                <div class="flex items-baseline gap-2 flex-wrap">
+                  <span class="chip" :class="changeActionClass(c.action)" x-text="c.action"></span>
+                  <span class="text-xs text-slate-400 uppercase tracking-wide" x-text="c.entity"></span>
+                  <button class="font-mono text-sm text-indigo-700 hover:underline"
+                          @click="openHistory(c.entity, c.entityId)"
+                          x-text="c.entityId"></button>
+                  <span class="text-xs text-slate-500">by <span class="font-medium" x-text="c.actorName || c.actorId"></span></span>
+                  <span class="text-xs text-slate-400 ml-auto" x-text="new Date(c.at).toLocaleString()"></span>
+                </div>
+                <ul class="mt-1 ml-1 space-y-0.5">
+                  <template x-for="f in (c.changes || []).slice(0, 4)" :key="f.field">
+                    <li class="text-xs text-slate-600">
+                      <span class="font-mono font-semibold" x-text="f.field"></span>
+                      <span class="text-red-600 line-through ml-2" x-text="historyValue(f.from)"></span>
+                      <span class="text-emerald-700 ml-2" x-text="historyValue(f.to)"></span>
+                    </li>
+                  </template>
+                  <template x-if="(c.changes || []).length > 4">
+                    <li class="text-xs text-slate-400 italic">
+                      +<span x-text="(c.changes || []).length - 4"></span> more —
+                      <button class="underline" @click="openHistory(c.entity, c.entityId)">see full history</button>
+                    </li>
+                  </template>
+                </ul>
+              </li>
+            </template>
+          </ul>
+        </div>
+
+        <!-- Audit log: the compliance record, denials included -->
+        <div class="card">
+          <div class="px-4 py-3 border-b border-slate-200">
+            <h2 class="text-sm font-semibold text-slate-800">Audit log</h2>
+            <p class="text-xs text-slate-500">Every tool call and API request, including the ones that were refused.</p>
+          </div>
+
+          <div class="px-4 py-3 border-b border-slate-100 flex flex-wrap items-end gap-3">
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Actor</span>
+              <input type="text" x-model="auditFilters.actor" @keydown.enter="auditPage = 1; loadAudit()" placeholder="username"
+                     class="filter-select" style="width:140px;">
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Action</span>
+              <input type="text" x-model="auditFilters.action" @keydown.enter="auditPage = 1; loadAudit()" placeholder="create_requirement"
+                     class="filter-select" style="width:180px;">
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Outcome</span>
+              <select x-model="auditFilters.outcome" @change="auditPage = 1; loadAudit()" class="filter-select" style="width:110px;">
+                <option value="">Any</option>
+                <option value="ok">Allowed</option>
+                <option value="denied">Denied</option>
+                <option value="error">Error</option>
+              </select>
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Source</span>
+              <select x-model="auditFilters.source" @change="auditPage = 1; loadAudit()" class="filter-select" style="width:110px;">
+                <option value="">Any</option>
+                <option value="mcp">MCP</option>
+                <option value="web">Dashboard</option>
+                <option value="system">System</option>
+              </select>
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Scope</span>
+              <select x-model="auditFilters.scope" @change="auditPage = 1; loadAudit()" class="filter-select" style="width:130px;">
+                <option value="project">This project</option>
+                <option value="all">All projects</option>
+              </select>
+            </label>
+            <button @click="auditPage = 1; loadAudit()" class="btn-primary text-xs">Apply</button>
+            <button @click="resetAuditFilters()" class="btn-secondary text-xs">Reset</button>
+            <span class="text-xs text-slate-400 ml-auto" x-text="auditTotal + ' entries'"></span>
+          </div>
+
+          <div x-show="auditLoading" class="px-4 py-6 text-sm text-slate-400">Loading…</div>
+          <template x-if="!auditLoading && auditEntries.length === 0">
+            <p class="px-4 py-6 text-sm text-slate-400 italic">Nothing matches those filters.</p>
+          </template>
+          <div x-show="!auditLoading && auditEntries.length > 0" class="data-table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th scope="col">When</th>
+                  <th scope="col">Actor</th>
+                  <th scope="col">Action</th>
+                  <th scope="col">Outcome</th>
+                  <th scope="col">Source</th>
+                  <th scope="col">Project</th>
+                  <th scope="col">Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="e in auditEntries" :key="e.id">
+                  <tr>
+                    <td class="whitespace-nowrap text-xs text-slate-500" x-text="new Date(e.at).toLocaleString()"></td>
+                    <td class="text-xs">
+                      <span class="font-medium text-slate-700" x-text="e.actorName || e.actorId"></span>
+                      <span x-show="e.tokenId" class="block text-[10px] text-slate-400" title="Acted through a personal access token">token</span>
+                    </td>
+                    <td class="font-mono text-xs text-slate-700" x-text="e.action"></td>
+                    <td>
+                      <span class="chip" :class="outcomeClass(e.outcome)" x-text="e.outcome"></span>
+                      <span x-show="e.outcome === 'denied' && e.permission" class="block text-[10px] text-slate-400 mt-0.5"
+                            x-text="'needs ' + e.permission"></span>
+                    </td>
+                    <td class="text-xs text-slate-500" x-text="e.source"></td>
+                    <td class="text-xs text-slate-500" x-text="e.projectId || '—'"></td>
+                    <td class="text-xs text-slate-500 max-w-xs truncate"
+                        :title="e.detail ? JSON.stringify(e.detail) : ''"
+                        x-text="e.detail ? JSON.stringify(e.detail) : '—'"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+
+          <div x-show="auditPages() > 1" class="px-4 py-3 border-t border-slate-100 flex items-center gap-3">
+            <button class="btn-secondary text-xs" :disabled="auditPage <= 1" @click="gotoAuditPage(auditPage - 1)">Previous</button>
+            <span class="text-xs text-slate-500" x-text="'Page ' + auditPage + ' of ' + auditPages()"></span>
+            <button class="btn-secondary text-xs" :disabled="auditPage >= auditPages()" @click="gotoAuditPage(auditPage + 1)">Next</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══════════════════════════════════════════════════════════
+           ACCESS TAB — users, roles and tokens (administrators only)
+      ═══════════════════════════════════════════════════════════════ -->
+      <div id="panel-access" role="tabpanel" aria-labelledby="tab-access" tabindex="0" x-show="tab === 'access'" class="tab-panel space-y-5">
+
+        <div x-show="adminError" x-cloak role="alert"
+             class="card p-3 text-sm text-red-700 bg-red-50 border-red-200" x-text="adminError"></div>
+
+        <div x-show="!auth.enabled" x-cloak class="card p-4 text-sm text-amber-800 bg-amber-50 border-amber-200">
+          Authentication is disabled, so every caller already has full access. Role grants made here take effect
+          once the server is started with <code class="font-mono">REQU_AUTH_MODE=ldap</code>.
+        </div>
+
+        <div x-show="ldapStatus && ldapStatus.configured" x-cloak class="card p-3 text-xs flex items-center gap-2"
+             :class="ldapStatus && ldapStatus.ok ? 'text-emerald-800 bg-emerald-50 border-emerald-200' : 'text-red-700 bg-red-50 border-red-200'">
+          <span class="font-semibold" x-text="ldapStatus && ldapStatus.ok ? 'Directory reachable' : 'Directory unreachable'"></span>
+          <span class="font-mono" x-text="ldapStatus ? ldapStatus.url : ''"></span>
+          <span x-show="ldapStatus && ldapStatus.message" x-text="ldapStatus ? ldapStatus.message : ''"></span>
+        </div>
+
+        <!-- Grant a role -->
+        <div class="card">
+          <div class="px-4 py-3 border-b border-slate-200">
+            <h2 class="text-sm font-semibold text-slate-800">Grant a role</h2>
+            <p class="text-xs text-slate-500">
+              Directory groups already map to roles via <code class="font-mono">REQU_LDAP_ROLE_MAP</code>.
+              Use this for the exceptions — a user appears here after their first sign-in.
+            </p>
+          </div>
+          <div class="px-4 py-3 flex flex-wrap items-end gap-3">
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">User</span>
+              <select x-model="grantForm.userId" class="filter-select" style="width:180px;">
+                <option value="">Select a user…</option>
+                <template x-for="u in adminUsers" :key="u.id">
+                  <option :value="u.id" x-text="u.displayName + ' (' + u.id + ')'"></option>
+                </template>
+              </select>
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Role</span>
+              <select x-model="grantForm.role" class="filter-select" style="width:140px;">
+                <option value="viewer">viewer</option>
+                <option value="contributor">contributor</option>
+                <option value="maintainer">maintainer</option>
+                <option value="admin">admin</option>
+              </select>
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Project (blank = all)</span>
+              <input type="text" x-model="grantForm.projectId" placeholder="all projects" class="filter-select" style="width:160px;">
+            </label>
+            <button @click="grantRole()" class="btn-primary text-xs">Grant</button>
+          </div>
+        </div>
+
+        <!-- Users -->
+        <div class="card">
+          <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+            <h2 class="text-sm font-semibold text-slate-800">Users</h2>
+            <button @click="loadAdminUsers()" class="btn-secondary text-xs">Refresh</button>
+          </div>
+          <div x-show="adminLoading" class="px-4 py-6 text-sm text-slate-400">Loading…</div>
+          <template x-if="!adminLoading && adminUsers.length === 0">
+            <p class="px-4 py-6 text-sm text-slate-400 italic">
+              Nobody has signed in yet. Users are created from the directory on their first sign-in.
+            </p>
+          </template>
+          <div x-show="!adminLoading && adminUsers.length > 0" class="data-table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th scope="col">User</th>
+                  <th scope="col">Effective roles</th>
+                  <th scope="col">Explicit grants</th>
+                  <th scope="col">Directory groups</th>
+                  <th scope="col">Last sign-in</th>
+                  <th scope="col">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="u in adminUsers" :key="u.id">
+                  <tr>
+                    <td>
+                      <span class="font-medium text-slate-800" x-text="u.displayName"></span>
+                      <span class="block text-xs text-slate-400 font-mono" x-text="u.id"></span>
+                    </td>
+                    <td>
+                      <div class="flex flex-wrap gap-1">
+                        <template x-for="r in (u.effectiveRoles || [])" :key="r">
+                          <span class="chip" :class="roleClass(r)" x-text="r"></span>
+                        </template>
+                        <span x-show="(u.effectiveRoles || []).length === 0" class="text-xs text-slate-400 italic">none</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="flex flex-wrap gap-1">
+                        <template x-for="b in (u.bindings || [])" :key="b.projectId + b.role">
+                          <button class="chip chip-slate hover:bg-red-100 hover:text-red-700 transition-colors"
+                                  :title="'Revoke ' + b.role + (b.projectId === '*' ? ' on all projects' : ' on ' + b.projectId)"
+                                  @click="revokeBinding(u.id, b.projectId, b.role)"
+                                  x-text="b.role + (b.projectId === '*' ? '' : ' @ ' + b.projectId)"></button>
+                        </template>
+                        <span x-show="(u.bindings || []).length === 0" class="text-xs text-slate-400 italic">—</span>
+                      </div>
+                    </td>
+                    <td class="text-xs text-slate-500 max-w-xs truncate" :title="(u.groups || []).join(', ')"
+                        x-text="(u.groups || []).length ? (u.groups || []).length + ' group(s)' : '—'"></td>
+                    <td class="text-xs text-slate-500" x-text="u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : '—'"></td>
+                    <td>
+                      <button class="chip" :class="u.disabled ? 'chip-red' : 'chip-green'"
+                              @click="setUserDisabled(u.id, !u.disabled)"
+                              :title="u.disabled ? 'Re-enable this account' : 'Disable this account and end its sessions'"
+                              x-text="u.disabled ? 'disabled' : 'active'"></button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       </div><!-- /tab panels -->
     </div><!-- /container -->
   </main>
@@ -2418,10 +2771,236 @@
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3"/></svg>
           Allure report
         </button>
-        <button @click="closeStoryDetail()" class="btn-primary text-xs">Close</button>
+        <div class="flex items-center gap-2">
+          <button x-show="can('history:read') && auth.auditEnabled && storyDetail" x-cloak
+            @click="openHistory('story', storyDetail.id)"
+            class="btn-secondary text-xs flex items-center gap-1.5"
+            :aria-label="storyDetail ? 'Change history for ' + storyDetail.id : 'Change history'">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+            History
+          </button>
+          <button @click="closeStoryDetail()" class="btn-primary text-xs">Close</button>
+        </div>
       </div>
     </div>
   </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       ACCOUNT — identity, permissions and personal access tokens
+  ═══════════════════════════════════════════════════════════════ -->
+  <div
+    x-show="accountOpen"
+    x-cloak
+    class="fixed inset-0 z-50 flex items-center justify-center p-4"
+    role="dialog" aria-modal="true" aria-labelledby="account-title"
+    @keydown.escape.window="accountOpen = false">
+    <div class="absolute inset-0 bg-black/50" @click="accountOpen = false"></div>
+    <div class="relative bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[88vh] flex flex-col">
+      <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between shrink-0">
+        <div>
+          <h2 id="account-title" class="text-base font-semibold text-slate-900" x-text="auth.displayName || auth.username || 'Account'"></h2>
+          <p class="text-xs text-slate-500">
+            <span x-text="auth.email || auth.userId"></span>
+            <span x-show="!auth.enabled"> · authentication disabled</span>
+          </p>
+        </div>
+        <button x-ref="accountClose" @click="accountOpen = false" class="p-2 text-slate-400 hover:text-slate-600 transition-colors" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div class="px-6 py-5 overflow-y-auto space-y-6">
+
+        <!-- What you may do -->
+        <div>
+          <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Roles and permissions</h3>
+          <div class="flex flex-wrap gap-1.5 mb-2">
+            <template x-for="r in auth.roles" :key="r">
+              <span class="chip" :class="roleClass(r)" x-text="r"></span>
+            </template>
+            <span x-show="auth.roles.length === 0" class="text-sm text-slate-400 italic">No role assigned.</span>
+          </div>
+          <div class="flex flex-wrap gap-1">
+            <template x-for="p in auth.permissions" :key="p">
+              <span class="chip chip-slate font-mono text-[10px]" x-text="p"></span>
+            </template>
+          </div>
+          <p x-show="auth.groups.length" x-cloak class="mt-2 text-xs text-slate-400"
+             x-text="'Directory groups: ' + auth.groups.join(', ')"></p>
+        </div>
+
+        <!-- The token that was just minted, shown once -->
+        <div x-show="mintedToken" x-cloak class="rounded-lg border border-emerald-300 bg-emerald-50 p-4">
+          <p class="text-xs font-semibold text-emerald-900 mb-2">
+            Copy this token now — it is never shown again. Only a hash of it is stored.
+          </p>
+          <div class="flex items-center gap-2 mb-3">
+            <code class="flex-1 text-xs font-mono bg-white border border-emerald-200 rounded px-2 py-1.5 break-all" x-text="mintedToken"></code>
+            <button @click="copyMinted(mintedToken)" class="btn-secondary text-xs shrink-0"
+                    x-text="mintedCopied ? 'Copied' : 'Copy'"></button>
+          </div>
+          <p class="text-xs text-emerald-900 mb-1">Add it to your MCP client configuration:</p>
+          <pre class="text-[11px] font-mono bg-white border border-emerald-200 rounded p-2 overflow-x-auto" x-text="mcpConfigSnippet()"></pre>
+          <button @click="copyMinted(mcpConfigSnippet())" class="btn-secondary text-xs mt-2">Copy configuration</button>
+        </div>
+
+        <!-- Mint a token -->
+        <div>
+          <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">New access token</h3>
+          <p class="text-xs text-slate-500 mb-3">
+            A token authenticates an MCP client as you. Give each client its own, so one can be revoked without
+            disturbing the others.
+          </p>
+          <div class="flex flex-wrap items-end gap-3">
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Name</span>
+              <input type="text" x-model="tokenForm.name" placeholder="Claude Code on my laptop" class="filter-select" style="width:220px;">
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Cap the role</span>
+              <select x-model="tokenForm.maxRole" class="filter-select" style="width:150px;">
+                <option value="">Same as my roles</option>
+                <option value="viewer">viewer (read-only)</option>
+                <option value="contributor">contributor</option>
+                <option value="maintainer">maintainer</option>
+              </select>
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Expires in (days)</span>
+              <input type="number" min="1" x-model="tokenForm.expiresInDays" placeholder="never" class="filter-select" style="width:110px;">
+            </label>
+            <label class="text-xs text-slate-600">
+              <span class="block mb-1">Limit to projects</span>
+              <input type="text" x-model="tokenForm.projects" placeholder="all projects" class="filter-select" style="width:170px;">
+            </label>
+            <button @click="createToken()" :disabled="tokenBusy" class="btn-primary text-xs disabled:opacity-60"
+                    x-text="tokenBusy ? 'Creating…' : 'Create token'"></button>
+          </div>
+          <p x-show="tokenError" x-cloak role="alert" class="mt-2 text-xs text-red-700" x-text="tokenError"></p>
+        </div>
+
+        <!-- Existing tokens -->
+        <div>
+          <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Your tokens</h3>
+          <div x-show="tokensLoading" class="text-sm text-slate-400">Loading…</div>
+          <template x-if="!tokensLoading && tokens.length === 0">
+            <p class="text-sm text-slate-400 italic">No tokens yet.</p>
+          </template>
+          <div x-show="!tokensLoading && tokens.length > 0" class="data-table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Token</th>
+                  <th scope="col">Scope</th>
+                  <th scope="col">Created</th>
+                  <th scope="col">Last used</th>
+                  <th scope="col"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="t in tokens" :key="t.id">
+                  <tr :class="t.active ? '' : 'opacity-50'">
+                    <td class="text-sm text-slate-800" x-text="t.name"></td>
+                    <td class="font-mono text-xs text-slate-500" x-text="t.prefix"></td>
+                    <td class="text-xs text-slate-500">
+                      <span x-text="t.maxRole ? 'capped at ' + t.maxRole : 'my roles'"></span>
+                      <span x-show="t.projects" class="block" x-text="(t.projects || []).join(', ')"></span>
+                      <span x-show="t.expiresAt" class="block" x-text="'expires ' + (t.expiresAt ? new Date(t.expiresAt).toLocaleDateString() : '')"></span>
+                    </td>
+                    <td class="text-xs text-slate-500" x-text="new Date(t.createdAt).toLocaleDateString()"></td>
+                    <td class="text-xs text-slate-500" x-text="t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString() : 'never'"></td>
+                    <td class="text-right">
+                      <button x-show="t.active" @click="revokeToken(t.id)"
+                              class="text-xs text-red-600 hover:text-red-800 transition-colors">Revoke</button>
+                      <span x-show="!t.active" class="chip chip-slate" x-text="t.revokedAt ? 'revoked' : 'expired'"></span>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="px-6 py-4 border-t border-slate-200 flex justify-end shrink-0">
+        <button @click="accountOpen = false" class="btn-primary text-xs">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       HISTORY — one entity's change log, the way an issue tracker shows it
+  ═══════════════════════════════════════════════════════════════ -->
+  <div
+    x-show="historyOpen"
+    x-cloak
+    class="fixed inset-0 z-50 flex items-center justify-center p-4"
+    role="dialog" aria-modal="true" aria-labelledby="history-title"
+    @keydown.escape.window="closeHistory()">
+    <div class="absolute inset-0 bg-black/50" @click="closeHistory()"></div>
+    <div class="relative bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col">
+      <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between shrink-0">
+        <div>
+          <h2 id="history-title" class="text-base font-semibold text-slate-900">
+            History · <span class="font-mono" x-text="historyEntityId"></span>
+          </h2>
+          <p class="text-xs text-slate-500" x-text="historyEntity"></p>
+        </div>
+        <button @click="closeHistory()" class="p-2 text-slate-400 hover:text-slate-600 transition-colors" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div class="px-6 py-5 overflow-y-auto">
+        <div x-show="historyLoading" class="text-sm text-slate-400">Loading…</div>
+        <template x-if="!historyLoading && historyChanges.length === 0">
+          <p class="text-sm text-slate-400 italic">
+            No recorded changes. History starts when auditing is switched on
+            (<code class="font-mono">REQU_AUDIT</code>), so edits made before then are not listed.
+          </p>
+        </template>
+        <ol x-show="!historyLoading && historyChanges.length > 0" class="space-y-4">
+          <template x-for="c in historyChanges" :key="c.id">
+            <li class="border-l-2 border-slate-200 pl-4 relative">
+              <span class="absolute -left-[5px] top-1.5 w-2 h-2 rounded-full bg-indigo-500" aria-hidden="true"></span>
+              <div class="flex items-baseline gap-2 flex-wrap">
+                <span class="chip" :class="changeActionClass(c.action)" x-text="c.action"></span>
+                <span class="text-sm font-medium text-slate-800" x-text="c.actorName || c.actorId"></span>
+                <span class="text-xs text-slate-400" x-text="new Date(c.at).toLocaleString()"></span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500" x-text="c.source"></span>
+                <span x-show="c.version" class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500" x-text="'v' + c.version"></span>
+              </div>
+              <table x-show="(c.changes || []).length" class="mt-2 w-full text-xs">
+                <thead>
+                  <tr class="text-slate-400 text-left">
+                    <th scope="col" class="font-medium pb-1 w-1/5">Field</th>
+                    <th scope="col" class="font-medium pb-1 w-2/5">From</th>
+                    <th scope="col" class="font-medium pb-1 w-2/5">To</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="f in (c.changes || [])" :key="f.field">
+                    <tr class="align-top border-t border-slate-100">
+                      <td class="py-1 pr-2 font-mono font-semibold text-slate-600" x-text="f.field"></td>
+                      <td class="py-1 pr-2 text-red-700 break-words" x-text="historyValue(f.from)"></td>
+                      <td class="py-1 text-emerald-800 break-words" x-text="historyValue(f.to)"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </li>
+          </template>
+        </ol>
+      </div>
+
+      <div class="px-6 py-4 border-t border-slate-200 flex justify-end shrink-0">
+        <button @click="closeHistory()" class="btn-primary text-xs">Close</button>
+      </div>
+    </div>
+  </div>
+
+  </div><!-- /authenticated shell -->
 
   <script src="https://cdn.jsdelivr.net/npm/marked@14/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>

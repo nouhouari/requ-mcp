@@ -85,6 +85,19 @@ import {
 } from "./screen-coverage.js";
 import { parseCucumberJson } from "./ingest.js";
 import { buildExport, applyImport } from "./export-import.js";
+import { audit, flushChanges, recordingStore } from "./audit.js";
+import { authConfig } from "./auth/config.js";
+import {
+  currentContext,
+  currentPrincipal,
+  newContext,
+  noteTarget,
+  runWithContext,
+} from "./auth/context.js";
+import { authenticateRequest, clientIp, reauthorizeForProject } from "./auth/authenticate.js";
+import { devPrincipal, ForbiddenError, requirePermission, UnauthorizedError } from "./auth/model.js";
+import { permissionForTool } from "./auth/rbac.js";
+import { authStore } from "./auth/store.js";
 
 const now = () => new Date().toISOString();
 
@@ -442,6 +455,64 @@ function tool(
   toolDefs.push({ name, config, handler, mutates, entity });
 }
 
+/** The project a store belongs to, as the audit trail and history record it. */
+function projectIdOf(store: AnyStore): string {
+  const pid = (store as { projectId?: string }).projectId;
+  if (pid) return pid;
+  const root = (store as { root?: string }).root;
+  return root ? path.basename(root) : "default";
+}
+
+async function safeVersion(store: AnyStore): Promise<string | null> {
+  try {
+    return await store.version();
+  } catch {
+    return null;
+  }
+}
+
+/** Argument keys that would bloat or pollute an audit row with whole documents. */
+const BULKY_ARGS = new Set(["html", "content", "markdown", "json", "payload", "data", "report"]);
+
+/**
+ * Argument names that might carry a credential. No tool takes one today; the
+ * guard is here so that adding one later cannot quietly write it into a table
+ * built to be read by other people.
+ */
+const SECRET_ARG_RE = /pass(word|wd)?|secret|token|credential|apikey|api_key|authorization/i;
+
+/**
+ * A compact summary of a tool call for the audit row.
+ *
+ * The arguments are recorded, not the payloads: an imported cucumber report or a
+ * screen's HTML is megabytes and adds nothing to "who changed what" — the change
+ * history already holds the field-level diff.
+ */
+function auditDetail(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args ?? {})) {
+    if (v === undefined) continue;
+    if (SECRET_ARG_RE.test(k)) {
+      out[k] = "<redacted>";
+      continue;
+    }
+    if (BULKY_ARGS.has(k)) {
+      out[k] = `<${typeof v === "string" ? `${v.length} chars` : "omitted"}>`;
+      continue;
+    }
+    if (typeof v === "string") {
+      out[k] = v.length > 200 ? `${v.slice(0, 200)}…` : v;
+    } else if (Array.isArray(v)) {
+      out[k] = v.length <= 20 ? v : `<${v.length} items>`;
+    } else if (v !== null && typeof v === "object") {
+      out[k] = "<object>";
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 /** Build a fresh McpServer with every collected tool registered on it. */
 function createServer(): McpServer {
   const server = new McpServer({ name: "requ-mcp", version: PKG_VERSION });
@@ -464,18 +535,71 @@ function createServer(): McpServer {
     const addressArg = ownsVersion ? "atVersion" : "version";
     inputSchema[addressArg] = versionSchema;
 
+    const permission = permissionForTool(name, mutates);
+
     server.registerTool(
       name,
       { title: config.title, description: config.description, inputSchema },
       async (args: any) => {
+        let projectId: string | null = null;
         try {
           const selector = selectorFor(name, args);
+          const ctx = currentContext();
+
+          // Note the target before anything can be refused: a denial recorded
+          // against no project is invisible to the audit screen's project
+          // filter, which is exactly where a refused call needs to show up.
+          // The selector may be a key rather than a slug, so it is normalised
+          // the same way the store id is.
+          if (selector) {
+            projectId = toSlug(selector);
+            if (ctx) ctx.projectKey = projectId;
+          }
+
+          // init_project mints the project, so there is nothing project-scoped
+          // to resolve against yet: only a global grant can authorise it, and it
+          // has to be checked before the store is created rather than after.
+          if (name === "init_project") {
+            requirePermission(currentPrincipal(), permission, `run ${name}`);
+          }
+
           const store = await getStore(server, selector, name === "init_project");
+          projectId = projectIdOf(store);
+
+          // The bearer token was verified before the request reached the MCP
+          // transport, but which project it is about only becomes clear here,
+          // in the arguments. Roles are resolved against the project's id — the
+          // same identifier role grants and token scopes are written against —
+          // rather than against whichever of its key or slug the caller used.
+          if (ctx) {
+            ctx.principal = await reauthorizeForProject(ctx.principal, projectId);
+            ctx.projectKey = projectId;
+          }
+          requirePermission(currentPrincipal(), permission, `run ${name}`);
           const bound = await bindVersion(
             store, args[addressArg], mutates, name, entity, args, ownsVersion,
           );
-          return (await handler(args, bound)) as ReturnType<typeof json>;
+          noteTarget(projectId, await safeVersion(bound));
+          const result = (await handler(args, recordingStore(bound, projectId))) as ReturnType<typeof json>;
+          // A tool reports a rejected call as `isError` rather than throwing, so
+          // the audit outcome follows the result, not the absence of an exception.
+          audit({
+            action: name,
+            outcome: (result as { isError?: boolean }).isError ? "error" : "ok",
+            permission,
+            projectId,
+            detail: auditDetail(args),
+          });
+          return result;
         } catch (e) {
+          const denied = e instanceof ForbiddenError || e instanceof UnauthorizedError;
+          audit({
+            action: name,
+            outcome: denied ? "denied" : "error",
+            permission,
+            projectId,
+            detail: { ...auditDetail(args), error: (e as Error).message },
+          });
           return fail((e as Error).message);
         }
       },
@@ -495,6 +619,7 @@ function createServer(): McpServer {
     },
     async () => {
       try {
+        requirePermission(currentPrincipal(), "spec:read", "list projects");
         // HTTP mode: discover DB-native projects, then enumerate loaded stores.
         await attachAllDbProjects();
         if (_stores.size > 0) {
@@ -533,6 +658,7 @@ function createServer(): McpServer {
     },
     async (args: { key: string }) => {
       try {
+        requirePermission(currentPrincipal(), "spec:read", "read a project brief");
         const store = await getStoreByKey(args.key, server);
         if (!store) {
           return json({ error: `No project found with key '${args.key}'.` });
@@ -3347,6 +3473,29 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
   });
 }
 
+/**
+ * Record a rejected MCP call. There is no principal, so the audit row names the
+ * credential that was presented rather than a user — which is exactly what an
+ * operator investigating a spike of 401s wants to see.
+ */
+async function auditUnauthenticated(
+  req: import("node:http").IncomingMessage,
+  reason: string,
+): Promise<void> {
+  await runWithContext(
+    newContext({
+      principal: { ...devPrincipal(), kind: "anonymous", userId: "anonymous", username: "anonymous", displayName: "Unauthenticated", roles: [], permissions: new Set() },
+      source: "mcp",
+      ip: clientIp(req),
+      userAgent: (req.headers["user-agent"] as string | undefined) ?? null,
+    }),
+    async () => {
+      const { auditSync } = await import("./audit.js");
+      await auditSync({ action: "mcp:request", outcome: "denied", detail: { reason } });
+    },
+  );
+}
+
 async function startHttpServer(): Promise<void> {
   const { createServer: createHttpServer } = await import("node:http");
   const { randomUUID }   = await import("node:crypto");
@@ -3361,6 +3510,9 @@ async function startHttpServer(): Promise<void> {
   if (process.env.REQU_PG_URL) initPgPool(process.env.REQU_PG_URL);
   loadProjectsFromEnv();
 
+  const auth = authConfig();
+  if (auth.enabled || auth.auditEnabled) await authStore().init();
+
   const httpServer = createHttpServer(async (req, res) => {
     // Web dashboard routes (REST API + static files)
     if (await handleWebRequest(req, res, _stores)) return;
@@ -3369,33 +3521,67 @@ async function startHttpServer(): Promise<void> {
       res.writeHead(404).end("Not Found");
       return;
     }
-    try {
-      const bodyStr = req.method === "POST" ? await readBody(req) : "{}";
-      const body    = bodyStr.trim() ? JSON.parse(bodyStr) : undefined;
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-      let transport: InstanceType<typeof StreamableHTTPServerTransport>;
-
-      if (sessionId && sessions.has(sessionId)) {
-        transport = sessions.get(sessionId)!;
-      } else {
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (id: string) => { sessions.set(id, transport); },
-        });
-        (transport as any).onclose = () => {
-          const sid = (transport as any).sessionId as string | undefined;
-          if (sid) sessions.delete(sid);
-        };
-        // Fresh McpServer per session — an McpServer cannot be connected to two transports.
-        const sessionServer = createServer();
-        await sessionServer.connect(transport);
-      }
-
-      await transport.handleRequest(req, res, body);
-    } catch (err) {
-      if (!res.headersSent) res.writeHead(500).end(String(err));
+    // Authenticate the MCP call before the transport sees it. The project the
+    // call targets is not known yet — it is a tool argument — so roles are
+    // resolved globally here and narrowed per call in the tool wrapper.
+    const attempt = await authenticateRequest(req, null);
+    if (!attempt.ok) {
+      const body = JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: attempt.status === 403 ? -32003 : -32001, message: attempt.reason },
+        id: null,
+      });
+      await auditUnauthenticated(req, attempt.reason);
+      res.writeHead(attempt.status, {
+        "Content-Type": "application/json",
+        // Tells a browser-based client which scheme to use; MCP clients put the
+        // token in their server config.
+        ...(attempt.status === 401 ? { "WWW-Authenticate": 'Bearer realm="requ-mcp"' } : {}),
+        "Content-Length": Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
     }
+
+    const ctx = newContext({
+      principal: attempt.principal,
+      source: "mcp",
+      ip: clientIp(req),
+      userAgent: (req.headers["user-agent"] as string | undefined) ?? null,
+    });
+
+    await runWithContext(ctx, async () => {
+      try {
+        const bodyStr = req.method === "POST" ? await readBody(req) : "{}";
+        const body    = bodyStr.trim() ? JSON.parse(bodyStr) : undefined;
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+        let transport: InstanceType<typeof StreamableHTTPServerTransport>;
+
+        if (sessionId && sessions.has(sessionId)) {
+          transport = sessions.get(sessionId)!;
+        } else {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (id: string) => { sessions.set(id, transport); },
+          });
+          (transport as any).onclose = () => {
+            const sid = (transport as any).sessionId as string | undefined;
+            if (sid) sessions.delete(sid);
+          };
+          // Fresh McpServer per session — an McpServer cannot be connected to two transports.
+          const sessionServer = createServer();
+          await sessionServer.connect(transport);
+        }
+
+        await transport.handleRequest(req, res, body);
+      } catch (err) {
+        if (!res.headersSent) res.writeHead(500).end(String(err));
+      } finally {
+        await flushChanges(ctx.changes);
+      }
+    });
   });
 
   httpServer.listen(port, host, () => {
