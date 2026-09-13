@@ -349,6 +349,34 @@ The tables live wherever requ's own data does: in PostgreSQL when `REQU_PG_URL`
 is set, otherwise in a SQLite file (`REQU_AUTH_DB`, default `~/.requ/auth.db`)
 so a laptop still keeps its history across restarts.
 
+### Testing against a directory
+
+`npm run smoke:auth` runs a **real LDAP server in the test process**
+([`scripts/lib/ldap-fixture.ts`](scripts/lib/ldap-fixture.ts)), so the bind path
+is covered in CI with no container and no network: correct and wrong passwords,
+unknown users, filter-injection attempts, `memberOf` versus group-tree
+discovery, a DN-template direct bind, LDAPS over a generated self-signed
+certificate, and the whole sign-in → session → token → MCP round trip.
+
+To try requ against your own directory before rolling it out, point it at a
+staging server and use the health check:
+
+```bash
+REQU_AUTH_MODE=ldap REQU_AUTH_SECRET=… REQU_LDAP_URL=ldaps://… \
+REQU_LDAP_BASE_DN=dc=example,dc=com npm start
+
+curl -s localhost:8788/api/admin/ldap-check   # as an admin: reachable? bind ok?
+```
+
+`GET /api/admin/ldap-check` binds with the service account and performs one
+search, so a wrong URL, a bad service password or an unreachable host surfaces
+before anyone tries to log in. The **Access** tab shows the same result.
+
+If you would rather not point at a live directory at all, any throwaway LDAP
+server works — `docker run -p 389:389 -e LDAP_ORGANISATION=Example \
+-e LDAP_DOMAIN=example.com -e LDAP_ADMIN_PASSWORD=secret osixia/openldap` is the
+usual one — with `REQU_LDAP_ALLOW_PLAINTEXT=true` while it is plaintext.
+
 ## Tools
 
 | Tool | Actor | Purpose |

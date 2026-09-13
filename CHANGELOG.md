@@ -39,6 +39,13 @@ All notable changes to this project will be documented here.
   See [Authentication](README.md#authentication-roles-and-the-audit-trail) and
   [ADR-0002](docs/adr/0002-ldap-authentication-rbac-and-audit.md).
 
+- **An in-process LDAP server for the test suite**
+  (`scripts/lib/ldap-fixture.ts`), so `npm run smoke:auth` exercises the real
+  bind path in CI without a container or network access — wrong passwords,
+  unknown users, filter injection, `memberOf` versus group-tree discovery, a
+  DN-template direct bind, LDAPS over a generated certificate, and the full
+  sign-in → session → token → MCP round trip.
+
 - **New REST endpoints** — `GET /api/auth/config`, `POST /api/auth/login`,
   `POST /api/auth/logout`, `GET /api/auth/me`, `GET|POST /api/auth/tokens`,
   `DELETE /api/auth/tokens/:id`, `GET /api/audit`, `GET /api/history`,
@@ -85,6 +92,22 @@ All notable changes to this project will be documented here.
 
 - **`export_project { allVersions: true }`** exports the whole history plus the
   version registry; import restores every version with its lock state.
+
+### Fixed
+- **LDAP attributes are now read case-insensitively.** Attribute descriptions
+  are case-insensitive per RFC 4512, and directories disagree in practice. An
+  exact-key lookup silently found nothing on a directory that returns
+  `memberof` rather than `memberOf` — so every user would have appeared to
+  belong to no group and quietly dropped to the default role. The user entry is
+  also now fetched with `*` rather than a list of named attributes, since
+  servers match a requested attribute list case-sensitively often enough that
+  asking for `displayName` can return nothing.
+- **Plaintext `ldap://` connections no longer fail the TLS handshake.** `ldapts`
+  turns TLS on when `tlsOptions` is present *or* the scheme is `ldaps:`, and
+  requ passed `tlsOptions` unconditionally — so a deployment that had
+  acknowledged plaintext with `REQU_LDAP_ALLOW_PLAINTEXT=true` still failed,
+  reported as "socket disconnected before secure TLS connection was
+  established", which points nowhere near the cause.
 
 ### Changed — BREAKING
 - **Writes to a locked version are rejected.** Once a version is locked, every

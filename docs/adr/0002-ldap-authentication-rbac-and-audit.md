@@ -92,6 +92,28 @@ flushed once, so a tool that writes five entities costs one insert.
 Both tables live in requ's own database — PostgreSQL when configured, SQLite
 otherwise — so the audit trail is not a separate operational concern.
 
+### The directory is tested for real, in-process
+
+Public test directories are unreachable from CI and a container is a heavy
+dependency for one smoke suite, so `npm run smoke:auth` starts a real LDAP
+server (`ldapjs`) inside the test process and points requ at it. The bind path
+is the part of authentication that cannot be verified by reading the code — the
+filter that goes on the wire, the DN that comes back, how groups are
+discovered — and it now has coverage that needs no network and no service.
+
+Writing it found two defects that review had not:
+
+- attributes were read by exact key, but attribute descriptions are
+  case-insensitive (RFC 4512). A directory returning `memberof` rather than
+  `memberOf` would have produced users with no groups, silently demoting
+  everyone to the default role;
+- `ldapts` enables TLS when `tlsOptions` is present *or* the scheme is `ldaps:`,
+  and requ passed `tlsOptions` unconditionally, so a plaintext deployment failed
+  its handshake against a server that never offered one.
+
+Both are the kind of fault that only appears against a live server, and both
+would have looked like a misconfiguration to whoever hit them first.
+
 ## Consequences
 
 - A production deployment needs a directory and a secret; a development one needs
@@ -105,3 +127,7 @@ otherwise — so the audit trail is not a separate operational concern.
 - Disabled mode is genuinely open. The dashboard says so in the header, and
   `/api/auth/config` says so to anyone asking, so an open instance cannot be
   mistaken for a secured one.
+- The LDAP fixture is a test double, not a conformance suite: it answers the
+  subset of the protocol requ uses. Real directories differ in schema, in ACLs
+  and in what they return to a bound user, so `GET /api/admin/ldap-check`
+  exists to prove a deployment's own settings reach its own directory.

@@ -22,6 +22,15 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startHarness, slugFor } from "./lib/http-harness.js";
+import {
+  BASE_DN,
+  GROUP_BASE_DN,
+  SERVICE_DN,
+  SERVICE_PASSWORD,
+  startLdapFixture,
+  USERS,
+  type FixtureOptions,
+} from "./lib/ldap-fixture.js";
 
 let passed = 0;
 let failed = 0;
@@ -365,6 +374,281 @@ async function main() {
       check("the refusal says the token was revoked", String(res.body.error ?? "").toLowerCase().includes("revoked"), res.body);
     } finally {
       await revoked.stop();
+    }
+  }
+
+  // =========================================================================
+  console.log("\n— against a live LDAP directory —");
+  // =========================================================================
+  //
+  // Everything above proves the authorisation layer; this proves the bind path,
+  // which is the part that cannot be checked by reasoning about it. The
+  // directory is a real LDAP server running in this process (see
+  // lib/ldap-fixture.ts) — no container, no network, works in CI.
+  {
+    const { authenticateLdap } = await import("../src/auth/ldap.js");
+
+    const ldapCfg = (url: string, over: Record<string, unknown> = {}) =>
+      ({
+        url,
+        bindDn: SERVICE_DN,
+        bindPassword: SERVICE_PASSWORD,
+        baseDn: BASE_DN,
+        userFilter: "(|(uid={{username}})(sAMAccountName={{username}}))",
+        userDnTemplate: null,
+        displayNameAttrs: ["displayName", "cn"],
+        emailAttrs: ["mail"],
+        groupBaseDn: GROUP_BASE_DN,
+        groupFilter: "(|(member={{dn}})(memberUid={{username}}))",
+        groupNameAttr: "cn",
+        memberOfAttr: "memberOf",
+        timeoutMs: 5_000,
+        tlsRejectUnauthorized: false,
+        ...over,
+      }) as any;
+
+    const withFixture = async (opts: FixtureOptions, fn: (url: string) => Promise<void>) => {
+      const fixture = await startLdapFixture(opts);
+      try {
+        await fn(fixture.url);
+      } finally {
+        await fixture.stop();
+      }
+    };
+
+    const rejects = async (fn: () => Promise<unknown>): Promise<{ message: string; invalid: boolean }> => {
+      try {
+        await fn();
+        return { message: "<no error>", invalid: false };
+      } catch (e) {
+        return { message: (e as Error).message, invalid: (e as { invalidCredentials?: boolean }).invalidCredentials === true };
+      }
+    };
+
+    // --- groups published on the user entry (Active Directory style) ---
+    await withFixture({ groupDiscovery: "memberOf" }, async (url) => {
+      const u = await authenticateLdap(ldapCfg(url), "vera", "vera-secret");
+      check("ldap: a correct password binds", u.username === "vera", u);
+      check("ldap: the DN comes back from the directory", u.dn === USERS.vera.dn, u.dn);
+      check("ldap: the display name is read", u.displayName === "Vera Viewer", u.displayName);
+      check("ldap: the mail attribute is read", u.email === "vera@example.test", u.email);
+      check("ldap: memberOf groups are discovered", u.groups.includes(`cn=requ-readers,${GROUP_BASE_DN}`), u.groups);
+      check("ldap: the bare group name is recorded too", u.groups.includes("requ-readers"), u.groups);
+
+      const wrong = await rejects(() => authenticateLdap(ldapCfg(url), "vera", "not-the-password"));
+      check("ldap: a wrong password is rejected", wrong.invalid, wrong);
+      check("ldap: and is reported as a credential problem", wrong.message.includes("Invalid username or password"), wrong.message);
+
+      const unknown = await rejects(() => authenticateLdap(ldapCfg(url), "ghost", "whatever"));
+      check("ldap: an unknown user is rejected", unknown.invalid, unknown);
+      check("ldap: an unknown user is indistinguishable from a wrong password",
+        unknown.message === wrong.message, { unknown: unknown.message, wrong: wrong.message });
+
+      // An empty password makes a real directory perform an *unauthenticated*
+      // bind, which succeeds — so the guard has to be on requ's side.
+      const blank = await rejects(() => authenticateLdap(ldapCfg(url), "vera", ""));
+      check("ldap: an empty password never authenticates", blank.invalid, blank);
+
+      // Filter injection: unescaped, `*` matches every entry in the tree.
+      const wildcard = await rejects(() => authenticateLdap(ldapCfg(url), "*", "vera-secret"));
+      check("ldap: a wildcard username matches nothing", wildcard.invalid, wildcard);
+      const injected = await rejects(() => authenticateLdap(ldapCfg(url), ")(uid=*", "vera-secret"));
+      check("ldap: a username cannot close the filter early", injected.invalid, injected);
+
+      const ambiguous = await rejects(() => authenticateLdap(ldapCfg(url), "dup", "dup-secret"));
+      check("ldap: a username matching two entries is refused, not guessed",
+        ambiguous.message.includes("matched 2 directory entries"), ambiguous.message);
+
+      // Direct bind, with a deliberately wrong service password: succeeding
+      // proves the service account was never used.
+      const direct = await authenticateLdap(
+        ldapCfg(url, { userDnTemplate: `uid={{username}},ou=people,${BASE_DN}`, bindPassword: "WRONG" }),
+        "mika", "mika-secret",
+      );
+      check("ldap: a DN template binds without the service account", direct.username === "mika", direct);
+      check("ldap: groups are still discovered on that path", direct.groups.includes("requ-maintainers"), direct.groups);
+
+      const badService = await rejects(() => authenticateLdap(ldapCfg(url, { bindPassword: "WRONG" }), "vera", "vera-secret"));
+      check("ldap: a bad service password is reported as a configuration fault, not a bad login",
+        !badService.invalid && badService.message.includes("REQU_LDAP_BIND_DN"), badService);
+    });
+
+    // --- groups found by searching the group tree (OpenLDAP without memberOf) ---
+    await withFixture({ groupDiscovery: "search" }, async (url) => {
+      const u = await authenticateLdap(ldapCfg(url), "mika", "mika-secret");
+      check("ldap: groups are found by searching the group tree when there is no memberOf",
+        u.groups.includes("requ-maintainers"), u.groups);
+      const nora = await authenticateLdap(ldapCfg(url), "nora", "nora-secret");
+      check("ldap: a user in no group authenticates with no groups", nora.groups.length === 0, nora.groups);
+    });
+
+    // --- a directory that normalises attribute names to lower case ---
+    // Attribute descriptions are case-insensitive (RFC 4512). Reading them by
+    // exact key finds nothing, and a user with no groups silently drops to the
+    // default role — so this is checked, not assumed.
+    await withFixture({ groupDiscovery: "memberOf", lowercaseAttributes: true }, async (url) => {
+      const u = await authenticateLdap(ldapCfg(url), "vera", "vera-secret");
+      check("ldap: attributes are read whatever case the directory used", u.displayName === "Vera Viewer", u.displayName);
+      check("ldap: mail too", u.email === "vera@example.test", u.email);
+      check("ldap: and the groups, which decide the role", u.groups.includes("requ-readers"), u.groups);
+    });
+
+    // --- LDAPS, against a real TLS handshake ---
+    await withFixture({ tls: true }, async (url) => {
+      check("ldap: the fixture is serving ldaps", url.startsWith("ldaps://"), url);
+      const u = await authenticateLdap(ldapCfg(url), "mika", "mika-secret");
+      check("ldaps: a bind over TLS works", u.username === "mika" && u.groups.includes("requ-maintainers"), u);
+
+      // ldapts enables TLS when tlsOptions is present *or* the scheme is ldaps,
+      // so a self-signed certificate must still be refused when verification is on.
+      const strict = await rejects(() => authenticateLdap(ldapCfg(url, { tlsRejectUnauthorized: true }), "mika", "mika-secret"));
+      check("ldaps: an untrusted certificate is refused when verification is on",
+        !strict.invalid && /certificate|self[- ]signed/i.test(strict.message), strict.message);
+    });
+
+    const { checkLdapConnection } = await import("../src/auth/ldap.js");
+    await withFixture({}, async (url) => {
+      let healthy = true;
+      try { await checkLdapConnection(ldapCfg(url)); } catch { healthy = false; }
+      check("ldap: the health check reaches a working directory", healthy);
+    });
+    let unhealthy = false;
+    try { await checkLdapConnection(ldapCfg("ldap://127.0.0.1:1")); } catch { unhealthy = true; }
+    check("ldap: the health check reports an unreachable directory", unhealthy);
+  }
+
+  // =========================================================================
+  console.log("\n— signing in to the server against that directory —");
+  // =========================================================================
+  //
+  // The whole round trip a person makes: sign in, get a session, mint a token
+  // from that session, and drive MCP with the token — with the role the
+  // directory's groups earned them, and nothing more.
+  {
+    const root = path.join(tmp, "ldapproj");
+    await fs.mkdir(root, { recursive: true });
+    const slug = slugFor(root);
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+
+    const env = {
+      REQU_AUTH_MODE: "ldap",
+      REQU_AUTH_SECRET: SECRET,
+      REQU_AUTH_DB: path.join(tmp, "ldap-auth.db"),
+      REQU_AUDIT: "on",
+      REQU_LDAP_URL: fixture.url,
+      REQU_LDAP_ALLOW_PLAINTEXT: "true",
+      REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN,
+      REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=maintainer",
+      REQU_AUTH_DEFAULT_ROLE: "none",
+    };
+
+    const h = await startHarness([root], "smoke-auth-ldap", { env, connectMcp: false });
+    try {
+      const signIn = async (username: string, password: string) => {
+        const res = await fetch(`${h.base}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        const body = await res.json().catch(() => ({}));
+        return { status: res.status, body, cookie: res.headers.get("set-cookie") };
+      };
+
+      const bad = await signIn("mika", "wrong-password");
+      check("sign-in: a wrong password is refused", bad.status === 401, bad.status);
+      check("sign-in: no cookie is issued", !bad.cookie, bad.cookie);
+
+      const noRole = await signIn("nora", "nora-secret");
+      check("sign-in: a user no group maps to is refused when there is no default role",
+        noRole.status === 401, { status: noRole.status, body: noRole.body });
+
+      const ok = await signIn("mika", "mika-secret");
+      check("sign-in: correct credentials are accepted", ok.status === 200, ok.body);
+      check("sign-in: the directory's group became a role", ok.body.roles?.includes("maintainer") === true, ok.body.roles);
+      check("sign-in: the display name comes from the directory", ok.body.user?.displayName === "Mika Maintainer", ok.body.user);
+      check("sign-in: a session cookie is set", (ok.cookie ?? "").includes("requ_session="), ok.cookie);
+      check("sign-in: the cookie is HttpOnly", (ok.cookie ?? "").includes("HttpOnly"), ok.cookie);
+      check("sign-in: the cookie is SameSite=Lax", (ok.cookie ?? "").includes("SameSite=Lax"), ok.cookie);
+      check("sign-in: the roles say where they came from", (ok.body.roleSources ?? []).some((r: any) => r.source === "group"), ok.body.roleSources);
+
+      const cookie = (ok.cookie ?? "").split(";")[0];
+
+      const me = await getJson(`${h.base}/api/auth/me`, { Cookie: cookie });
+      check("session: the cookie identifies the user", me.body.username === "mika" && me.body.kind === "session", me.body);
+      check("session: it carries the maintainer permissions", me.body.permissions?.includes("spec:write") === true, me.body.permissions);
+
+      // A session can mint a token, and that token drives MCP.
+      const mint = await fetch(`${h.base}/api/auth/tokens`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookie },
+        body: JSON.stringify({ name: "from the dashboard" }),
+      });
+      const minted = await mint.json().catch(() => ({}));
+      check("token: a session can mint one", mint.status === 201 && typeof minted.token === "string", minted);
+      check("token: the plaintext is returned only in the creation response",
+        !JSON.stringify((await getJson(`${h.base}/api/auth/tokens`, { Cookie: cookie })).body).includes(minted.token), "listed tokens contain the secret");
+
+      const viaToken = await startHarness([root], "smoke-auth-ldap-token", {
+        env,
+        headers: { Authorization: `Bearer ${minted.token}` },
+      });
+      try {
+        const init = await viaToken.call("init_project", { key: slug, name: "LDAP Project", initialPhase: "v1.0", force: true });
+        check("token: a token minted in the dashboard drives MCP", !init.isError, init.data);
+        const created = await viaToken.call("create_requirement", { title: "Signed in for real", priority: "high" });
+        check("token: the maintainer role carries over to MCP", !created.isError, created.data);
+
+        const hist = await getJson(
+          `${viaToken.base}/api/history/requirement/${encodeURIComponent(created.data?.id)}?project=${slug}`,
+          { Authorization: `Bearer ${minted.token}` },
+        );
+        check("token: the change is attributed to the directory user", hist.body.changes?.[0]?.actorId === "mika", hist.body.changes?.[0]);
+      } finally {
+        await viaToken.stop();
+      }
+
+      // Signing out has to end the session for real, not just drop the cookie.
+      const out = await fetch(`${h.base}/api/auth/logout`, { method: "POST", headers: { Cookie: cookie } });
+      check("sign-out: succeeds", out.ok, out.status);
+      const after = await getJson(`${h.base}/api/auth/me`, { Cookie: cookie });
+      check("sign-out: the old cookie no longer authenticates", after.body.authenticated === false, after.body);
+
+      // A viewer signs in and is held to viewer rights.
+      const vera = await signIn("vera", "vera-secret");
+      check("sign-in: a reader's group maps to viewer", vera.body.roles?.includes("viewer") === true, vera.body.roles);
+      const veraCookie = (vera.cookie ?? "").split(";")[0];
+      const denied = await fetch(`${h.base}/api/config?project=${slug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: veraCookie },
+        body: JSON.stringify({ brief: "should not land" }),
+      });
+      check("session: a viewer's write over REST is refused", denied.status === 403, denied.status);
+
+      // Disabling an account ends its sessions immediately.
+      const mikaAgain = await signIn("mika", "mika-secret");
+      const mikaCookie = (mikaAgain.cookie ?? "").split(";")[0];
+      // Point the modules at *this* section's database. The config caches
+      // sqlitePath, so resetting the store alone would write to whichever
+      // database an earlier section left configured.
+      const { authStore, setAuthStore } = await import("../src/auth/store.js");
+      const { resetAuthConfig } = await import("../src/auth/config.js");
+      process.env.REQU_AUTH_DB = env.REQU_AUTH_DB;
+      process.env.REQU_AUTH_SECRET = SECRET;
+      process.env.REQU_AUTH_MODE = "disabled";
+      resetAuthConfig();
+      setAuthStore(null);
+      await authStore().setUserDisabled("mika", true);
+      await authStore().revokeSessionsForUser("mika");
+      const disabled = await getJson(`${h.base}/api/auth/me`, { Cookie: mikaCookie });
+      check("admin: disabling an account ends its session at once", disabled.body.authenticated === false, disabled.body);
+      const blocked = await signIn("mika", "mika-secret");
+      check("admin: a disabled account cannot sign back in", blocked.status === 401, blocked.status);
+    } finally {
+      await h.stop();
+      await fixture.stop();
     }
   }
 

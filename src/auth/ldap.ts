@@ -77,26 +77,36 @@ function substituteDn(template: string, vars: Record<string, string>): string {
   return template.replace(/\{\{(\w+)\}\}/g, (_m, name: string) => escapeDnValue(vars[name] ?? ""));
 }
 
-/** First non-empty value of an entry attribute, whatever shape ldapts returned. */
-function attr(entry: Entry, name: string): string | null {
-  const raw = entry[name];
-  if (raw === undefined || raw === null) return null;
-  const values = Array.isArray(raw) ? raw : [raw];
-  for (const v of values) {
-    const s = Buffer.isBuffer(v) ? v.toString("utf-8") : String(v);
-    if (s.trim() !== "") return s;
+/**
+ * Read an attribute regardless of how the directory cased its name.
+ *
+ * Attribute descriptions are case-insensitive (RFC 4512), and directories do
+ * disagree: one returns `memberOf`, another `memberof`. An exact-key lookup
+ * silently finds nothing — which for the group attribute means every user looks
+ * like they belong to no group and quietly falls back to the default role.
+ */
+function rawAttr(entry: Entry, name: string): unknown {
+  if (name in entry) return entry[name];
+  const wanted = name.toLowerCase();
+  for (const key of Object.keys(entry)) {
+    if (key.toLowerCase() === wanted) return entry[key];
   }
-  return null;
+  return undefined;
 }
 
-/** Every value of an entry attribute, as strings. */
+/** Every value of an entry attribute, as non-empty strings. */
 function attrAll(entry: Entry, name: string): string[] {
-  const raw = entry[name];
+  const raw = rawAttr(entry, name);
   if (raw === undefined || raw === null) return [];
   const values = Array.isArray(raw) ? raw : [raw];
   return values
     .map((v) => (Buffer.isBuffer(v) ? v.toString("utf-8") : String(v)))
     .filter((s) => s.trim() !== "");
+}
+
+/** First non-empty value of an entry attribute. */
+function attr(entry: Entry, name: string): string | null {
+  return attrAll(entry, name)[0] ?? null;
 }
 
 function firstAttr(entry: Entry, names: string[]): string | null {
@@ -119,11 +129,17 @@ export function rdnValue(dn: string): string | null {
 
 async function newClient(cfg: LdapConfig): Promise<Client> {
   const { Client: LdapClient } = await import("ldapts");
+  // ldapts turns TLS on when *either* the scheme is ldaps: or tlsOptions is
+  // present, so passing tlsOptions unconditionally would make a plaintext
+  // ldap:// deployment fail the TLS handshake against a server that never
+  // offered one — reported as "socket disconnected before secure TLS connection
+  // was established", which points nowhere near the cause.
+  const secure = cfg.url.trim().toLowerCase().startsWith("ldaps:");
   return new LdapClient({
     url: cfg.url,
     timeout: cfg.timeoutMs,
     connectTimeout: cfg.timeoutMs,
-    tlsOptions: { rejectUnauthorized: cfg.tlsRejectUnauthorized },
+    ...(secure ? { tlsOptions: { rejectUnauthorized: cfg.tlsRejectUnauthorized } } : {}),
   });
 }
 
@@ -198,14 +214,13 @@ export async function authenticateLdap(
 
     // Read the user entry. We are bound as the user now, which is the identity
     // most likely to be allowed to read its own attributes.
-    const wanted = [
-      ...cfg.displayNameAttrs,
-      ...cfg.emailAttrs,
-      ...(cfg.memberOfAttr ? [cfg.memberOfAttr] : []),
-      "uid",
-      "sAMAccountName",
-      "cn",
-    ];
+    //
+    // `*` asks for every user attribute rather than naming each one: servers
+    // match a requested attribute list case-sensitively often enough that
+    // spelling `displayName` can return nothing on a directory that calls it
+    // `displayname`. The group attribute is named as well, because on Active
+    // Directory it is constructed and `*` alone does not always include it.
+    const wanted = ["*", ...(cfg.memberOfAttr ? [cfg.memberOfAttr] : [])];
     let entry: Entry | null = null;
     try {
       const res = await client.search(userDn, {
