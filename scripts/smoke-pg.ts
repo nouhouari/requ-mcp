@@ -447,7 +447,10 @@ async function authStoreChecks(): Promise<void> {
     check("pg: listTokens returns both", (await store.listTokens(uid)).length === 2);
 
     // --- sessions ---
-    const session = { id: `sess-${pid}`, userId: uid, createdAt: iso(), expiresAt: iso(3_600_000), revokedAt: null, ip: "127.0.0.1", userAgent: "smoke" };
+    const session = {
+      id: `sess-${pid}`, userId: uid, createdAt: iso(), expiresAt: iso(3_600_000),
+      revokedAt: null, ip: "127.0.0.1", userAgent: "smoke", pendingTotp: false,
+    };
     await store.createSession(session);
     check("pg: a session round-trips", (await store.getSession(session.id))?.userId === uid);
     check("pg: revoking a session works", (await store.revokeSession(session.id)) === true);
@@ -489,6 +492,42 @@ async function authStoreChecks(): Promise<void> {
     check("pg: a change with no field diff round-trips",
       (await store.queryChanges({ projectId: pid, entity: "story" })).changes[0].changes.length === 0);
 
+    // --- second factor ---
+    const { sealSecret, openSecret } = await import("../src/auth/secret-box.js");
+    const { generateSecret, generateRecoveryCodes, hashRecoveryCode } = await import("../src/auth/totp.js");
+    const seed = generateSecret();
+    const secretPepper = process.env.REQU_AUTH_SECRET!;
+    const codes = generateRecoveryCodes();
+    await store.putTotp({
+      userId: uid,
+      secretSealed: sealSecret(seed, secretPepper),
+      confirmedAt: iso(),
+      createdAt: iso(),
+      lastStep: null,
+      recoveryHashes: codes.map((c) => hashRecoveryCode(c, secretPepper)),
+    });
+    const totpRow = await store.getTotp(uid);
+    check("pg: an enrolment round-trips", totpRow?.confirmedAt !== null && totpRow?.recoveryHashes.length === 10, totpRow?.recoveryHashes.length);
+    check("pg: the seed is stored sealed, not in the clear", !JSON.stringify(totpRow).includes(seed));
+    check("pg: and opens back to the original", openSecret(totpRow!.secretSealed, secretPepper) === seed);
+    check("pg: a confirmed enrolment is listed", (await store.listTotpUserIds()).includes(uid));
+
+    await store.setTotpLastStep(uid, 100);
+    check("pg: the replay watermark is recorded", (await store.getTotp(uid))?.lastStep === 100);
+    await store.setTotpLastStep(uid, 50);
+    check("pg: and never moves backwards", (await store.getTotp(uid))?.lastStep === 100, (await store.getTotp(uid))?.lastStep);
+
+    await store.setRecoveryHashes(uid, totpRow!.recoveryHashes.slice(1));
+    check("pg: spending a recovery code shortens the list", (await store.getTotp(uid))?.recoveryHashes.length === 9);
+
+    const pending = { ...session, id: `${session.id}-pending`, pendingTotp: true };
+    await store.createSession(pending);
+    check("pg: a session can be stored pending its second factor", (await store.getSession(pending.id))?.pendingTotp === true);
+    check("pg: clearing the flag promotes it", (await store.clearSessionPending(pending.id)) === true);
+    check("pg: and it is now an ordinary session", (await store.getSession(pending.id))?.pendingTotp === false);
+    check("pg: clearing an already-promoted session is a no-op", (await store.clearSessionPending(pending.id)) === false);
+    check("pg: an enrolment can be deleted", (await store.deleteTotp(uid)) === true);
+
     check("pg: disabling a user persists", await (async () => {
       await store.setUserDisabled(uid, true);
       return (await store.getUser(uid))?.disabled === true;
@@ -498,6 +537,7 @@ async function authStoreChecks(): Promise<void> {
     await pool.query("DELETE FROM entity_changes WHERE project_id = $1", [pid]);
     await pool.query("DELETE FROM auth_tokens WHERE user_id = $1", [uid]);
     await pool.query("DELETE FROM auth_sessions WHERE user_id = $1", [uid]);
+    await pool.query("DELETE FROM auth_totp WHERE user_id = $1", [uid]);
     await pool.query("DELETE FROM auth_role_bindings WHERE user_id = $1", [uid]);
     await pool.query("DELETE FROM auth_users WHERE id = $1", [uid]);
     await pool.end();

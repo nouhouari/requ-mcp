@@ -18,6 +18,15 @@ import { isRole, type Role } from "./model.js";
 
 export type AuthMode = "disabled" | "ldap";
 
+/**
+ * How hard the second factor is pushed.
+ *
+ *  off       — not offered at all;
+ *  optional  — anyone may enrol, nobody must;
+ *  required  — everyone must, and a sign-in without one leads to enrolment.
+ */
+export type TwoFactorMode = "off" | "optional" | "required";
+
 export type LdapConfig = {
   url: string;
   /** Service account used to search for users. Empty means anonymous search. */
@@ -79,6 +88,15 @@ export type AuthConfig = {
   cookieName: string;
   /** Send the session cookie with `Secure`. Defaults to on for ldap mode. */
   cookieSecure: boolean;
+  /** Second factor (TOTP: Microsoft Authenticator, Google Authenticator, …). */
+  twoFactor: TwoFactorMode;
+  /**
+   * Roles for which the second factor is mandatory even when the mode is
+   * `optional` — "everyone may, administrators must" is the common policy.
+   */
+  twoFactorRequiredRoles: Role[];
+  /** Name shown beside the account in the authenticator app. */
+  twoFactorIssuer: string;
 };
 
 export class AuthConfigError extends Error {
@@ -232,6 +250,31 @@ export function loadAuthConfig(): AuthConfig {
     );
   }
 
+  const rawTwoFactor = (env("REQU_2FA") ?? "off").toLowerCase();
+  if (!["off", "optional", "required"].includes(rawTwoFactor)) {
+    throw new AuthConfigError(`REQU_2FA must be 'off', 'optional' or 'required', got '${rawTwoFactor}'.`);
+  }
+  if (rawTwoFactor !== "off" && !enabled) {
+    throw new AuthConfigError(
+      "REQU_2FA needs REQU_AUTH_MODE=ldap: a second factor is meaningless without a first one.",
+    );
+  }
+  const twoFactorRequiredRoles: Role[] = [];
+  for (const raw of envList("REQU_2FA_REQUIRED_ROLES")) {
+    const role = raw.toLowerCase();
+    if (!isRole(role)) {
+      throw new AuthConfigError(
+        `REQU_2FA_REQUIRED_ROLES names an unknown role '${raw}'. Known: viewer, contributor, maintainer, admin.`,
+      );
+    }
+    twoFactorRequiredRoles.push(role);
+  }
+  if (twoFactorRequiredRoles.length > 0 && rawTwoFactor === "off") {
+    throw new AuthConfigError(
+      "REQU_2FA_REQUIRED_ROLES has no effect while REQU_2FA=off. Set REQU_2FA=optional to require it for those roles.",
+    );
+  }
+
   const rawAudit = (env("REQU_AUDIT") ?? "auto").toLowerCase();
   if (!["auto", "on", "off"].includes(rawAudit)) {
     throw new AuthConfigError(`REQU_AUDIT must be 'auto', 'on' or 'off', got '${rawAudit}'.`);
@@ -254,6 +297,9 @@ export function loadAuthConfig(): AuthConfig {
       env("REQU_AUTH_DB") ?? path.join(os.homedir(), ".requ", "auth.db"),
     cookieName: env("REQU_AUTH_COOKIE") ?? "requ_session",
     cookieSecure: envBool("REQU_AUTH_COOKIE_SECURE", enabled),
+    twoFactor: rawTwoFactor as TwoFactorMode,
+    twoFactorRequiredRoles,
+    twoFactorIssuer: env("REQU_2FA_ISSUER") ?? "requ",
   };
 }
 

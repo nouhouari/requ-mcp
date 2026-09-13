@@ -842,6 +842,285 @@ async function main() {
   }
 
   // =========================================================================
+  console.log("\n— two-factor authentication —");
+  // =========================================================================
+  //
+  // TOTP, which is what Microsoft Authenticator speaks for third-party accounts.
+  // The algorithm itself is checked against the RFC vectors below; this section
+  // is about the flow around it: that a password alone stops being enough, that
+  // a code cannot be replayed or brute-forced, and that losing a phone is
+  // recoverable without an administrator.
+  {
+    const { totpAt, stepFor, verifyTotp, hotp, base32Encode, generateRecoveryCodes, hashRecoveryCode, matchRecoveryCode, PERIOD_SECONDS } =
+      await import("../src/auth/totp.js");
+    const { sealSecret, openSecret } = await import("../src/auth/secret-box.js");
+
+    // --- the algorithm, against the published vectors ---
+    const rfcKey = Buffer.from("12345678901234567890", "utf-8");
+    const rfc4226 = ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"];
+    check(
+      "totp: matches every RFC 4226 HOTP vector",
+      rfc4226.every((expected, counter) => hotp(rfcKey, counter) === expected),
+      rfc4226.map((_, c) => hotp(rfcKey, c)),
+    );
+    const rfcSecret = base32Encode(rfcKey);
+    const rfc6238: Array<[number, string]> = [
+      [59, "287082"], [1111111109, "081804"], [1111111111, "050471"],
+      [1234567890, "005924"], [2000000000, "279037"],
+      // Past 2^32 seconds: catches a counter written with a 32-bit shift.
+      [20000000000, "353130"],
+    ];
+    check(
+      "totp: matches every RFC 6238 TOTP vector, including beyond 2^32 seconds",
+      rfc6238.every(([t, expected]) => totpAt(rfcSecret, Math.floor(t / PERIOD_SECONDS)) === expected),
+      rfc6238.map(([t]) => totpAt(rfcSecret, Math.floor(t / PERIOD_SECONDS))),
+    );
+
+    const at = 1_700_000_000_000;
+    const nowStep = Math.floor(at / 1000 / PERIOD_SECONDS);
+    check("totp: a code one step early is accepted (clock drift)", verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep - 1), { atMs: at }).ok);
+    check("totp: a code one step late is accepted", verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep + 1), { atMs: at }).ok);
+    check("totp: two steps out is refused", !verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep - 2), { atMs: at }).ok);
+    const spent = verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep), { atMs: at, minStep: nowStep });
+    check("totp: a spent step is refused as a replay", !spent.ok && spent.reason === "replayed", spent);
+
+    // --- the seed is encrypted at rest ---
+    const sealed = sealSecret(rfcSecret, SECRET);
+    check("totp: the stored seed is not the seed", !sealed.includes(rfcSecret), sealed.slice(0, 24));
+    check("totp: it opens with the right server secret", openSecret(sealed, SECRET) === rfcSecret);
+    check("totp: and not with a different one", openSecret(sealed, "some-other-secret-entirely-0123456789") === null);
+    check("totp: tampering with the ciphertext is detected", openSecret(sealed.slice(0, -4) + "AAAA", SECRET) === null);
+
+    const rcs = generateRecoveryCodes();
+    const rcHashes = rcs.map((c) => hashRecoveryCode(c, SECRET));
+    check("totp: recovery codes are stored only as hashes", !rcHashes.some((h) => rcs.some((c) => h.includes(c.replace("-", "")))));
+    check("totp: a recovery code matches regardless of case or dashes", matchRecoveryCode(rcs[2].toLowerCase(), rcHashes, SECRET) === 2);
+
+    // --- the flow ---
+    const root = path.join(tmp, "tfaproj");
+    await fs.mkdir(root, { recursive: true });
+    const authDb = path.join(tmp, "tfa-auth.db");
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+    const env = {
+      REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_AUTH_DB: authDb, REQU_AUDIT: "on",
+      REQU_LDAP_URL: fixture.url, REQU_LDAP_ALLOW_PLAINTEXT: "true", REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN, REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=maintainer",
+      REQU_2FA: "optional",
+    };
+
+    const h = await startHarness([root], "smoke-auth-2fa", { env, connectMcp: false });
+    try {
+      const post = async (p: string, payload: unknown, cookie = "") => {
+        const res = await fetch(`${h.base}${p}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+          body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json().catch(() => ({})), cookie: (res.headers.get("set-cookie") ?? "").split(";")[0] };
+      };
+      const signIn = (u: string, p: string) => post("/api/auth/login", { username: u, password: p });
+
+      // Nothing changes for someone who has not enrolled.
+      const plain = await signIn("mika", "mika-secret");
+      check("2fa: an un-enrolled user signs in on the password alone", plain.status === 200 && Boolean(plain.cookie), plain.body);
+      check("2fa: and is told no second factor is owed", plain.body.twoFactor?.required === false, plain.body.twoFactor);
+      const cookie = plain.cookie;
+
+      const status0 = await getJson(`${h.base}/api/auth/2fa`, { Cookie: cookie });
+      check("2fa: the server offers it", status0.body.available === true && status0.body.mode === "optional", status0.body);
+      check("2fa: and reports nobody enrolled yet", status0.body.enrolled === false, status0.body);
+
+      // Enrolment.
+      const setup = await post("/api/auth/2fa/setup", {}, cookie);
+      check("2fa: setup returns a provisioning URI", String(setup.body.uri ?? "").startsWith("otpauth://totp/"), setup.body.uri);
+      check("2fa: the URI names the issuer and the account", String(setup.body.uri).includes("issuer=requ") && String(setup.body.uri).includes("mika%40example.test"), setup.body.uri);
+      check("2fa: a QR code is rendered server-side", String(setup.body.qrSvg ?? "").startsWith("<svg"), String(setup.body.qrSvg).slice(0, 20));
+      check("2fa: the secret is also offered for manual entry", /^[A-Z2-7 ]+$/.test(setup.body.secret ?? ""), setup.body.secret);
+      const secret = new URL(String(setup.body.uri).replace("otpauth://", "http://")).searchParams.get("secret")!;
+
+      const wrongConfirm = await post("/api/auth/2fa/confirm", { code: "000000" }, cookie);
+      check("2fa: a wrong code does not complete enrolment", wrongConfirm.status === 400, wrongConfirm.body);
+      const stillOff = await getJson(`${h.base}/api/auth/2fa`, { Cookie: cookie });
+      check("2fa: so the account is still un-enrolled", stillOff.body.enrolled === false, stillOff.body);
+
+      const confirmed = await post("/api/auth/2fa/confirm", { code: totpAt(secret, stepFor()) }, cookie);
+      check("2fa: the right code completes enrolment", confirmed.status === 200, confirmed.body);
+      const recoveryCodes: string[] = confirmed.body.recoveryCodes ?? [];
+      check("2fa: ten recovery codes are issued once", recoveryCodes.length === 10, recoveryCodes.length);
+
+      const listed = await getJson(`${h.base}/api/auth/2fa`, { Cookie: cookie });
+      check("2fa: the account now reports enrolled", listed.body.enrolled === true, listed.body);
+      check("2fa: the recovery codes are never listed back", !JSON.stringify(listed.body).includes(recoveryCodes[0]), listed.body);
+
+      // Signing in now takes two steps.
+      const second = await signIn("mika", "mika-secret");
+      check("2fa: the password alone no longer yields a session", !second.cookie, second.cookie);
+      check("2fa: a code is demanded", second.body.twoFactor?.step === "code", second.body.twoFactor);
+      const challenge = second.body.twoFactor?.challenge;
+      check("2fa: a challenge is handed back", typeof challenge === "string" && challenge.length > 0);
+
+      // The pending session is not a credential.
+      const pendingUse = await getJson(`${h.base}/api/auth/me`, { Cookie: `requ_session=${encodeURIComponent(challenge)}` });
+      check("2fa: the pending session authenticates nothing", pendingUse.body.authenticated === false, pendingUse.body);
+      const pendingApi = await getJson(`${h.base}/api/summary?project=${slugFor(root)}`, { Cookie: `requ_session=${encodeURIComponent(challenge)}` });
+      check("2fa: nor does it reach the API", pendingApi.status === 401, pendingApi.status);
+
+      const badCode = await post("/api/auth/2fa/verify", { challenge, code: "123456" });
+      check("2fa: a wrong code is refused", badCode.status === 401, badCode.body);
+      check("2fa: and yields no cookie", !badCode.cookie);
+
+      const reusedEnrolCode = await post("/api/auth/2fa/verify", { challenge, code: totpAt(secret, stepFor()) });
+      check(
+        "2fa: the code spent on enrolment cannot be reused to sign in",
+        reusedEnrolCode.status === 401 && String(reusedEnrolCode.body.error).includes("already been used"),
+        reusedEnrolCode.body,
+      );
+
+      const freshCode = totpAt(secret, stepFor() + 1);
+      const verified = await post("/api/auth/2fa/verify", { challenge, code: freshCode });
+      check("2fa: a fresh code completes the sign-in", verified.status === 200 && Boolean(verified.cookie), verified.body);
+      const me = await getJson(`${h.base}/api/auth/me`, { Cookie: verified.cookie });
+      check("2fa: and the session works", me.body.authenticated === true && me.body.username === "mika", me.body);
+
+      // Replay across sign-ins.
+      const third = await signIn("mika", "mika-secret");
+      const replayed = await post("/api/auth/2fa/verify", { challenge: third.body.twoFactor.challenge, code: freshCode });
+      check("2fa: the same code cannot be replayed on a new sign-in", replayed.status === 401, replayed.body);
+
+      // Recovery codes.
+      const fourth = await signIn("mika", "mika-secret");
+      const viaRecovery = await post("/api/auth/2fa/verify", { challenge: fourth.body.twoFactor.challenge, code: recoveryCodes[0] });
+      check("2fa: a recovery code signs you in", viaRecovery.status === 200 && Boolean(viaRecovery.cookie), viaRecovery.body);
+      check("2fa: and says how many are left", viaRecovery.body.recoveryCodesRemaining === 9, viaRecovery.body);
+      const fifth = await signIn("mika", "mika-secret");
+      const reusedRecovery = await post("/api/auth/2fa/verify", { challenge: fifth.body.twoFactor.challenge, code: recoveryCodes[0] });
+      check("2fa: a recovery code works exactly once", reusedRecovery.status === 401, reusedRecovery.body);
+
+      // An expired or forged challenge is useless.
+      const forged = await post("/api/auth/2fa/verify", { challenge: `${challenge}x`, code: totpAt(secret, stepFor() + 2) });
+      check("2fa: a tampered challenge is refused", forged.status === 401, forged.body);
+
+      // Removing it requires proving possession.
+      const mikaSession = viaRecovery.cookie;
+      const badDisable = await post("/api/auth/2fa/disable", { code: "000000" }, mikaSession);
+      check("2fa: removing it needs a current code", badDisable.status === 401, badDisable.body);
+
+      // The successful removal runs on a second account, because each accepted
+      // code advances the replay watermark and only one step either side of now
+      // is ever accepted — so mika has no unspent step left in this window.
+      const vera = await signIn("vera", "vera-secret");
+      const veraSetup = await post("/api/auth/2fa/setup", {}, vera.cookie);
+      const veraSecret = new URL(String(veraSetup.body.uri).replace("otpauth://", "http://")).searchParams.get("secret")!;
+      await post("/api/auth/2fa/confirm", { code: totpAt(veraSecret, stepFor()) }, vera.cookie);
+      const veraEnrolled = await signIn("vera", "vera-secret");
+      check("2fa: a second account enrols independently", veraEnrolled.body.twoFactor?.step === "code", veraEnrolled.body.twoFactor);
+
+      const disabled = await post("/api/auth/2fa/disable", { code: totpAt(veraSecret, stepFor() + 1) }, vera.cookie);
+      check("2fa: with a current code, it is removed", disabled.status === 200, disabled.body);
+      const afterDisable = await signIn("vera", "vera-secret");
+      check("2fa: and the password alone signs in again", Boolean(afterDisable.cookie), afterDisable.body.twoFactor);
+
+      // A token is its own credential; it does not carry a second factor.
+      const tokenRes = await post("/api/auth/tokens", { name: "ci" }, mikaSession);
+      check("2fa: a token can still be minted", tokenRes.status === 201, tokenRes.body);
+      const viaToken = await getJson(`${h.base}/api/auth/me`, { Authorization: `Bearer ${tokenRes.body.token}` });
+      check("2fa: and keeps working as a credential of its own, with no code", viaToken.body.authenticated === true, viaToken.body);
+
+      // The audit trail records the second factor.
+      const auditRes = await getJson(`${h.base}/api/audit?scope=all&limit=200`, { Cookie: mikaSession });
+      const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
+      check("2fa: enrolment is audited", actions.includes("2fa.enrolled"), actions.slice(0, 12));
+      check("2fa: removal is audited", actions.includes("2fa.disabled"), actions.slice(0, 12));
+      const denials = (auditRes.body.entries ?? []).filter((e: any) => e.outcome === "denied");
+      check("2fa: refused codes are audited", denials.length > 0, denials.slice(0, 3));
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+
+    // --- a policy that requires it ---
+    const strictRoot = path.join(tmp, "tfastrict");
+    await fs.mkdir(strictRoot, { recursive: true });
+    const strictFixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+    const strict = await startHarness([strictRoot], "smoke-auth-2fa-required", {
+      connectMcp: false,
+      env: {
+        REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_AUTH_DB: path.join(tmp, "tfa-strict.db"), REQU_AUDIT: "on",
+        REQU_LDAP_URL: strictFixture.url, REQU_LDAP_ALLOW_PLAINTEXT: "true", REQU_LDAP_BASE_DN: BASE_DN,
+        REQU_LDAP_BIND_DN: SERVICE_DN, REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+        REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+        REQU_LDAP_ROLE_MAP: "requ-maintainers=maintainer",
+        REQU_2FA: "required",
+      },
+    });
+    try {
+      const post = async (p: string, payload: unknown) => {
+        const res = await fetch(`${strict.base}${p}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json().catch(() => ({})), cookie: (res.headers.get("set-cookie") ?? "").split(";")[0] };
+      };
+      const first = await post("/api/auth/login", { username: "mika", password: "mika-secret" });
+      check("2fa required: a user without one gets no session", !first.cookie, first.cookie);
+      check("2fa required: and is sent to enrolment", first.body.twoFactor?.step === "enrol", first.body.twoFactor);
+
+      const challenge = first.body.twoFactor.challenge;
+      const offer = await post("/api/auth/2fa/enrol", { challenge });
+      check("2fa required: enrolment is offered against the challenge", String(offer.body.enrolment?.uri ?? "").startsWith("otpauth://"), offer.body);
+      const secret = new URL(String(offer.body.enrolment.uri).replace("otpauth://", "http://")).searchParams.get("secret")!;
+
+      const wrong = await post("/api/auth/2fa/enrol", { challenge, code: "000000" });
+      check("2fa required: a wrong code does not let them past", wrong.status === 400 && !wrong.cookie, wrong.body);
+
+      const done = await post("/api/auth/2fa/enrol", { challenge, code: totpAt(secret, stepFor()) });
+      check("2fa required: enrolling completes the sign-in", done.status === 200 && Boolean(done.cookie), done.body);
+      check("2fa required: recovery codes are issued at the same time", (done.body.recoveryCodes ?? []).length === 10, done.body.recoveryCodes?.length);
+
+      const statusRes = await getJson(`${strict.base}/api/auth/2fa`, { Cookie: done.cookie });
+      check("2fa required: the account reports it as required", statusRes.body.required === true && statusRes.body.enrolled === true, statusRes.body);
+      const cannotRemove = await fetch(`${strict.base}/api/auth/2fa/disable`, {
+        method: "POST", headers: { "Content-Type": "application/json", Cookie: done.cookie },
+        body: JSON.stringify({ code: totpAt(secret, stepFor() + 1) }),
+      });
+      check("2fa required: it cannot be removed while policy demands it", cannotRemove.status === 403, cannotRemove.status);
+    } finally {
+      await strict.stop();
+      await strictFixture.stop();
+    }
+
+    // --- configuration guards ---
+    const { loadAuthConfig, resetAuthConfig } = await import("../src/auth/config.js");
+    const snap = { ...process.env };
+    const tryCfg = (env: Record<string, string | undefined>): string | null => {
+      for (const [k, v] of Object.entries(env)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      resetAuthConfig();
+      try { loadAuthConfig(); return null; } catch (e) { return (e as Error).message; }
+      finally {
+        for (const k of Object.keys(env)) { if (snap[k] === undefined) delete process.env[k]; else process.env[k] = snap[k]!; }
+        resetAuthConfig();
+      }
+    };
+    check("2fa: an unknown mode is refused", (tryCfg({ REQU_2FA: "maybe" }) ?? "").includes("REQU_2FA"));
+    check(
+      "2fa: it cannot be switched on without authentication",
+      (tryCfg({ REQU_2FA: "required", REQU_AUTH_MODE: "disabled" }) ?? "").includes("REQU_AUTH_MODE=ldap"),
+    );
+    check(
+      "2fa: an unknown role in the required-roles list is refused",
+      (tryCfg({
+        REQU_2FA: "optional", REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET,
+        REQU_LDAP_URL: "ldaps://d", REQU_LDAP_BASE_DN: "dc=x", REQU_2FA_REQUIRED_ROLES: "wizard",
+      }) ?? "").includes("wizard"),
+    );
+    check(
+      "2fa: requiring it for roles while switched off is refused",
+      (tryCfg({ REQU_2FA: "off", REQU_2FA_REQUIRED_ROLES: "admin" }) ?? "").includes("REQU_2FA=off"),
+    );
+  }
+
+  // =========================================================================
   console.log("\n— login throttling —");
   // =========================================================================
   {

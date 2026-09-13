@@ -202,7 +202,22 @@ document.addEventListener('alpine:init', function () {
         // admin:users, which is what keeps the two panels apart.
         globalPermissions: [],
       },
-      login: { username: '', password: '', error: '', busy: false },
+      // `step` drives the sign-in card: password first, then — when the server
+      // says a second factor is owed — either a code or a forced enrolment.
+      login: { username: '', password: '', code: '', error: '', busy: false, step: 'password', challenge: '' },
+
+      // ── Second factor ───────────────────────────────────────────────────────
+      twofa: {
+        available: false, mode: 'off', enrolled: false, required: false,
+        confirmedAt: null, recoveryCodesRemaining: 0,
+      },
+      twofaSetup: null,      // { uri, qrSvg, secret } while enrolling
+      twofaCode: '',
+      twofaError: '',
+      twofaBusy: false,
+      /** Shown once, right after enrolling or reissuing. */
+      recoveryCodes: [],
+      recoveryCopied: false,
 
       accountOpen: false,
       tokens: [],
@@ -405,8 +420,98 @@ document.addEventListener('alpine:init', function () {
           }
           // Never keep the password in the component once it has been used.
           this.login.password = '';
-          await this.loadAuth();
-          if (this.auth.authenticated) await this.bootDashboard();
+
+          // A second factor is still owed: no session cookie was set, and the
+          // challenge is what the next step is submitted against.
+          if (body.twoFactor && body.twoFactor.required) {
+            this.login.challenge = body.twoFactor.challenge;
+            this.login.step = body.twoFactor.step === 'enrol' ? 'enrol' : 'code';
+            if (this.login.step === 'enrol') await this.startForcedEnrolment();
+            return;
+          }
+          await this.afterSignIn();
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        } finally {
+          this.login.busy = false;
+        }
+      },
+
+      async afterSignIn() {
+        this.login.step = 'password';
+        this.login.challenge = '';
+        this.login.code = '';
+        await this.loadAuth();
+        if (this.auth.authenticated) await this.bootDashboard();
+      },
+
+      /** Submit the code from the authenticator app, or a recovery code. */
+      async submitLoginCode() {
+        if (this.login.busy) return;
+        if (!this.login.code.trim()) { this.login.error = 'Enter the code from your authenticator app.'; return; }
+        this.login.busy = true;
+        this.login.error = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge: this.login.challenge, code: this.login.code.trim() }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) {
+            this.login.error = body.error || 'That code was not accepted.';
+            // An expired challenge means starting over from the password.
+            if (body.code === 'BAD_CHALLENGE') this.login.step = 'password';
+            return;
+          }
+          if (body.usedRecoveryCode) {
+            window.alert(
+              'You signed in with a recovery code. ' + body.recoveryCodesRemaining +
+              ' remain — generate a new set from your account page.'
+            );
+          }
+          await this.afterSignIn();
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        } finally {
+          this.login.busy = false;
+        }
+      },
+
+      /** Policy demands a second factor this account does not have yet. */
+      async startForcedEnrolment() {
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/enrol', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge: this.login.challenge }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.login.error = body.error || 'Could not start enrolment.'; return; }
+          this.twofaSetup = body.enrolment;
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        }
+      },
+
+      async confirmForcedEnrolment() {
+        if (this.login.busy) return;
+        this.login.busy = true;
+        this.login.error = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/enrol', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge: this.login.challenge, code: this.login.code.trim() }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.login.error = body.error || 'That code was not accepted.'; return; }
+          this.recoveryCodes = body.recoveryCodes || [];
+          this.twofaSetup = null;
+          await this.afterSignIn();
+          // Shown after the dashboard loads: these cannot be retrieved later.
+          this.accountOpen = true;
         } catch (e) {
           this.login.error = 'Could not reach the server.';
         } finally {
@@ -421,6 +526,124 @@ document.addEventListener('alpine:init', function () {
         window.location.reload();
       },
 
+      // ── Second factor, from the account page ────────────────────────────────
+
+      async loadTwoFactor() {
+        var d = await this._fetch('/api/auth/2fa');
+        if (d) this.twofa = d;
+      },
+
+      async startEnrolment() {
+        this.twofaBusy = true;
+        this.twofaError = '';
+        this.recoveryCodes = [];
+        try {
+          var res = await window.fetch('/api/auth/2fa/setup', { method: 'POST' });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'Could not start enrolment.'; return; }
+          this.twofaSetup = body;
+          this.twofaCode = '';
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        } finally {
+          this.twofaBusy = false;
+        }
+      },
+
+      async confirmEnrolment() {
+        if (this.twofaBusy) return;
+        this.twofaBusy = true;
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: this.twofaCode.trim() }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'That code was not accepted.'; return; }
+          this.recoveryCodes = body.recoveryCodes || [];
+          this.twofaSetup = null;
+          this.twofaCode = '';
+          await this.loadTwoFactor();
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        } finally {
+          this.twofaBusy = false;
+        }
+      },
+
+      cancelEnrolment() {
+        this.twofaSetup = null;
+        this.twofaCode = '';
+        this.twofaError = '';
+      },
+
+      async disableTwoFactor() {
+        var code = window.prompt('Enter a current code from your authenticator to confirm removing it:');
+        if (!code) return;
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/disable', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: code }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'Could not remove it.'; return; }
+          this.recoveryCodes = [];
+          await this.loadTwoFactor();
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        }
+      },
+
+      async reissueRecoveryCodes() {
+        var code = window.prompt('Enter a current code from your authenticator to issue a new set:');
+        if (!code) return;
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/recovery-codes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: code }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'Could not issue new codes.'; return; }
+          this.recoveryCodes = body.recoveryCodes || [];
+          await this.loadTwoFactor();
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        }
+      },
+
+      async copyRecoveryCodes() {
+        try {
+          await navigator.clipboard.writeText(this.recoveryCodes.join('\n'));
+          this.recoveryCopied = true;
+          var self = this;
+          setTimeout(function () { self.recoveryCopied = false; }, 2000);
+        } catch (_) { /* clipboard blocked — they are on screen to select */ }
+      },
+
+      /** Administrator clearing a lost authenticator for someone else. */
+      async resetUserTwoFactor(user) {
+        if (!window.confirm(
+          'Reset two-factor authentication for ' + (user.displayName || user.id) + '?\n\n' +
+          'Their authenticator and recovery codes stop working and every session they have is ended. ' +
+          'Only do this once you are sure who you are talking to.'
+        )) return;
+        this.adminError = '';
+        try {
+          var res = await window.fetch('/api/admin/users/' + encodeURIComponent(user.id) + '/2fa', { method: 'DELETE' });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.adminError = body.error || 'Could not reset it.'; return; }
+          await this.loadAdminUsers();
+        } catch (e) {
+          this.adminError = 'Could not reach the server.';
+        }
+      },
+
       // ── Personal access tokens ──────────────────────────────────────────────
 
       async openAccount() {
@@ -428,7 +651,8 @@ document.addEventListener('alpine:init', function () {
         this.mintedToken = '';
         this.mintedCopied = false;
         this.tokenError = '';
-        await this.loadTokens();
+        this.twofaError = '';
+        await Promise.all([this.loadTokens(), this.loadTwoFactor()]);
       },
 
       async loadTokens() {

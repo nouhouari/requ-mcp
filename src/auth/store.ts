@@ -24,6 +24,7 @@ import type {
   RoleBinding,
   SessionRecord,
   TokenRecord,
+  TotpRecord,
 } from "./types.js";
 
 const now = (): string => new Date().toISOString();
@@ -58,9 +59,21 @@ export interface AuthStore {
   // sessions
   createSession(row: SessionRecord): Promise<void>;
   getSession(id: string): Promise<SessionRecord | null>;
+  /** Promote a session that has passed its second factor. */
+  clearSessionPending(id: string): Promise<boolean>;
   revokeSession(id: string): Promise<boolean>;
   revokeSessionsForUser(userId: string): Promise<number>;
   purgeExpired(before: string): Promise<void>;
+
+  // second factor
+  getTotp(userId: string): Promise<TotpRecord | null>;
+  putTotp(row: TotpRecord): Promise<void>;
+  deleteTotp(userId: string): Promise<boolean>;
+  /** Record the step a code was spent at, so it cannot be replayed. */
+  setTotpLastStep(userId: string, step: number): Promise<void>;
+  setRecoveryHashes(userId: string, hashes: string[]): Promise<void>;
+  /** Users with a confirmed authenticator, for the administration listing. */
+  listTotpUserIds(): Promise<string[]>;
 
   // audit
   appendAudit(entry: AuditEntry): Promise<number | null>;
@@ -136,15 +149,26 @@ const PG_SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id);
   CREATE TABLE IF NOT EXISTS auth_sessions (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    revoked_at TEXT,
-    ip         TEXT,
-    user_agent TEXT
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    revoked_at   TEXT,
+    ip           TEXT,
+    user_agent   TEXT,
+    pending_totp BOOLEAN NOT NULL DEFAULT false
   );
+  -- Added after the sessions table shipped, so existing databases get it here.
+  ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS pending_totp BOOLEAN NOT NULL DEFAULT false;
   CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+  CREATE TABLE IF NOT EXISTS auth_totp (
+    user_id         TEXT PRIMARY KEY,
+    secret_sealed   TEXT NOT NULL,
+    confirmed_at    TEXT,
+    created_at      TEXT NOT NULL,
+    last_step       BIGINT,
+    recovery_hashes JSONB NOT NULL DEFAULT '[]'::jsonb
+  );
   CREATE TABLE IF NOT EXISTS audit_log (
     id         BIGSERIAL PRIMARY KEY,
     at         TEXT NOT NULL,
@@ -326,10 +350,19 @@ class PgAuthStore implements AuthStore {
 
   async createSession(s: SessionRecord): Promise<void> {
     await this.q(
-      `INSERT INTO auth_sessions (id, user_id, created_at, expires_at, revoked_at, ip, user_agent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [s.id, s.userId, s.createdAt, s.expiresAt, s.revokedAt, s.ip, s.userAgent],
+      `INSERT INTO auth_sessions (id, user_id, created_at, expires_at, revoked_at, ip, user_agent, pending_totp)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [s.id, s.userId, s.createdAt, s.expiresAt, s.revokedAt, s.ip, s.userAgent, Boolean(s.pendingTotp)],
     );
+  }
+
+  async clearSessionPending(id: string): Promise<boolean> {
+    const rows = await this.q(
+      `UPDATE auth_sessions SET pending_totp = false
+       WHERE id = $1 AND pending_totp = true AND revoked_at IS NULL RETURNING id`,
+      [id],
+    );
+    return rows.length > 0;
   }
 
   async getSession(id: string): Promise<SessionRecord | null> {
@@ -355,6 +388,50 @@ class PgAuthStore implements AuthStore {
 
   async purgeExpired(before: string): Promise<void> {
     await this.q(`DELETE FROM auth_sessions WHERE expires_at < $1`, [before]);
+  }
+
+  // --- second factor ---
+
+  async getTotp(userId: string): Promise<TotpRecord | null> {
+    const rows = await this.q(`SELECT * FROM auth_totp WHERE user_id = $1`, [userId]);
+    return rows[0] ? pgTotp(rows[0]) : null;
+  }
+
+  async putTotp(row: TotpRecord): Promise<void> {
+    await this.q(
+      `INSERT INTO auth_totp (user_id, secret_sealed, confirmed_at, created_at, last_step, recovery_hashes)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+       ON CONFLICT (user_id) DO UPDATE SET
+         secret_sealed   = EXCLUDED.secret_sealed,
+         confirmed_at    = EXCLUDED.confirmed_at,
+         created_at      = EXCLUDED.created_at,
+         last_step       = EXCLUDED.last_step,
+         recovery_hashes = EXCLUDED.recovery_hashes`,
+      [row.userId, row.secretSealed, row.confirmedAt, row.createdAt, row.lastStep, JSON.stringify(row.recoveryHashes ?? [])],
+    );
+  }
+
+  async deleteTotp(userId: string): Promise<boolean> {
+    const rows = await this.q(`DELETE FROM auth_totp WHERE user_id = $1 RETURNING user_id`, [userId]);
+    return rows.length > 0;
+  }
+
+  async setTotpLastStep(userId: string, step: number): Promise<void> {
+    // GREATEST so a code accepted one step behind cannot lower the watermark
+    // and re-open a step that was already spent.
+    await this.q(
+      `UPDATE auth_totp SET last_step = GREATEST(COALESCE(last_step, -1), $2) WHERE user_id = $1`,
+      [userId, step],
+    );
+  }
+
+  async setRecoveryHashes(userId: string, hashes: string[]): Promise<void> {
+    await this.q(`UPDATE auth_totp SET recovery_hashes = $2::jsonb WHERE user_id = $1`, [userId, JSON.stringify(hashes)]);
+  }
+
+  async listTotpUserIds(): Promise<string[]> {
+    const rows = await this.q(`SELECT user_id FROM auth_totp WHERE confirmed_at IS NOT NULL`);
+    return rows.map((r: any) => r.user_id as string);
   }
 
   // --- audit ---
@@ -490,6 +567,18 @@ function pgSession(r: any): SessionRecord {
     revokedAt: r.revoked_at ?? null,
     ip: r.ip ?? null,
     userAgent: r.user_agent ?? null,
+    pendingTotp: Boolean(r.pending_totp),
+  };
+}
+
+function pgTotp(r: any): TotpRecord {
+  return {
+    userId: r.user_id,
+    secretSealed: r.secret_sealed,
+    confirmedAt: r.confirmed_at ?? null,
+    createdAt: r.created_at,
+    lastStep: r.last_step === null || r.last_step === undefined ? null : Number(r.last_step),
+    recoveryHashes: asJson<string[]>(r.recovery_hashes, []),
   };
 }
 
@@ -567,15 +656,24 @@ const SQLITE_SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id);
   CREATE TABLE IF NOT EXISTS auth_sessions (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    revoked_at TEXT,
-    ip         TEXT,
-    user_agent TEXT
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    revoked_at   TEXT,
+    ip           TEXT,
+    user_agent   TEXT,
+    pending_totp INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+  CREATE TABLE IF NOT EXISTS auth_totp (
+    user_id         TEXT PRIMARY KEY,
+    secret_sealed   TEXT NOT NULL,
+    confirmed_at    TEXT,
+    created_at      TEXT NOT NULL,
+    last_step       INTEGER,
+    recovery_hashes TEXT NOT NULL DEFAULT '[]'
+  );
   CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     at         TEXT NOT NULL,
@@ -748,8 +846,17 @@ class SqliteAuthStore implements AuthStore {
   async createSession(s: SessionRecord): Promise<void> {
     const db = await this.handle();
     db.prepare(
-      `INSERT INTO auth_sessions (id, user_id, created_at, expires_at, revoked_at, ip, user_agent) VALUES (?,?,?,?,?,?,?)`,
-    ).run(s.id, s.userId, s.createdAt, s.expiresAt, s.revokedAt, s.ip, s.userAgent);
+      `INSERT INTO auth_sessions (id, user_id, created_at, expires_at, revoked_at, ip, user_agent, pending_totp)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(s.id, s.userId, s.createdAt, s.expiresAt, s.revokedAt, s.ip, s.userAgent, s.pendingTotp ? 1 : 0);
+  }
+
+  async clearSessionPending(id: string): Promise<boolean> {
+    const db = await this.handle();
+    return (
+      db.prepare(`UPDATE auth_sessions SET pending_totp = 0 WHERE id = ? AND pending_totp = 1 AND revoked_at IS NULL`)
+        .run(id).changes > 0
+    );
   }
 
   async getSession(id: string): Promise<SessionRecord | null> {
@@ -771,6 +878,50 @@ class SqliteAuthStore implements AuthStore {
   async purgeExpired(before: string): Promise<void> {
     const db = await this.handle();
     db.prepare(`DELETE FROM auth_sessions WHERE expires_at < ?`).run(before);
+  }
+
+  // --- second factor ---
+
+  async getTotp(userId: string): Promise<TotpRecord | null> {
+    const db = await this.handle();
+    const r = db.prepare(`SELECT * FROM auth_totp WHERE user_id = ?`).get(userId);
+    return r ? pgTotp(r) : null;
+  }
+
+  async putTotp(row: TotpRecord): Promise<void> {
+    const db = await this.handle();
+    db.prepare(
+      `INSERT INTO auth_totp (user_id, secret_sealed, confirmed_at, created_at, last_step, recovery_hashes)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         secret_sealed   = excluded.secret_sealed,
+         confirmed_at    = excluded.confirmed_at,
+         created_at      = excluded.created_at,
+         last_step       = excluded.last_step,
+         recovery_hashes = excluded.recovery_hashes`,
+    ).run(row.userId, row.secretSealed, row.confirmedAt, row.createdAt, row.lastStep, JSON.stringify(row.recoveryHashes ?? []));
+  }
+
+  async deleteTotp(userId: string): Promise<boolean> {
+    const db = await this.handle();
+    return db.prepare(`DELETE FROM auth_totp WHERE user_id = ?`).run(userId).changes > 0;
+  }
+
+  async setTotpLastStep(userId: string, step: number): Promise<void> {
+    const db = await this.handle();
+    // MAX so a code accepted one step behind cannot lower the watermark and
+    // re-open a step that was already spent.
+    db.prepare(`UPDATE auth_totp SET last_step = MAX(COALESCE(last_step, -1), ?) WHERE user_id = ?`).run(step, userId);
+  }
+
+  async setRecoveryHashes(userId: string, hashes: string[]): Promise<void> {
+    const db = await this.handle();
+    db.prepare(`UPDATE auth_totp SET recovery_hashes = ? WHERE user_id = ?`).run(JSON.stringify(hashes), userId);
+  }
+
+  async listTotpUserIds(): Promise<string[]> {
+    const db = await this.handle();
+    return db.prepare(`SELECT user_id FROM auth_totp WHERE confirmed_at IS NOT NULL`).all().map((r: any) => r.user_id as string);
   }
 
   // --- audit ---

@@ -46,6 +46,30 @@ All notable changes to this project will be documented here.
   DN-template direct bind, LDAPS over a generated certificate, and the full
   sign-in → session → token → MCP round trip.
 
+- **Two-factor authentication (TOTP).** `REQU_2FA=optional|required` adds a
+  second factor from an authenticator app. **Microsoft Authenticator** enrols
+  requ as a standard TOTP account — its push approval is proprietary to Entra ID
+  and closed to third parties — and the same QR code works with Google
+  Authenticator, 1Password and anything else that reads `otpauth://`.
+  `REQU_2FA_REQUIRED_ROLES=admin` requires it only for the roles that matter.
+
+  Signing in becomes two steps, with a *pending* session in between that
+  authenticates nothing. Codes are single-use (the spent time step is recorded,
+  so a code cannot be replayed inside its own window), attempts are throttled on
+  the same counters as the password, and the TOTP seed — the one secret that
+  cannot be hashed, since verification needs it back — is encrypted at rest with
+  AES-256-GCM under a key derived from `REQU_AUTH_SECRET`.
+
+  Ten single-use recovery codes are issued once at enrolment for a lost phone;
+  an administrator can reset an enrolment from the **Access** tab, which also
+  ends that user's sessions. Access tokens are unaffected: they are a credential
+  of their own and there is no phone behind an MCP client.
+
+  The TOTP implementation is written directly on `node:crypto` — no dependency —
+  and is checked against every published RFC 4226 and RFC 6238 test vector,
+  including the beyond-2³²-seconds case that catches a 32-bit counter overflow.
+  See [Two-factor authentication](README.md#two-factor-authentication).
+
 - **Project membership.** Roles already resolved per project; there is now a way
   to manage them. The **Access** tab's *Members* panel — and
   `GET|POST /api/projects/:slug/members`, `DELETE …/members/:userId` — adds

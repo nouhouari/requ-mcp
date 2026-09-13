@@ -9,7 +9,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { authConfig } from "./config.js";
-import { clearSessionCookie, serializeSessionCookie } from "./cookies.js";
+import { clearSessionCookie, serializeSessionCookie, signSessionId, verifySessionCookie } from "./cookies.js";
 import { canInScope, clientIp, login, logout, principalInScope, userIdFor } from "./authenticate.js";
 import { checkLdapConnection } from "./ldap.js";
 import {
@@ -28,6 +28,7 @@ import { clearLoginFailures, loginRetryAfterMs, recordLoginFailure } from "./thr
 import { mintToken, tokenDisplayPrefix } from "./tokens.js";
 import type { AuditOutcome, AuditSource, TokenRecord } from "./types.js";
 import { audit, auditSync } from "../audit.js";
+import * as twoFactor from "./two-factor.js";
 
 const now = (): string => new Date().toISOString();
 
@@ -141,6 +142,7 @@ export async function handleAuthRoutes(
       rolePermissions: ROLE_PERMISSIONS,
       // A development server says so out loud, so nobody mistakes an open
       // instance for a secured one.
+      twoFactor: cfg.twoFactor,
       warning: cfg.enabled ? null : "Authentication is disabled: every caller has full access.",
     });
     return true;
@@ -193,30 +195,44 @@ export async function handleAuthRoutes(
         bindings,
         projectId: ctx.projectSlug,
       });
-      await auditLogin(username, "ok", ip, { roles });
-      send(
-        res,
-        200,
-        {
-          user: {
-            userId: result.user.id,
-            username: result.user.username,
-            displayName: result.user.displayName,
-            email: result.user.email,
-            groups: result.user.groups,
+      await auditLogin(username, "ok", ip, { roles, secondFactor: result.secondFactor });
+
+      const identity = {
+        user: {
+          userId: result.user.id,
+          username: result.user.username,
+          displayName: result.user.displayName,
+          email: result.user.email,
+          groups: result.user.groups,
+        },
+        roles,
+        roleSources: sources,
+        expiresAt: result.session.expiresAt,
+      };
+
+      // A second factor is still owed: the signed session id goes back as a
+      // *challenge*, not as a cookie. It authenticates nothing until the code
+      // is verified, so a stolen challenge is worth no more than the password.
+      if (result.secondFactor !== "none") {
+        send(res, 200, {
+          ...identity,
+          twoFactor: {
+            required: true,
+            // "code" — they have an app; "enrol" — policy says they need one.
+            step: result.secondFactor,
+            challenge: result.cookieValue,
           },
-          roles,
-          roleSources: sources,
-          expiresAt: result.session.expiresAt,
-        },
-        {
-          "Set-Cookie": serializeSessionCookie(result.cookieValue, {
-            name: cfg.cookieName,
-            secure: cfg.cookieSecure,
-            maxAgeSeconds: cfg.sessionTtlHours * 3600,
-          }),
-        },
-      );
+        });
+        return true;
+      }
+
+      send(res, 200, { ...identity, twoFactor: { required: false } }, {
+        "Set-Cookie": serializeSessionCookie(result.cookieValue, {
+          name: cfg.cookieName,
+          secure: cfg.cookieSecure,
+          maxAgeSeconds: cfg.sessionTtlHours * 3600,
+        }),
+      });
     } catch (err) {
       const message = (err as Error).message;
       const invalid = (err as { invalidCredentials?: boolean }).invalidCredentials === true;
@@ -272,6 +288,23 @@ export async function handleAuthRoutes(
     return true;
   }
 
+  // -------------------------------------------------------------------------
+  // Second factor — the half of sign-in that happens after the password
+  // -------------------------------------------------------------------------
+  //
+  // These two are reached with a *challenge* rather than a session, because the
+  // caller has no usable session yet. The challenge is the signed id of a
+  // session marked pending; verifying the code is what promotes it.
+
+  if (pathname === "/api/auth/2fa/verify" && m === "POST") {
+    await handlePendingStep(req, res, cfg, "verify");
+    return true;
+  }
+  if (pathname === "/api/auth/2fa/enrol" && m === "POST") {
+    await handlePendingStep(req, res, cfg, "enrol");
+    return true;
+  }
+
   // Everything below needs an identified caller.
   const principal = ctx.principal;
   if (!principal) {
@@ -284,6 +317,98 @@ export async function handleAuthRoutes(
       return true;
     }
     return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // Second factor — self-service, for a caller who is already signed in
+  // -------------------------------------------------------------------------
+
+  if (pathname.startsWith("/api/auth/2fa")) {
+    const me = await authStore().getUser(principal.userId);
+    if (!me) {
+      fail(res, 401, "Your account no longer exists.");
+      return true;
+    }
+
+    // A token is a credential of its own; it is not a browser and has no
+    // authenticator to prompt. Enrolment is a deliberate act by a person.
+    if (principal.kind === "token" && m !== "GET") {
+      fail(res, 403, "Manage two-factor authentication from the dashboard, not with an access token.", "SESSION_REQUIRED");
+      return true;
+    }
+
+    const withCode = async (): Promise<string | null> => {
+      const payload = await body(req);
+      return str(payload.code);
+    };
+
+    try {
+      // --- GET /api/auth/2fa — is it available, am I enrolled, must I be?
+      if (pathname === "/api/auth/2fa" && m === "GET") {
+        send(res, 200, await twoFactor.status(me));
+        return true;
+      }
+
+      // --- POST /api/auth/2fa/setup — a new secret plus the QR to scan
+      if (pathname === "/api/auth/2fa/setup" && m === "POST") {
+        const offer = await twoFactor.begin(me);
+        audit({ action: "2fa.setup", outcome: "ok", source: "web" });
+        send(res, 200, offer);
+        return true;
+      }
+
+      // --- POST /api/auth/2fa/confirm { code } — finish, and take the recovery codes
+      if (pathname === "/api/auth/2fa/confirm" && m === "POST") {
+        const code = await withCode();
+        if (!code) {
+          fail(res, 400, "Enter the 6-digit code from your authenticator app.");
+          return true;
+        }
+        const { recoveryCodes } = await twoFactor.confirm(me.id, code);
+        audit({ action: "2fa.enrolled", outcome: "ok", source: "web" });
+        send(res, 200, { ok: true, recoveryCodes });
+        return true;
+      }
+
+      // --- POST /api/auth/2fa/disable { code }
+      if (pathname === "/api/auth/2fa/disable" && m === "POST") {
+        const code = await withCode();
+        if (!code) {
+          fail(res, 400, "Enter a current code to confirm it is you.");
+          return true;
+        }
+        await twoFactor.disable(me.id, code);
+        audit({ action: "2fa.disabled", outcome: "ok", source: "web" });
+        send(res, 200, { ok: true });
+        return true;
+      }
+
+      // --- POST /api/auth/2fa/recovery-codes { code } — reissue
+      if (pathname === "/api/auth/2fa/recovery-codes" && m === "POST") {
+        const code = await withCode();
+        if (!code) {
+          fail(res, 400, "Enter a current code to confirm it is you.");
+          return true;
+        }
+        const recoveryCodes = await twoFactor.regenerateRecoveryCodes(me.id, code);
+        audit({ action: "2fa.recovery-codes.reissued", outcome: "ok", source: "web" });
+        send(res, 200, { recoveryCodes });
+        return true;
+      }
+
+      fail(res, 404, "Unknown two-factor route.");
+      return true;
+    } catch (e) {
+      const err = e as twoFactor.TwoFactorError;
+      audit({
+        action: `2fa:${pathname}`,
+        outcome: "denied",
+        source: "web",
+        detail: { reason: err.message, code: err.code },
+      });
+      fail(res, typeof err.status === "number" ? err.status : 400, err.message, err.code);
+      return true;
+    }
   }
 
   // --- GET /api/auth/tokens — the caller's own tokens
@@ -518,12 +643,18 @@ export async function handleAuthRoutes(
     // --- GET /api/admin/users
     if (pathname === "/api/admin/users" && m === "GET") {
       const store = authStore();
-      const [users, bindings] = await Promise.all([store.listUsers(), store.listBindings()]);
+      const [users, bindings, enrolled] = await Promise.all([
+        store.listUsers(),
+        store.listBindings(),
+        store.listTotpUserIds(),
+      ]);
+      const withFactor = new Set(enrolled);
       send(
         res,
         200,
         users.map((u) => ({
           ...u,
+          twoFactorEnrolled: withFactor.has(u.id),
           bindings: bindings.filter((b) => b.userId === u.id),
           effectiveRoles: resolveRoles({
             cfg,
@@ -638,6 +769,28 @@ export async function handleAuthRoutes(
       return true;
     }
 
+    // --- DELETE /api/admin/users/:id/2fa — reset a lost authenticator
+    //
+    // For the person who lost their phone *and* their recovery codes. Under a
+    // `required` policy this does not leave them unprotected: their next sign-in
+    // walks straight back into enrolment.
+    const resetMatch = /^\/api\/admin\/users\/([^/]+)\/2fa$/.exec(pathname);
+    if (resetMatch && m === "DELETE") {
+      const target = userIdFor(decodeURIComponent(resetMatch[1]));
+      const removed = await twoFactor.adminReset(target);
+      // End their sessions too: a reset is what you do when an account may be
+      // compromised, and leaving live sessions open would defeat it.
+      await authStore().revokeSessionsForUser(target);
+      audit({
+        action: "admin:2fa.reset",
+        outcome: "ok",
+        source: "web",
+        detail: { userId: target, removed },
+      });
+      send(res, 200, { ok: true, removed });
+      return true;
+    }
+
     // --- GET /api/admin/tokens — every token on the server
     if (pathname === "/api/admin/tokens" && m === "GET") {
       const tokens = await authStore().listAllTokens();
@@ -670,6 +823,115 @@ export async function handleAuthRoutes(
   }
 
   return false;
+}
+
+/**
+ * The second half of sign-in, reached with a challenge rather than a session.
+ *
+ * `verify` takes a code from the authenticator (or a recovery code) and
+ * promotes the pending session. `enrol` is the forced-enrolment path: a user
+ * the policy obliges to hold a factor sets one up here, and confirming it
+ * promotes the session in the same step.
+ *
+ * Both are throttled on the same counters as the password, because a six-digit
+ * code is a million guesses — trivially brute-forced if a caller may keep
+ * trying.
+ */
+async function handlePendingStep(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cfg: ReturnType<typeof authConfig>,
+  step: "verify" | "enrol",
+): Promise<void> {
+  let payload: Record<string, unknown>;
+  try {
+    payload = await body(req);
+  } catch (e) {
+    fail(res, 400, (e as Error).message);
+    return;
+  }
+
+  const challenge = str(payload.challenge);
+  if (!challenge) {
+    fail(res, 400, "`challenge` is required — sign in with your password first.", "NO_CHALLENGE");
+    return;
+  }
+  const sessionId = verifySessionCookie(challenge, cfg.secret);
+  if (!sessionId) {
+    fail(res, 401, "That sign-in has expired. Start again.", "BAD_CHALLENGE");
+    return;
+  }
+
+  const store = authStore();
+  const session = await store.getSession(sessionId);
+  if (!session || session.revokedAt || session.expiresAt < now()) {
+    fail(res, 401, "That sign-in has expired. Start again.", "BAD_CHALLENGE");
+    return;
+  }
+  if (!session.pendingTotp) {
+    fail(res, 400, "This sign-in is already complete.", "NOT_PENDING");
+    return;
+  }
+
+  const user = await store.getUser(session.userId);
+  if (!user || user.disabled) {
+    fail(res, 403, "This account is not available.", "ACCOUNT_UNAVAILABLE");
+    return;
+  }
+
+  const ip = clientIp(req);
+  const waitMs = loginRetryAfterMs(user.username, ip);
+  if (waitMs > 0) {
+    const seconds = Math.ceil(waitMs / 1000);
+    await auditLogin(user.username, "denied", ip, { reason: "throttled", stage: `2fa:${step}` });
+    res.setHeader("Retry-After", String(seconds));
+    fail(res, 429, `Too many attempts. Try again in ${seconds} second${seconds === 1 ? "" : "s"}.`, "THROTTLED");
+    return;
+  }
+
+  const completeSignIn = async (detail: Record<string, unknown>) => {
+    await store.clearSessionPending(sessionId);
+    clearLoginFailures(user.username, ip);
+    await auditLogin(user.username, "ok", ip, { stage: `2fa:${step}`, ...detail });
+    return serializeSessionCookie(signSessionId(sessionId, cfg.secret), {
+      name: cfg.cookieName,
+      secure: cfg.cookieSecure,
+      maxAgeSeconds: cfg.sessionTtlHours * 3600,
+    });
+  };
+
+  try {
+    if (step === "verify") {
+      const code = str(payload.code);
+      if (!code) {
+        fail(res, 400, "Enter the code from your authenticator app.");
+        return;
+      }
+      const outcome = await twoFactor.verify(user.id, code);
+      const cookie = await completeSignIn({ usedRecoveryCode: outcome.usedRecoveryCode });
+      send(res, 200, { ok: true, ...outcome }, { "Set-Cookie": cookie });
+      return;
+    }
+
+    // enrol: either hand out a fresh secret, or confirm the one just scanned.
+    const code = str(payload.code);
+    if (!code) {
+      const offer = await twoFactor.begin(user);
+      send(res, 200, { enrolment: offer });
+      return;
+    }
+    const { recoveryCodes } = await twoFactor.confirm(user.id, code);
+    const cookie = await completeSignIn({ enrolled: true });
+    send(res, 200, { ok: true, recoveryCodes }, { "Set-Cookie": cookie });
+  } catch (e) {
+    const err = e as twoFactor.TwoFactorError;
+    const status = typeof err.status === "number" ? err.status : 400;
+    // Only a wrong code counts towards the throttle; a misconfiguration is the
+    // server's problem and must not lock the user out on top of it.
+    if (err.code === "BAD_CODE") recordLoginFailure(user.username, ip);
+    await auditLogin(user.username, "denied", ip, { stage: `2fa:${step}`, reason: err.message });
+    fail(res, status, err.message, err.code);
+  }
 }
 
 /**

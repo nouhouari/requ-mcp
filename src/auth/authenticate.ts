@@ -8,7 +8,7 @@
  */
 
 import type { IncomingMessage } from "node:http";
-import { authConfig } from "./config.js";
+import { authConfig, type AuthConfig } from "./config.js";
 import { authenticateLdap, LdapError } from "./ldap.js";
 import {
   buildPrincipal,
@@ -46,7 +46,27 @@ export type LoginResult = {
   session: SessionRecord;
   /** Value to put in the session cookie (already signed). */
   cookieValue: string;
+  /**
+   * What still stands between the caller and a usable session.
+   *
+   *  none    — the cookie is live, sign-in is complete;
+   *  code    — they have an authenticator; a code must be verified;
+   *  enrol   — policy requires a second factor they have not set up yet.
+   *
+   * For anything but `none` the caller gets the signed session id as a
+   * *challenge* rather than as a cookie: the password has been proven and
+   * nothing else, and the session authenticates no request until the factor is
+   * satisfied.
+   */
+  secondFactor: "none" | "code" | "enrol";
 };
+
+/** Whether policy obliges this user to hold a second factor. */
+export function twoFactorRequiredFor(cfg: AuthConfig, roles: readonly Role[]): boolean {
+  if (cfg.twoFactor === "off") return false;
+  if (cfg.twoFactor === "required") return true;
+  return cfg.twoFactorRequiredRoles.some((r) => roles.includes(r));
+}
 
 export class LoginError extends Error {
   /** True when the directory rejected the credentials rather than failing. */
@@ -117,6 +137,21 @@ export async function login(
     );
   }
 
+  // Which second factor, if any, this sign-in still owes. Roles are resolved
+  // across every project the user can reach, so "administrators must use 2FA"
+  // covers someone who is an administrator of one project.
+  const everyRole = new Set<Role>(globalRoles);
+  for (const b of bindings) everyRole.add(b.role);
+  const enrolment = await store.getTotp(id);
+  const hasFactor = Boolean(enrolment?.confirmedAt);
+  const mustHaveFactor = twoFactorRequiredFor(cfg, [...everyRole]);
+
+  let secondFactor: LoginResult["secondFactor"] = "none";
+  if (cfg.twoFactor !== "off") {
+    if (hasFactor) secondFactor = "code";
+    else if (mustHaveFactor) secondFactor = "enrol";
+  }
+
   const createdAt = now();
   const session: SessionRecord = {
     id: newSessionId(),
@@ -126,13 +161,14 @@ export async function login(
     revokedAt: null,
     ip: meta.ip,
     userAgent: meta.userAgent,
+    pendingTotp: secondFactor !== "none",
   };
   await store.createSession(session);
   // Opportunistic housekeeping; a failure here must not fail the login.
   store.purgeExpired(new Date(Date.now() - 7 * 86_400_000).toISOString()).catch(() => {});
 
   const { signSessionId } = await import("./cookies.js");
-  return { user, session, cookieValue: signSessionId(session.id, cfg.secret) };
+  return { user, session, cookieValue: signSessionId(session.id, cfg.secret), secondFactor };
 }
 
 export async function logout(sessionId: string): Promise<boolean> {
@@ -313,6 +349,11 @@ export async function authenticateRequest(
     if (!session) return { ok: false, reason: "Session not found. Please sign in again.", status: 401 };
     if (session.revokedAt) return { ok: false, reason: "Session ended. Please sign in again.", status: 401 };
     if (session.expiresAt < now()) return { ok: false, reason: "Session expired. Please sign in again.", status: 401 };
+    // The password was proven, the second factor was not. Such a session is a
+    // challenge handle, never a credential.
+    if (session.pendingTotp) {
+      return { ok: false, reason: "Two-factor authentication is not complete.", status: 401 };
+    }
     const user = await store.getUser(session.userId);
     if (!user) return { ok: false, reason: "Your account no longer exists.", status: 401 };
     if (user.disabled) return { ok: false, reason: "Your account is disabled.", status: 403 };

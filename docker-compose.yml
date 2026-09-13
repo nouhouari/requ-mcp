@@ -56,6 +56,9 @@ services:
       REQU_LDAP_ROLE_MAP: ${REQU_LDAP_ROLE_MAP:-}
       REQU_LDAP_TLS_REJECT_UNAUTHORIZED: ${REQU_LDAP_TLS_REJECT_UNAUTHORIZED:-true}
       REQU_LDAP_ALLOW_PLAINTEXT: ${REQU_LDAP_ALLOW_PLAINTEXT:-}
+      REQU_2FA: ${REQU_2FA:-off}
+      REQU_2FA_REQUIRED_ROLES: ${REQU_2FA_REQUIRED_ROLES:-}
+      REQU_2FA_ISSUER: ${REQU_2FA_ISSUER:-}
     volumes:
       # requ-mcp reads Conductor feature files, mockups and reports from its OWN
       # filesystem. Without this the server cannot see any project's files and

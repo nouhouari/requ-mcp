@@ -92,6 +92,39 @@ flushed once, so a tool that writes five entities costs one insert.
 Both tables live in requ's own database — PostgreSQL when configured, SQLite
 otherwise — so the audit trail is not a separate operational concern.
 
+### The second factor is TOTP, and the seed is the one thing encrypted
+
+"2FA with Microsoft Authenticator" resolves to TOTP (RFC 6238): the app's
+push-approval flow is proprietary to Entra ID and not open to third-party
+applications. That turns out to be the better outcome — the same QR code enrols
+Google Authenticator, 1Password, Authy and the rest, so the choice of
+authenticator stays with the person rather than with this decision.
+
+The algorithm is written on `node:crypto` rather than taken from npm. TOTP is an
+HMAC plus a truncation rule; it is short enough to read in one sitting, and it is
+verified here against every published RFC 4226 and RFC 6238 vector — including
+the row past 2³² seconds, which is what catches a counter written with a 32-bit
+shift. That is more assurance than a dependency's version range offers, for less
+supply-chain surface.
+
+Two consequences shaped the rest:
+
+- **A TOTP seed cannot be hashed.** Verifying a code needs the seed back, so
+  unlike passwords and tokens it can only be encrypted. It is sealed with
+  AES-256-GCM under a key derived from `REQU_AUTH_SECRET` by HKDF, so a database
+  dump alone yields no working second factors, and a rotated secret degrades to
+  "enrol again" rather than to a crash.
+- **A half-finished sign-in needs somewhere to live.** Rather than invent a
+  second token type, the password step creates an ordinary session marked
+  `pending_totp`, and hands back its signed id as a challenge instead of setting
+  a cookie. It inherits expiry, revocation and the audit trail for free, and
+  `authenticateRequest` refuses it outright — so a stolen challenge is worth no
+  more than the password it came from.
+
+Codes are spent, not merely checked: the time step a code belongs to is recorded
+and anything at or below it is refused, because a code that stays valid for its
+whole 30-second window is replayable by anyone who reads it over a shoulder.
+
 ### Scope is part of the question, not part of the answer
 
 Roles resolve per project, so a principal arrives at a handler already carrying

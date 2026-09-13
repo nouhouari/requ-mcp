@@ -75,6 +75,10 @@ const ROUTE_PERMISSIONS: Array<{ method: string; pattern: RegExp; permission: Pe
 const PUBLIC_ROUTES: Array<{ method: string; pattern: RegExp }> = [
   { method: "GET",  pattern: /^\/api\/auth\/config$/ },
   { method: "POST", pattern: /^\/api\/auth\/login$/ },
+  // The second half of sign-in: the caller holds a challenge, not a session,
+  // so there is no principal to check a permission against yet.
+  { method: "POST", pattern: /^\/api\/auth\/2fa\/verify$/ },
+  { method: "POST", pattern: /^\/api\/auth\/2fa\/enrol$/ },
   { method: "POST", pattern: /^\/api\/auth\/logout$/ },
   { method: "GET",  pattern: /^\/api\/auth\/me$/ },
   { method: "GET",  pattern: /^\/api\/version$/ },
@@ -97,6 +101,9 @@ export function permissionForRoute(method: string, pathname: string): Permission
   const m = method.toUpperCase();
   if (isPublicRoute(m, pathname)) return null;
   if (/^\/api\/auth\/tokens(\/|$)/.test(pathname)) return null;
+  // Managing your own second factor is part of being signed in, not a
+  // permission someone grants you; the handler enforces that it is your own.
+  if (/^\/api\/auth\/2fa(\/|$)/.test(pathname)) return null;
   // Membership routes authorise themselves against the project named in the
   // URL. A blanket check here could only ask about the project the *request*
   // was authenticated for, which is a different question.

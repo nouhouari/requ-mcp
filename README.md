@@ -330,6 +330,54 @@ always evaluated in the global scope, so holding `admin` on one project never
 adds up to holding it everywhere. The last administrator of a project also
 cannot remove themselves, since that would leave a project nobody can administer.
 
+### Two-factor authentication
+
+A password and a code from an authenticator app. Off by default; one variable
+turns it on:
+
+```bash
+REQU_2FA=optional     # anyone may enrol
+REQU_2FA=required     # everyone must — sign-in leads to enrolment until they have
+REQU_2FA_REQUIRED_ROLES=admin   # or: anyone may, administrators must
+```
+
+**Microsoft Authenticator** enrols requ as a standard **TOTP** account (RFC
+6238) — its push-approval flow is proprietary to Entra ID and not available to
+third-party applications, so TOTP is what "2FA with Microsoft Authenticator"
+means here. In the app: **+ → Other account (Google, Facebook, etc.)**, then
+scan the QR code requ shows under *Account → Two-factor authentication*. The same
+code works with Google Authenticator, 1Password, Authy or anything else that
+reads `otpauth://`, so nobody is forced onto one vendor.
+
+Once enrolled, signing in takes two steps: the password proves who you are, and
+the code proves you still have the phone. Between the two the server holds a
+*pending* session that authenticates nothing — a stolen half-finished sign-in is
+worth no more than the password alone.
+
+What the implementation guards against:
+
+- **Replay** — each code is spent: the time step it belongs to is recorded, and
+  a code from that step or earlier is refused even inside its 30-second window.
+- **Brute force** — a six-digit code is a million guesses, so attempts are
+  throttled on the same per-user and per-address counters as the password.
+- **A stolen database** — the TOTP seed is the one secret that cannot be hashed,
+  because verifying a code needs it back. It is encrypted with AES-256-GCM under
+  a key derived from `REQU_AUTH_SECRET`, which lives in the environment, not the
+  database.
+- **Clock drift** — one step either side of now is accepted (±30s), which covers
+  a phone that is slightly out without meaningfully widening the window.
+
+**Recovery codes.** Ten are issued once, at enrolment, and shown exactly once —
+only their hashes are stored. Each works a single time. Someone who loses their
+phone signs in with one of these; if they have lost those too, an administrator
+can reset the enrolment from the **Access** tab (which also ends that user's
+sessions, since a reset is what you do when an account may be compromised).
+
+**Access tokens are unaffected.** A token is already a credential of its own and
+there is no phone to prompt behind an MCP client, so tokens keep working without
+a code — the same way they do on GitHub. Enrolling and removing a second factor
+requires a browser session, not a token.
+
 ### Access tokens for MCP clients
 
 An MCP client cannot fill in a login form, so each user mints **personal access

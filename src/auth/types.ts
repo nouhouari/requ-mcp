@@ -49,6 +49,29 @@ export type SessionRecord = {
   revokedAt: string | null;
   ip: string | null;
   userAgent: string | null;
+  /**
+   * True while the session is waiting on a second factor. The password has been
+   * proven, nothing else has: such a session authenticates no request, and is
+   * the handle the code is submitted against.
+   */
+  pendingTotp: boolean;
+};
+
+/** One user's enrolled authenticator. */
+export type TotpRecord = {
+  userId: string;
+  /** The TOTP seed, encrypted at rest — see secret-box.ts. */
+  secretSealed: string;
+  /** Null until the first correct code proves the app was really enrolled. */
+  confirmedAt: string | null;
+  createdAt: string;
+  /**
+   * Highest time step already spent, so a code cannot be used twice within its
+   * validity window.
+   */
+  lastStep: number | null;
+  /** Hashes of the unused recovery codes. */
+  recoveryHashes: string[];
 };
 
 export type AuditOutcome = "ok" | "denied" | "error";

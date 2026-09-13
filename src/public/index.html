@@ -38,7 +38,8 @@
       </div>
       <p class="text-sm text-slate-500 mb-6">Sign in with your directory account.</p>
 
-      <form @submit.prevent="doLogin()" class="space-y-4">
+      <!-- Step 1 — password -->
+      <form x-show="login.step === 'password'" @submit.prevent="doLogin()" class="space-y-4">
         <div>
           <label for="login-username" class="block text-xs font-medium text-slate-600 mb-1">Username</label>
           <input id="login-username" type="text" x-model="login.username" autocomplete="username" autofocus required
@@ -56,7 +57,59 @@
                 x-text="login.busy ? 'Signing in…' : 'Sign in'"></button>
       </form>
 
-      <p class="mt-6 text-[11px] text-slate-400 leading-relaxed">
+      <!-- Step 2a — the code from the authenticator -->
+      <form x-show="login.step === 'code'" x-cloak @submit.prevent="submitLoginCode()" class="space-y-4">
+        <p class="text-sm text-slate-600">
+          Open your authenticator app and enter the 6-digit code for
+          <span class="font-medium" x-text="login.username"></span>.
+        </p>
+        <div>
+          <label for="login-code" class="block text-xs font-medium text-slate-600 mb-1">Verification code</label>
+          <input id="login-code" type="text" x-model="login.code" inputmode="numeric" autocomplete="one-time-code"
+                 maxlength="14" placeholder="000000" autofocus
+                 class="w-full px-3 py-2 text-lg tracking-[0.3em] text-center font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+        </div>
+        <p x-show="login.error" x-cloak role="alert"
+           class="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2" x-text="login.error"></p>
+        <button type="submit" :disabled="login.busy"
+                class="w-full btn-primary text-sm py-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                x-text="login.busy ? 'Checking…' : 'Verify'"></button>
+        <p class="text-[11px] text-slate-400 leading-relaxed">
+          Lost your phone? Enter one of your recovery codes instead — each works once.
+        </p>
+        <button type="button" @click="login.step = 'password'; login.code = ''; login.error = ''"
+                class="w-full text-xs text-slate-500 hover:text-slate-700">Back</button>
+      </form>
+
+      <!-- Step 2b — this server requires a second factor and there is none yet -->
+      <form x-show="login.step === 'enrol'" x-cloak @submit.prevent="confirmForcedEnrolment()" class="space-y-4">
+        <p class="text-sm text-slate-600">
+          This server requires two-factor authentication. Scan this with
+          <span class="font-medium">Microsoft Authenticator</span> — or any authenticator app — then enter the code it shows.
+        </p>
+        <div x-show="twofaSetup" x-cloak class="flex justify-center">
+          <div class="w-44 h-44 [&>svg]:w-full [&>svg]:h-full" x-html="twofaSetup ? twofaSetup.qrSvg : ''"></div>
+        </div>
+        <details x-show="twofaSetup" x-cloak class="text-xs text-slate-500">
+          <summary class="cursor-pointer">Can't scan it?</summary>
+          <p class="mt-2">In the app choose <em>Add account → Other account</em>, then type this key:</p>
+          <code class="block mt-1 font-mono text-[11px] bg-slate-50 border border-slate-200 rounded p-2 break-all"
+                x-text="twofaSetup ? twofaSetup.secret : ''"></code>
+        </details>
+        <div>
+          <label for="enrol-code" class="block text-xs font-medium text-slate-600 mb-1">Code from the app</label>
+          <input id="enrol-code" type="text" x-model="login.code" inputmode="numeric" autocomplete="one-time-code"
+                 maxlength="6" placeholder="000000"
+                 class="w-full px-3 py-2 text-lg tracking-[0.3em] text-center font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+        </div>
+        <p x-show="login.error" x-cloak role="alert"
+           class="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2" x-text="login.error"></p>
+        <button type="submit" :disabled="login.busy"
+                class="w-full btn-primary text-sm py-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                x-text="login.busy ? 'Checking…' : 'Activate and sign in'"></button>
+      </form>
+
+      <p x-show="login.step === 'password'" class="mt-6 text-[11px] text-slate-400 leading-relaxed">
         Authentication is handled by your organisation's LDAP directory. requ never stores your password —
         only the groups the directory reports, which decide what you may do.
       </p>
@@ -2439,6 +2492,7 @@
                   <th scope="col">Effective roles</th>
                   <th scope="col">Explicit grants</th>
                   <th scope="col">Directory groups</th>
+                  <th scope="col">2FA</th>
                   <th scope="col">Last sign-in</th>
                   <th scope="col">Status</th>
                 </tr>
@@ -2471,6 +2525,16 @@
                     </td>
                     <td class="text-xs text-slate-500 max-w-xs truncate" :title="(u.groups || []).join(', ')"
                         x-text="(u.groups || []).length ? (u.groups || []).length + ' group(s)' : '—'"></td>
+                    <td>
+                      <template x-if="u.twoFactorEnrolled">
+                        <button class="chip chip-green hover:bg-red-100 hover:text-red-700 transition-colors"
+                                @click="resetUserTwoFactor(u)"
+                                title="Reset this authenticator — for someone who lost their phone and their recovery codes">on</button>
+                      </template>
+                      <template x-if="!u.twoFactorEnrolled">
+                        <span class="chip chip-slate" title="No authenticator enrolled">off</span>
+                      </template>
+                    </td>
                     <td class="text-xs text-slate-500" x-text="u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : '—'"></td>
                     <td>
                       <button class="chip"
@@ -2937,6 +3001,86 @@
           </div>
           <p x-show="auth.groups.length" x-cloak class="mt-2 text-xs text-slate-400"
              x-text="'Directory groups: ' + auth.groups.join(', ')"></p>
+        </div>
+
+        <!-- Second factor -->
+        <div x-show="twofa.available" x-cloak>
+          <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Two-factor authentication</h3>
+
+          <div class="flex items-center gap-2 mb-2">
+            <span class="chip" :class="twofa.enrolled ? 'chip-green' : (twofa.required ? 'chip-red' : 'chip-slate')"
+                  x-text="twofa.enrolled ? 'enabled' : (twofa.required ? 'required — not set up' : 'not set up')"></span>
+            <span x-show="twofa.enrolled" x-cloak class="text-xs text-slate-400"
+                  x-text="'since ' + (twofa.confirmedAt ? new Date(twofa.confirmedAt).toLocaleDateString() : '')"></span>
+            <span x-show="twofa.enrolled" x-cloak class="text-xs text-slate-400"
+                  x-text="'· ' + twofa.recoveryCodesRemaining + ' recovery codes left'"></span>
+          </div>
+
+          <p x-show="twofaError" x-cloak role="alert" class="text-xs text-red-700 mb-2" x-text="twofaError"></p>
+
+          <!-- Not enrolled, not currently enrolling -->
+          <div x-show="!twofa.enrolled && !twofaSetup" x-cloak>
+            <p class="text-xs text-slate-500 mb-3">
+              Protect your account with a code from Microsoft Authenticator, Google Authenticator, 1Password
+              or any other authenticator app.
+            </p>
+            <button @click="startEnrolment()" :disabled="twofaBusy" class="btn-primary text-xs disabled:opacity-60"
+                    x-text="twofaBusy ? 'Preparing…' : 'Set up two-factor authentication'"></button>
+          </div>
+
+          <!-- Enrolling: scan, then confirm -->
+          <div x-show="twofaSetup" x-cloak class="rounded-lg border border-indigo-200 bg-indigo-50 p-4">
+            <p class="text-xs text-indigo-900 mb-3">
+              In <span class="font-semibold">Microsoft Authenticator</span>, tap
+              <em>+ → Other account (Google, Facebook, etc.)</em> and scan this code.
+            </p>
+            <div class="flex flex-col sm:flex-row gap-4 items-start">
+              <div class="w-40 h-40 shrink-0 bg-white rounded border border-indigo-200 p-1 [&>svg]:w-full [&>svg]:h-full"
+                   x-html="twofaSetup ? twofaSetup.qrSvg : ''"></div>
+              <div class="flex-1 min-w-0">
+                <p class="text-xs text-indigo-900 mb-1">Or type this key in by hand:</p>
+                <code class="block font-mono text-[11px] bg-white border border-indigo-200 rounded p-2 break-all mb-3"
+                      x-text="twofaSetup ? twofaSetup.secret : ''"></code>
+                <label for="twofa-confirm" class="block text-xs font-medium text-indigo-900 mb-1">
+                  Then enter the 6-digit code it shows
+                </label>
+                <div class="flex gap-2">
+                  <input id="twofa-confirm" type="text" x-model="twofaCode" inputmode="numeric" maxlength="6"
+                         autocomplete="one-time-code" placeholder="000000"
+                         @keydown.enter="confirmEnrolment()"
+                         class="filter-select font-mono tracking-widest text-center" style="width:120px;">
+                  <button @click="confirmEnrolment()" :disabled="twofaBusy" class="btn-primary text-xs disabled:opacity-60"
+                          x-text="twofaBusy ? 'Checking…' : 'Activate'"></button>
+                  <button @click="cancelEnrolment()" class="btn-secondary text-xs">Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Enrolled -->
+          <div x-show="twofa.enrolled && !twofaSetup" x-cloak class="flex flex-wrap gap-2">
+            <button @click="reissueRecoveryCodes()" class="btn-secondary text-xs">New recovery codes</button>
+            <button x-show="!twofa.required" @click="disableTwoFactor()"
+                    class="text-xs text-red-600 hover:text-red-800 transition-colors px-2">Remove authenticator</button>
+            <span x-show="twofa.required" x-cloak class="text-xs text-slate-400 self-center">
+              Required for your account, so it cannot be removed.
+            </span>
+          </div>
+
+          <!-- Recovery codes, shown once -->
+          <div x-show="recoveryCodes.length" x-cloak class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-4">
+            <p class="text-xs font-semibold text-amber-900 mb-2">
+              Save these recovery codes somewhere safe — they are shown once, and each works a single time.
+              They are the only way back in if you lose your phone.
+            </p>
+            <div class="grid grid-cols-2 sm:grid-cols-3 gap-1 mb-3">
+              <template x-for="rc in recoveryCodes" :key="rc">
+                <code class="font-mono text-[11px] bg-white border border-amber-200 rounded px-2 py-1 text-center" x-text="rc"></code>
+              </template>
+            </div>
+            <button @click="copyRecoveryCodes()" class="btn-secondary text-xs"
+                    x-text="recoveryCopied ? 'Copied' : 'Copy all'"></button>
+          </div>
         </div>
 
         <!-- The token that was just minted, shown once -->
