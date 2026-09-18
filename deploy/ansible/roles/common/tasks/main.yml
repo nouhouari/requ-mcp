@@ -1,0 +1,58 @@
+---
+- name: Install the baseline packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# Security updates only (Ubuntu's default origin list), no automatic reboot:
+# a kernel update on the database host is a planned event. Docker's own apt
+# repository is not in that list, so docker-ce moves only when this playbook
+# runs.
+- name: Turn on unattended security upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+- name: Point time sync at the corporate NTP servers
+  ansible.builtin.template:
+    src: timesyncd.conf.j2
+    dest: /etc/systemd/timesyncd.conf.d/requ.conf
+    mode: "0644"
+  when: ntp_servers | length > 0
+  notify: Restart systemd-timesyncd
+
+- name: Make sure the timesyncd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/timesyncd.conf.d
+    state: directory
+    mode: "0755"
+  when: ntp_servers | length > 0
+
+- name: Keep time synchronised
+  ansible.builtin.systemd_service:
+    name: systemd-timesyncd
+    enabled: true
+    state: started
+  failed_when: false
+
+- name: Is an SSH server installed
+  ansible.builtin.stat:
+    path: /etc/ssh/sshd_config
+  register: sshd_config
+
+- name: Refuse SSH passwords and root logins
+  when: sshd_config.stat.exists
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?{{ item.key }}\\s"
+    line: "{{ item.key }} {{ item.value }}"
+    validate: /usr/sbin/sshd -t -f %s
+  loop:
+    - { key: PasswordAuthentication, value: "{{ 'yes' if common_ssh_password_auth else 'no' }}" }
+    - { key: PermitRootLogin, value: "no" }
+  notify: Restart sshd

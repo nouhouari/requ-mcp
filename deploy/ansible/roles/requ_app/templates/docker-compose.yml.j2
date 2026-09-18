@@ -1,0 +1,79 @@
+# Rendered by Ansible (requ deployment) — do not edit on the host; change the
+# inventory and re-run `ansible-playbook site.yml --tags requ`.
+#
+# Derived from deploy/docker-compose.yml in the repository, with the database
+# on the data volume, the authentication settings in requ.env, and the LDAPS
+# CA chain mounted when one is configured.
+#
+# Hand operations from {{ requ_app_dir }}:
+#   docker compose ps / logs -f requ
+#   docker compose exec -T postgres pg_dump -U "$PG_USER" "$PG_DB" > requ.sql
+
+name: requ
+
+services:
+  postgres:
+    image: {{ postgres_image }}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DB}
+    volumes:
+      - {{ requ_data_mount }}/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  requ:
+    image: ${REQU_IMAGE}:${REQU_TAG}
+{% if requ_image_build | bool %}
+    build:
+      context: {{ requ_src_dir }}
+      dockerfile: Dockerfile
+{% endif %}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${REQU_BIND}:${REQU_PORT}:8788"
+    env_file:
+      - ./requ.env
+    environment:
+      REQU_HOST: 0.0.0.0
+      REQU_PORT: 8788
+      REQU_PG_URL: postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/${PG_DB}
+{% if requ_ldap_ca_present %}
+      NODE_EXTRA_CA_CERTS: /etc/ssl/requ/ldap-ca.pem
+{% endif %}
+    volumes:
+      # requ reads Conductor feature files, mockups and reports from its OWN
+      # filesystem. Projects must record paths as the container sees them
+      # (/workspace/<repo>/...). Read-only: requ never writes into your repos.
+      - ${REQU_WORKSPACE_DIR}:/workspace:ro
+{% if requ_ldap_ca_present %}
+      - ./certs/ldap-ca.pem:/etc/ssl/requ/ldap-ca.pem:ro
+{% endif %}
+    # The image runs as the unprivileged `node` user and writes nothing when
+    # Postgres is the store, so the root filesystem can be read-only.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8788/api/version >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    logging: *logging

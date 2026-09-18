@@ -74,6 +74,13 @@ Without `REQU_PG_URL` the server uses SQLite and takes its projects from
 *creation* requires Postgres.
 </details>
 
+### Deploying to a server
+
+For a real deployment — an Ubuntu VM on OpenStack running the published image
+next to PostgreSQL on a block volume, behind your reverse proxy, signing in
+against Active Directory — see [deploy/ansible/README.md](deploy/ansible/README.md).
+One playbook provisions the VM, configures it, and verifies the result.
+
 ## Web Dashboard
 
 The same server that answers MCP calls also serves a web dashboard, so there is
@@ -98,6 +105,8 @@ when running under Docker Compose).
 | **Coverage** | Phase + mode selector (Cumulative / Strict), summary stats, per-component breakdown, and gaps (reqs without story / stories without scenarios / stories not covered) |
 | **Components** | Card grid of components showing description, domain tags, requirement count, and verified percentage |
 | **VCS** | Table of VCS refs (branches and MRs/PRs) linked to stories and requirements, with state badges and external links |
+| **Audit** | Recent specification changes with their field-level diffs, and the audit log of every tool call and API request — denials included. Needs `audit:read`; see [Authentication](#authentication-roles-and-the-audit-trail) |
+| **Access** | *Members* — who can reach this project, with what role, and where that role came from; add, change and remove (project admins). *Roles* — what each role allows, as a permission checklist, for the shared catalogue and the project's own. Plus server-wide user and grant administration (server admins only) |
 | **Decisions** | Architecture decisions (ADRs) with status badges and their requirement/component links; open one to read the record with its mermaid diagrams rendered |
 | **Versions** | Specification baselines: the version history with lock state, parent and audit trail, plus a side-by-side comparison of any two versions showing additions, removals and field-level changes |
 
@@ -229,6 +238,342 @@ one full set of rows per baseline (see
 [Versions](#versions--lockable-specification-baselines)). Executions, scenarios
 and VCS refs are *not* versioned — they are progress, kept in a single namespace
 and tagged with the version they were produced against.
+
+## Authentication, roles and the audit trail
+
+Out of the box requ-mcp is **open**: there is no login, every caller is an
+admin, and that is deliberate — a development instance should not need a
+directory to start. Production is a single environment variable away.
+
+```bash
+REQU_AUTH_MODE=disabled   # default — no login, full access, no credentials
+REQU_AUTH_MODE=ldap       # users sign in against your directory
+```
+
+### Signing in
+
+In `ldap` mode the dashboard opens on a sign-in form and nothing else loads until
+a session exists. requ binds to the directory as the user to prove the password,
+reads their display name, mail and groups, and never stores the password.
+
+The minimum a deployment needs:
+
+```bash
+REQU_AUTH_MODE=ldap
+REQU_AUTH_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+REQU_LDAP_URL=ldaps://ldap.example.com:636
+REQU_LDAP_BASE_DN=dc=example,dc=com
+REQU_LDAP_ROLE_MAP='requ-admins=admin;requ-leads=maintainer;requ-devs=contributor'
+REQU_AUTH_ADMINS=alice          # a way in before any group mapping exists
+```
+
+`REQU_AUTH_SECRET` signs session cookies and peppers stored token hashes.
+Changing it signs everyone out and invalidates every access token, so keep it
+with your other secrets. Every setting is listed in
+[`.env.example`](.env.example); Docker Compose passes them all through.
+
+### Permissions and roles
+
+Permissions are split by entity, and checked identically for an MCP tool call
+and for the REST endpoint that does the same thing:
+
+| Group | Permission | What holding it allows |
+|---|---|---|
+| Reading | `spec:read` | Requirements, stories, screens, scenarios, coverage, decisions |
+| | `history:read` | What changed on an entity, and who changed it |
+| | `audit:read` | The server-wide audit log, refusals included |
+| Specification | `requirement:write` | Create, change and remove requirements; assign them to phases |
+| | `story:write` | User stories and their acceptance criteria |
+| | `scenario:write` | The cucumber scenarios that verify a story |
+| | `screen:write` | UI specifications, and their links to stories |
+| | `adr:write` | Architecture decision records |
+| | `component:write` | The component breakdown |
+| | `phase:write` | Phases, and which one is active |
+| Delivery | `execution:write` | Scenario runs, by hand or from a cucumber report |
+| | `vcs:write` | Branch and merge-request links |
+| Lifecycle | `version:manage` | Create, lock, unlock and activate baselines |
+| | `project:manage` | Create a project; edit its configuration and brief |
+| | `project:export` | Take a full export |
+| | `project:import` | Import over the project's data |
+| Administration | `project:members` | Who can reach *this* project, and the roles it defines |
+| | `admin:users` | Server-wide grants, shared roles, accounts, everyone's tokens |
+
+The split is what lets a role mean something in the language of the team: a QA
+engineer owns `scenario:write` and `execution:write` without `requirement:write`,
+so they write and run the tests for a requirement they cannot quietly rewrite —
+and an analyst has exactly the opposite.
+
+**A role is a named set of those permissions, stored in the database**, so the
+roles a deployment has are its own. Eight are seeded on first boot:
+
+| Role | For |
+|---|---|
+| `viewer` | Reads the specification and its history. Changes nothing. |
+| `contributor` | Reads everything and reports delivery progress, but does not change scope. |
+| `maintainer` | Edits the whole specification and manages versions. |
+| `admin` | Everything, including who may reach the project. |
+| `product-owner` | Scope and release planning: requirements, stories, phases, baselines. Writes no tests. |
+| `requirements-analyst` | Writes the specification. Does not freeze a baseline or report on delivery. |
+| `qa` | Owns verification: writes scenarios and records their results. |
+| `developer` | Implements stories: scenarios, runs, branches and merge requests. |
+
+All eight can be **edited** — what QA may do in your team is yours to decide —
+but not deleted, because grants, access tokens and `REQU_LDAP_ROLE_MAP` entries
+point at them by id. For the same reason, no role's id ever changes.
+
+#### Defining your own
+
+The **Access** tab's *Roles* card is a permission checklist; the same thing over
+the API:
+
+```jsonc
+// POST /api/roles                              — shared with every project
+// POST /api/projects/<slug>/roles              — this project's own
+{
+  "name": "Release Manager",
+  "description": "Cuts and freezes the baselines.",
+  "permissions": ["spec:read", "history:read", "version:manage", "project:export"]
+}
+// → 201 { "id": "release-manager", ... }   PATCH to edit, DELETE to remove
+```
+
+Two scopes. A **shared** role is defined once and assignable anywhere: editing it
+changes what it means everywhere it is already granted. A **project** role
+belongs to one project, and one that reuses a shared role's id replaces it there
+and nowhere else — which is how "QA means something different on this project"
+gets said. A project's own role may not name `admin:users`: a project cannot
+confer it, and a role listing a permission it does not grant is a lie the next
+reader has to discover for themselves.
+
+> **You cannot give away what you do not have.** Defining, editing, deleting or
+> assigning a role is refused if it would hand out a permission the caller does
+> not hold in that scope. Without that rule, "define your project's own roles"
+> would be a complete bypass of everything else. Editing checks only the
+> permissions being *added*, so an administrator whose own rights were narrowed
+> can still take permissions away from a role. Deleting one that people still
+> hold needs `?force=true`, which revokes those grants rather than leaving them
+> pointing at nothing.
+
+A user's roles come from three places, unioned:
+
+1. `REQU_AUTH_ADMINS` — usernames that are always admin;
+2. `REQU_LDAP_ROLE_MAP` — directory group → role, so the directory stays the
+   source of truth for who is on the team. Groups match on either the bare name
+   (`requ-leads`) or the full DN, and the role may be any role id, including one
+   you defined;
+3. explicit grants — either on one project (the **Access** tab's members panel,
+   see below) or server-wide.
+
+Anyone matched by none of them gets `REQU_AUTH_DEFAULT_ROLE` (viewer), or is
+refused the sign-in when that is set to `none`. Role ids in the configuration are
+checked for shape at boot and against the catalogue once the database is
+reachable; one that names no role is warned about on startup rather than
+refused, since a deployment may wire up its directory before defining its roles.
+
+### Adding people to a project
+
+Roles resolve **per project**, so the same person can be a maintainer on one and
+a viewer on another. The **Access** tab's *Members* panel is where that is
+decided — add someone by their directory username, pick their role, and they
+have it on that project and nowhere else:
+
+```jsonc
+// POST /api/projects/<slug>/members
+{ "username": "jdupont", "role": "maintainer" }
+```
+
+They do **not** need to have signed in first. The grant waits for them, they show
+as *invited*, and their real name, mail and groups are filled in from the
+directory the first time they sign in. Someone whose only role is on one project
+can still sign in — they simply see that project.
+
+The panel lists everyone who can reach the project and **where each role came
+from**: granted here, inherited from a directory group, granted server-wide, or
+handed out by `REQU_AUTH_DEFAULT_ROLE`. Only the first is editable — removing a
+member drops the grant made on this project and says so if they still reach it
+another way, rather than offering a button that could not work.
+
+Two scopes, kept apart deliberately:
+
+| | granted by | can do |
+|---|---|---|
+| **Project admin** — `admin` on one project | that project's admins | manage that project's members; nothing elsewhere |
+| **Server admin** — `admin` globally (`REQU_AUTH_ADMINS`, a mapped group, or a server-wide grant) | server admins | everything above, plus server-wide grants, disabling accounts, and every token |
+
+A project's admin genuinely cannot reach past it: server-wide administration is
+always evaluated in the global scope, so holding `admin` on one project never
+adds up to holding it everywhere. The last administrator of a project also
+cannot remove themselves, since that would leave a project nobody can administer.
+
+### Two-factor authentication
+
+A password and a code from an authenticator app. Off by default; one variable
+turns it on:
+
+```bash
+REQU_2FA=optional     # anyone may enrol
+REQU_2FA=required     # everyone must — sign-in leads to enrolment until they have
+REQU_2FA_REQUIRED_ROLES=admin   # or: anyone may, administrators must
+```
+
+**Microsoft Authenticator** enrols requ as a standard **TOTP** account (RFC
+6238) — its push-approval flow is proprietary to Entra ID and not available to
+third-party applications, so TOTP is what "2FA with Microsoft Authenticator"
+means here. In the app: **+ → Other account (Google, Facebook, etc.)**, then
+scan the QR code requ shows under *Account → Two-factor authentication*. The same
+code works with Google Authenticator, 1Password, Authy or anything else that
+reads `otpauth://`, so nobody is forced onto one vendor.
+
+Once enrolled, signing in takes two steps: the password proves who you are, and
+the code proves you still have the phone. Between the two the server holds a
+*pending* session that authenticates nothing — a stolen half-finished sign-in is
+worth no more than the password alone.
+
+What the implementation guards against:
+
+- **Replay** — each code is spent: the time step it belongs to is recorded, and
+  a code from that step or earlier is refused even inside its 30-second window.
+- **Brute force** — a six-digit code is a million guesses, so attempts are
+  throttled on the same per-user and per-address counters as the password.
+- **A stolen database** — the TOTP seed is the one secret that cannot be hashed,
+  because verifying a code needs it back. It is encrypted with AES-256-GCM under
+  a key derived from `REQU_AUTH_SECRET`, which lives in the environment, not the
+  database.
+- **Clock drift** — one step either side of now is accepted (±30s), which covers
+  a phone that is slightly out without meaningfully widening the window.
+
+**Recovery codes.** Ten are issued once, at enrolment, and shown exactly once —
+only their hashes are stored. Each works a single time. Someone who loses their
+phone signs in with one of these; if they have lost those too, an administrator
+can reset the enrolment from the **Access** tab (which also ends that user's
+sessions, since a reset is what you do when an account may be compromised).
+
+**Access tokens are unaffected.** A token is already a credential of its own and
+there is no phone to prompt behind an MCP client, so tokens keep working without
+a code — the same way they do on GitHub. Enrolling and removing a second factor
+requires a browser session, not a token.
+
+### Access tokens for MCP clients
+
+An MCP client cannot fill in a login form, so each user mints **personal access
+tokens** from the dashboard (the avatar in the header → *New access token*).
+The token is shown exactly once — only a peppered SHA-256 of it is stored — along
+with the client configuration to paste:
+
+```json
+{
+  "mcpServers": {
+    "requ": {
+      "type": "http",
+      "url": "https://requ.example.com/mcp",
+      "headers": { "Authorization": "Bearer requ_pat_…" }
+    }
+  }
+}
+```
+
+A token acts as its owner and can be narrowed further:
+
+- **capped at a role** — a `qa` token for a CI job gets what its owner and the
+  `qa` role *both* allow, so a maintainer's token can record test results
+  without being able to rewrite the requirements, and gains nothing if its owner
+  is later promoted. Capping is an intersection rather than a ceiling on a
+  ladder: with roles a team defines for itself there is no "at or below", since
+  nothing says whether QA outranks a requirements analyst;
+- **limited to projects** — refused on anything else;
+- **expiring** — after `expiresInDays`, or `REQU_AUTH_TOKEN_TTL_DAYS` by default.
+
+Revoking a token takes effect on the next call. Give each client its own so one
+can be revoked without disturbing the others.
+
+### Audit log and change history
+
+`REQU_AUDIT` (`auto` by default: on whenever authentication is on) records two
+different things, both on the dashboard's **Audit** tab:
+
+- **Audit log** — one row per tool call or API request: who, when, from where
+  (MCP or dashboard), which project and version, and the outcome. **Refused
+  calls are recorded too**, with the permission that was missing, which is what
+  makes the log useful for answering "who tried to do that?". Filter by actor,
+  action, outcome, source, or across every project at once.
+- **Change history** — "what changed on REQ-014?", the way an issue tracker
+  shows it: one entry per write with the fields that actually differed, old
+  value beside new, attributed to a person. Open it from the **History** button
+  on a requirement or story, or from any entry in *Recent changes*.
+
+Both are produced centrally — the tool dispatcher audits, and the store is
+wrapped by a recorder that diffs every write — so an edit is recorded the same
+way whether it came from an agent over MCP or from a person in the dashboard,
+and a tool added later is covered without being told to.
+
+The tables live wherever requ's own data does: in PostgreSQL when `REQU_PG_URL`
+is set, otherwise in a SQLite file (`REQU_AUTH_DB`, default `~/.requ/auth.db`)
+so a laptop still keeps its history across restarts.
+
+### Hardening
+
+Two settings decide what the server believes about where a request came from,
+and both default to the strict reading:
+
+```bash
+REQU_TRUSTED_PROXIES=10.0.0.5,::1          # peers whose X-Forwarded-For is believed
+REQU_CORS_ORIGINS=https://tools.example.com # browser origins allowed to call the API
+```
+
+- **`REQU_TRUSTED_PROXIES`** — the login throttle and the audit trail key on the
+  caller's address. `X-Forwarded-For` is only honoured when the socket peer is
+  one of these addresses; from anyone else it is ignored, so a caller cannot
+  pick a fresh address per attempt or lock a colleague's real address out.
+  Leave it empty when requ is reached directly.
+- **`REQU_CORS_ORIGINS`** — by default no CORS headers are sent: the dashboard is
+  same-origin and MCP clients are not browsers. List origins to let a page on
+  one of them drive the REST API with a token, or `*` for the old wildcard.
+  Credentials are never allowed, so the session cookie stays same-origin either
+  way.
+
+Beyond those, every response carries `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: SAMEORIGIN` and `Referrer-Policy: same-origin`, plus
+`Strict-Transport-Security` whenever the session cookie is `Secure`. The
+dashboard shell is served with a Content Security Policy that limits scripts to
+this server and the pinned jsDelivr files, with no inline scripts; the CDN tags
+carry Subresource Integrity hashes, and Tailwind is compiled at build time
+(`npm run build:css`) rather than in the browser. `/mcp` accepts access tokens
+only — never the dashboard cookie — so a session taken over through the browser
+cannot reach the tools. Unexpected failures answer with a reference id and put
+the real error in the server log, not in the response.
+
+`npm run smoke:auth` pins each of these so a regression fails CI: the project a
+request is authorised for must be the project served, every write route must
+have an explicit permission entry, the shell must carry its policy headers, the
+throttle must ignore a spoofed address, and cross-origin access must be opt-in.
+
+### Testing against a directory
+
+`npm run smoke:auth` runs a **real LDAP server in the test process**
+([`scripts/lib/ldap-fixture.ts`](scripts/lib/ldap-fixture.ts)), so the bind path
+is covered in CI with no container and no network: correct and wrong passwords,
+unknown users, filter-injection attempts, `memberOf` versus group-tree
+discovery, a DN-template direct bind, LDAPS over a generated self-signed
+certificate, and the whole sign-in → session → token → MCP round trip.
+
+To try requ against your own directory before rolling it out, point it at a
+staging server and use the health check:
+
+```bash
+REQU_AUTH_MODE=ldap REQU_AUTH_SECRET=… REQU_LDAP_URL=ldaps://… \
+REQU_LDAP_BASE_DN=dc=example,dc=com npm start
+
+curl -s localhost:8788/api/admin/ldap-check   # as an admin: reachable? bind ok?
+```
+
+`GET /api/admin/ldap-check` binds with the service account and performs one
+search, so a wrong URL, a bad service password or an unreachable host surfaces
+before anyone tries to log in. The **Access** tab shows the same result.
+
+If you would rather not point at a live directory at all, any throwaway LDAP
+server works — `docker run -p 389:389 -e LDAP_ORGANISATION=Example \
+-e LDAP_DOMAIN=example.com -e LDAP_ADMIN_PASSWORD=secret osixia/openldap` is the
+usual one — with `REQU_LDAP_ALLOW_PLAINTEXT=true` while it is plaintext.
 
 ## Tools
 

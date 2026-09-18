@@ -1,0 +1,1872 @@
+/**
+ * End-to-end smoke test for authentication, RBAC, the audit log and the
+ * per-entity change history.
+ *
+ * Two servers are driven:
+ *
+ *  1. **auth off, audit on** — the development posture. Everything still works
+ *     without credentials, and every write is still recorded, so a laptop keeps
+ *     a usable "what changed" history.
+ *  2. **auth on (ldap mode)** — the production posture. Unauthenticated calls
+ *     are refused on both the MCP endpoint and the REST API; personal access
+ *     tokens carry a role; a viewer may read but not write; a maintainer may
+ *     write; revoking a token takes effect immediately.
+ *
+ * No directory is needed: the suite seeds users and tokens straight into the
+ * auth store the server reads, which is exactly what a successful LDAP bind
+ * would have produced. The LDAP bind itself is exercised only for its failure
+ * path, where an unreachable directory must produce a clean error rather than a
+ * stack trace.
+ */
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { startHarness, slugFor, repoRoot } from "./lib/http-harness.js";
+import type { AuthConfig } from "../src/auth/config.js";
+import {
+  BASE_DN,
+  GROUP_BASE_DN,
+  SERVICE_DN,
+  SERVICE_PASSWORD,
+  startLdapFixture,
+  USERS,
+  type FixtureOptions,
+} from "./lib/ldap-fixture.js";
+
+let passed = 0;
+let failed = 0;
+function check(label: string, cond: boolean, detail?: unknown) {
+  if (cond) {
+    passed++;
+    console.log(`  ✓ ${label}`);
+  } else {
+    failed++;
+    console.error(`  ✗ ${label}`, detail !== undefined ? JSON.stringify(detail) : "");
+  }
+}
+
+const SECRET = "smoke-secret-smoke-secret-smoke-secret-0123456789";
+
+/** Seed a user and mint a token directly in the auth store the server reads. */
+async function seed(
+  authDb: string,
+  user: { id: string; groups: string[] },
+  token: { name: string; maxRole?: "viewer" | "contributor" | "maintainer" | "admin" | null; projects?: string[] | null },
+): Promise<string> {
+  // Point the modules at the same database and secret the server uses.
+  process.env.REQU_AUTH_DB = authDb;
+  process.env.REQU_AUTH_SECRET = SECRET;
+  process.env.REQU_AUTH_MODE = "disabled"; // the seeder itself does not authenticate
+  const { resetAuthConfig } = await import("../src/auth/config.js");
+  const { authStore, setAuthStore } = await import("../src/auth/store.js");
+  resetAuthConfig();
+  setAuthStore(null);
+
+  const store = authStore();
+  await store.init();
+  await store.upsertUser({
+    id: user.id,
+    username: user.id,
+    displayName: user.id,
+    email: `${user.id}@example.test`,
+    dn: `uid=${user.id},ou=people,dc=example,dc=test`,
+    groups: user.groups,
+    disabled: false,
+    lastLoginAt: new Date().toISOString(),
+  });
+
+  const { mintToken } = await import("../src/auth/tokens.js");
+  const minted = mintToken(SECRET);
+  await store.createToken({
+    id: minted.id,
+    userId: user.id,
+    name: token.name,
+    tokenHash: minted.hash,
+    createdAt: new Date().toISOString(),
+    expiresAt: null,
+    lastUsedAt: null,
+    revokedAt: null,
+    revokedBy: null,
+    maxRole: token.maxRole ?? null,
+    projects: token.projects ?? null,
+    // `tokenHash` is carried alongside the record; the type demands both.
+  } as any);
+  return minted.plaintext;
+}
+
+async function revokeSeededToken(authDb: string, plaintext: string): Promise<void> {
+  process.env.REQU_AUTH_DB = authDb;
+  const { authStore, setAuthStore } = await import("../src/auth/store.js");
+  const { parseToken } = await import("../src/auth/tokens.js");
+  setAuthStore(null);
+  const parsed = parseToken(plaintext)!;
+  await authStore().revokeToken(parsed.id, "smoke");
+}
+
+async function getJson(url: string, headers: Record<string, string> = {}): Promise<{ status: number; body: any }> {
+  const res = await fetch(url, { headers });
+  const text = await res.text();
+  let body: any = text;
+  try { body = JSON.parse(text); } catch { /* not json */ }
+  return { status: res.status, body };
+}
+
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "requ-auth-"));
+
+  // =========================================================================
+  console.log("\n— development mode: auth off, audit on —");
+  // =========================================================================
+  {
+    const root = path.join(tmp, "devproj");
+    await fs.mkdir(root, { recursive: true });
+    const authDb = path.join(tmp, "dev-auth.db");
+    const h = await startHarness([root], "smoke-auth-dev", {
+      env: { REQU_AUTH_MODE: "disabled", REQU_AUDIT: "on", REQU_AUTH_DB: authDb },
+    });
+    const slug = slugFor(root);
+    try {
+      const cfg = await getJson(`${h.base}/api/auth/config`);
+      check("auth config reports disabled", cfg.body.enabled === false && cfg.body.mode === "disabled", cfg.body);
+      check("auth config warns that the server is open", typeof cfg.body.warning === "string", cfg.body.warning);
+
+      const me = await getJson(`${h.base}/api/auth/me`);
+      check("/api/auth/me reports the development principal", me.body.authenticated === true && me.body.kind === "anonymous", me.body);
+      check("development principal is an admin", Array.isArray(me.body.roles) && me.body.roles.includes("admin"), me.body.roles);
+
+      check("no credentials needed to read", (await getJson(`${h.base}/api/version`)).status === 200);
+
+      const init = await h.call("init_project", { name: "Dev Project", initialPhase: "v1.0", force: true });
+      check("init_project works without credentials", !init.isError, init.data);
+
+      const created = await h.call("create_requirement", { title: "Audited requirement", priority: "high" });
+      check("create_requirement works without credentials", !created.isError, created.data);
+      const reqId = created.data?.id;
+
+      const updated = await h.call("update_requirement", { id: reqId, title: "Renamed requirement", priority: "critical" });
+      check("update_requirement succeeds", !updated.isError, updated.data);
+
+      // Change history — the Jira-style record.
+      const hist = await getJson(`${h.base}/api/history/requirement/${encodeURIComponent(reqId)}?project=${slug}`);
+      check("entity history is readable", hist.status === 200 && hist.body.enabled === true, hist.body);
+      const changes = hist.body.changes ?? [];
+      check("history has a creation and an update", changes.length >= 2, changes.map((c: any) => c.action));
+      check("newest history entry is the update", changes[0]?.action === "updated", changes[0]);
+      const titleChange = (changes[0]?.changes ?? []).find((c: any) => c.field === "title");
+      check(
+        "the title change records both sides",
+        titleChange?.from === "Audited requirement" && titleChange?.to === "Renamed requirement",
+        titleChange,
+      );
+      check(
+        "updatedAt is not reported as a change",
+        !(changes[0]?.changes ?? []).some((c: any) => c.field === "updatedAt"),
+        changes[0]?.changes,
+      );
+      check("the change names an actor", typeof changes[0]?.actorId === "string" && changes[0].actorId.length > 0, changes[0]?.actorId);
+      check("the change records its source", changes[0]?.source === "mcp", changes[0]?.source);
+
+      // Project-wide history stream.
+      const stream = await getJson(`${h.base}/api/history?project=${slug}`);
+      check("project history stream is readable", stream.status === 200 && (stream.body.changes ?? []).length >= 2, stream.body.total);
+
+      // Audit log.
+      const auditRes = await getJson(`${h.base}/api/audit?project=${slug}&limit=200`);
+      check("audit log is readable", auditRes.status === 200 && auditRes.body.enabled === true, auditRes.body);
+      const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
+      check("audit recorded the tool calls", actions.includes("create_requirement") && actions.includes("update_requirement"), actions.slice(0, 10));
+      const createEntry = (auditRes.body.entries ?? []).find((e: any) => e.action === "create_requirement");
+      check("audit entry carries the outcome", createEntry?.outcome === "ok", createEntry);
+      check("audit entry carries the permission checked", createEntry?.permission === "requirement:write", createEntry?.permission);
+      check("audit entry carries the project", createEntry?.projectId === slug, createEntry?.projectId);
+      check("audit entry summarises the arguments", createEntry?.detail?.title === "Audited requirement", createEntry?.detail);
+
+      // A REST write is recorded the same way as an MCP call.
+      const restRes = await fetch(`${h.base}/api/config?project=${slug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ brief: "Updated over REST" }),
+      });
+      check("REST config update succeeds", restRes.ok, restRes.status);
+      const afterRest = await getJson(`${h.base}/api/history?project=${slug}&entity=project`);
+      check("REST writes land in the change history", (afterRest.body.changes ?? []).length >= 1, afterRest.body.total);
+      check("REST change is attributed to the web source", afterRest.body.changes?.[0]?.source === "web", afterRest.body.changes?.[0]);
+    } finally {
+      await h.stop();
+    }
+  }
+
+  // =========================================================================
+  console.log("\n— production mode: authentication required —");
+  // =========================================================================
+  {
+    const root = path.join(tmp, "prodproj");
+    await fs.mkdir(root, { recursive: true });
+    const slug = slugFor(root);
+    const authDb = path.join(tmp, "prod-auth.db");
+
+    // Seed the identities a successful LDAP bind would have produced.
+    const viewerToken = await seed(authDb, { id: "vera", groups: ["cn=requ-readers,ou=groups,dc=example,dc=test"] }, { name: "vera laptop" });
+    const maintainerToken = await seed(authDb, { id: "mika", groups: ["cn=requ-maintainers,ou=groups,dc=example,dc=test"] }, { name: "mika ci" });
+    const cappedToken = await seed(authDb, { id: "mika", groups: ["cn=requ-maintainers,ou=groups,dc=example,dc=test"] }, { name: "mika read-only", maxRole: "viewer" });
+    const scopedToken = await seed(authDb, { id: "mika", groups: ["cn=requ-maintainers,ou=groups,dc=example,dc=test"] }, { name: "other project only", projects: ["some-other-project"] });
+
+    const env = {
+      REQU_AUTH_MODE: "ldap",
+      REQU_AUTH_SECRET: SECRET,
+      REQU_AUTH_DB: authDb,
+      REQU_AUDIT: "on",
+      // Never contacted except by the login test below, which asserts it fails cleanly.
+      REQU_LDAP_URL: "ldaps://127.0.0.1:1",
+      REQU_LDAP_BASE_DN: "dc=example,dc=test",
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=maintainer",
+      REQU_AUTH_DEFAULT_ROLE: "none",
+    };
+
+    // --- unauthenticated ---
+    const anon = await startHarness([root], "smoke-auth-anon", { env, connectMcp: false });
+    try {
+      const summary = await getJson(`${anon.base}/api/summary?project=${slug}`);
+      check("unauthenticated REST read is refused", summary.status === 401, summary);
+      check("the refusal names the reason", typeof summary.body.error === "string", summary.body);
+
+      const mcp = await fetch(`${anon.base}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      check("unauthenticated MCP call is refused", mcp.status === 401, mcp.status);
+      check("the MCP refusal asks for a bearer token", (mcp.headers.get("www-authenticate") ?? "").includes("Bearer"), mcp.headers.get("www-authenticate"));
+
+      const bad = await getJson(`${anon.base}/api/summary?project=${slug}`, { Authorization: "Bearer requ_pat_nope_nope" });
+      check("an unknown token is refused", bad.status === 401, bad);
+
+      const cfg = await getJson(`${anon.base}/api/auth/config`);
+      check("auth config stays public", cfg.status === 200 && cfg.body.enabled === true, cfg.body);
+      check("auth config does not leak the secret", !JSON.stringify(cfg.body).includes(SECRET));
+
+      const meAnon = await getJson(`${anon.base}/api/auth/me`);
+      check("/api/auth/me reports an anonymous caller", meAnon.status === 200 && meAnon.body.authenticated === false, meAnon.body);
+
+      // An unreachable directory must fail cleanly, not crash the server.
+      const loginRes = await fetch(`${anon.base}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "vera", password: "hunter2" }),
+      });
+      check("login against an unreachable directory fails cleanly", loginRes.status === 502 || loginRes.status === 401, loginRes.status);
+      check("the server is still alive after a failed login", (await getJson(`${anon.base}/api/version`)).status === 200);
+
+      const emptyPassword = await fetch(`${anon.base}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "vera", password: "" }),
+      });
+      check("login with an empty password is rejected before the directory", emptyPassword.status === 400, emptyPassword.status);
+
+      const allure = await getJson(`${anon.base}/allure/${slug}/`);
+      check("the Allure report is not served to an unauthenticated caller", allure.status === 401 || allure.status === 403, allure.status);
+    } finally {
+      await anon.stop();
+    }
+
+    // --- viewer ---
+    const viewer = await startHarness([root], "smoke-auth-viewer", {
+      env,
+      headers: { Authorization: `Bearer ${viewerToken}` },
+    });
+    try {
+      const me = await getJson(`${viewer.base}/api/auth/me`, { Authorization: `Bearer ${viewerToken}` });
+      check("a token identifies its owner", me.body.username === "vera" && me.body.kind === "token", me.body);
+      check("the group mapping granted the viewer role", me.body.roles?.includes("viewer") === true, me.body.roles);
+      check("a viewer may read", me.body.permissions?.includes("spec:read") === true, me.body.permissions);
+      check("a viewer may not write", me.body.permissions?.includes("requirement:write") !== true, me.body.permissions);
+      check("/api/auth/me names the token", me.body.tokenName === "vera laptop", me.body.tokenName);
+
+      const init = await viewer.call("init_project", { key: slug, name: "Prod Project", initialPhase: "v1.0", force: true });
+      check("a viewer may not create a project", init.isError === true, init.data);
+
+      const read = await getJson(`${viewer.base}/api/summary?project=${slug}`, { Authorization: `Bearer ${viewerToken}` });
+      // The project is not initialized yet, so 503 is the expected read answer —
+      // what matters is that it is not 401/403.
+      check("a viewer's read is authorised", read.status !== 401 && read.status !== 403, read.status);
+
+      const auditDenied = await getJson(`${viewer.base}/api/audit?project=${slug}`, { Authorization: `Bearer ${viewerToken}` });
+      check("a viewer may not read the audit log", auditDenied.status === 403, auditDenied);
+    } finally {
+      await viewer.stop();
+    }
+
+    // --- maintainer ---
+    let reqId: string | undefined;
+    const maint = await startHarness([root], "smoke-auth-maint", {
+      env,
+      headers: { Authorization: `Bearer ${maintainerToken}` },
+    });
+    try {
+      const me = await getJson(`${maint.base}/api/auth/me`, { Authorization: `Bearer ${maintainerToken}` });
+      check("the group mapping granted the maintainer role", me.body.roles?.includes("maintainer") === true, me.body.roles);
+
+      const init = await maint.call("init_project", { key: slug, name: "Prod Project", initialPhase: "v1.0", force: true });
+      check("a maintainer may create a project", !init.isError, init.data);
+
+      const created = await maint.call("create_requirement", { title: "Locked down", priority: "high" });
+      check("a maintainer may write", !created.isError, created.data);
+      reqId = created.data?.id;
+
+      const hist = await getJson(`${maint.base}/api/history/requirement/${encodeURIComponent(reqId!)}?project=${slug}`, {
+        Authorization: `Bearer ${maintainerToken}`,
+      });
+      check("the change is attributed to the maintainer", hist.body.changes?.[0]?.actorId === "mika", hist.body.changes?.[0]);
+
+      const auditRes = await getJson(`${maint.base}/api/audit?project=${slug}&limit=200`, {
+        Authorization: `Bearer ${maintainerToken}`,
+      });
+      check("a maintainer may read the audit log", auditRes.status === 200, auditRes.status);
+      const denials = (auditRes.body.entries ?? []).filter((e: any) => e.outcome === "denied");
+      check("the viewer's refused write was audited", denials.some((e: any) => e.actorId === "vera"), denials.slice(0, 5));
+      check("the denial records the missing permission", denials.some((e: any) => e.permission === "project:manage"), denials.slice(0, 5));
+      const tokenEntry = (auditRes.body.entries ?? []).find((e: any) => e.actorId === "mika" && e.action === "create_requirement");
+      check("the audit entry names the token used", typeof tokenEntry?.tokenId === "string" && tokenEntry.tokenId.length > 0, tokenEntry?.tokenId);
+
+      const adminDenied = await getJson(`${maint.base}/api/admin/users`, { Authorization: `Bearer ${maintainerToken}` });
+      check("a maintainer is not an administrator", adminDenied.status === 403, adminDenied.status);
+    } finally {
+      await maint.stop();
+    }
+
+    // --- a token capped below its owner's role ---
+    const capped = await startHarness([root], "smoke-auth-capped", {
+      env,
+      headers: { Authorization: `Bearer ${cappedToken}` },
+    });
+    try {
+      const me = await getJson(`${capped.base}/api/auth/me`, { Authorization: `Bearer ${cappedToken}` });
+      // The owner's roles are reported as assigned — that is what makes "why
+      // can I do this?" answerable — and the ceiling is reported beside them.
+      // What the token may actually do is the intersection of the two.
+      check("a capped token reports its owner's roles", me.body.roles?.includes("maintainer") === true, me.body.roles);
+      check("a capped token says what it was capped to", me.body.cappedTo === "viewer", me.body.cappedTo);
+      check("a capped token loses the permissions the ceiling lacks", me.body.permissions?.includes("requirement:write") !== true, me.body.permissions);
+      check("a capped token keeps the permissions both hold", me.body.permissions?.includes("spec:read") === true, me.body.permissions);
+
+      const write = await capped.call("create_requirement", { key: slug, title: "Should not exist", priority: "medium" });
+      check("a capped token cannot write even though its owner can", write.isError === true, write.data);
+    } finally {
+      await capped.stop();
+    }
+
+    // --- a token scoped to a different project ---
+    const scoped = await startHarness([root], "smoke-auth-scoped", {
+      env,
+      headers: { Authorization: `Bearer ${scopedToken}` },
+      connectMcp: false,
+    });
+    try {
+      const res = await getJson(`${scoped.base}/api/summary?project=${slug}`, { Authorization: `Bearer ${scopedToken}` });
+      check("a project-scoped token is refused on another project", res.status === 403, res);
+    } finally {
+      await scoped.stop();
+    }
+
+    // --- revocation ---
+    await revokeSeededToken(authDb, maintainerToken);
+    const revoked = await startHarness([root], "smoke-auth-revoked", { env, connectMcp: false });
+    try {
+      const res = await getJson(`${revoked.base}/api/summary?project=${slug}`, { Authorization: `Bearer ${maintainerToken}` });
+      check("a revoked token no longer works", res.status === 401, res);
+      check("the refusal says the token was revoked", String(res.body.error ?? "").toLowerCase().includes("revoked"), res.body);
+    } finally {
+      await revoked.stop();
+    }
+  }
+
+  // =========================================================================
+  console.log("\n— against a live LDAP directory —");
+  // =========================================================================
+  //
+  // Everything above proves the authorisation layer; this proves the bind path,
+  // which is the part that cannot be checked by reasoning about it. The
+  // directory is a real LDAP server running in this process (see
+  // lib/ldap-fixture.ts) — no container, no network, works in CI.
+  {
+    const { authenticateLdap } = await import("../src/auth/ldap.js");
+
+    const ldapCfg = (url: string, over: Record<string, unknown> = {}) =>
+      ({
+        url,
+        bindDn: SERVICE_DN,
+        bindPassword: SERVICE_PASSWORD,
+        baseDn: BASE_DN,
+        userFilter: "(|(uid={{username}})(sAMAccountName={{username}}))",
+        userDnTemplate: null,
+        displayNameAttrs: ["displayName", "cn"],
+        emailAttrs: ["mail"],
+        groupBaseDn: GROUP_BASE_DN,
+        groupFilter: "(|(member={{dn}})(memberUid={{username}}))",
+        groupNameAttr: "cn",
+        memberOfAttr: "memberOf",
+        timeoutMs: 5_000,
+        tlsRejectUnauthorized: false,
+        ...over,
+      }) as any;
+
+    const withFixture = async (opts: FixtureOptions, fn: (url: string) => Promise<void>) => {
+      const fixture = await startLdapFixture(opts);
+      try {
+        await fn(fixture.url);
+      } finally {
+        await fixture.stop();
+      }
+    };
+
+    const rejects = async (fn: () => Promise<unknown>): Promise<{ message: string; invalid: boolean }> => {
+      try {
+        await fn();
+        return { message: "<no error>", invalid: false };
+      } catch (e) {
+        return { message: (e as Error).message, invalid: (e as { invalidCredentials?: boolean }).invalidCredentials === true };
+      }
+    };
+
+    // --- groups published on the user entry (Active Directory style) ---
+    await withFixture({ groupDiscovery: "memberOf" }, async (url) => {
+      const u = await authenticateLdap(ldapCfg(url), "vera", "vera-secret");
+      check("ldap: a correct password binds", u.username === "vera", u);
+      check("ldap: the DN comes back from the directory", u.dn === USERS.vera.dn, u.dn);
+      check("ldap: the display name is read", u.displayName === "Vera Viewer", u.displayName);
+      check("ldap: the mail attribute is read", u.email === "vera@example.test", u.email);
+      check("ldap: memberOf groups are discovered", u.groups.includes(`cn=requ-readers,${GROUP_BASE_DN}`), u.groups);
+      check("ldap: the bare group name is recorded too", u.groups.includes("requ-readers"), u.groups);
+
+      const wrong = await rejects(() => authenticateLdap(ldapCfg(url), "vera", "not-the-password"));
+      check("ldap: a wrong password is rejected", wrong.invalid, wrong);
+      check("ldap: and is reported as a credential problem", wrong.message.includes("Invalid username or password"), wrong.message);
+
+      const unknown = await rejects(() => authenticateLdap(ldapCfg(url), "ghost", "whatever"));
+      check("ldap: an unknown user is rejected", unknown.invalid, unknown);
+      check("ldap: an unknown user is indistinguishable from a wrong password",
+        unknown.message === wrong.message, { unknown: unknown.message, wrong: wrong.message });
+
+      // An empty password makes a real directory perform an *unauthenticated*
+      // bind, which succeeds — so the guard has to be on requ's side.
+      const blank = await rejects(() => authenticateLdap(ldapCfg(url), "vera", ""));
+      check("ldap: an empty password never authenticates", blank.invalid, blank);
+
+      // Filter injection: unescaped, `*` matches every entry in the tree.
+      const wildcard = await rejects(() => authenticateLdap(ldapCfg(url), "*", "vera-secret"));
+      check("ldap: a wildcard username matches nothing", wildcard.invalid, wildcard);
+      const injected = await rejects(() => authenticateLdap(ldapCfg(url), ")(uid=*", "vera-secret"));
+      check("ldap: a username cannot close the filter early", injected.invalid, injected);
+
+      const ambiguous = await rejects(() => authenticateLdap(ldapCfg(url), "dup", "dup-secret"));
+      check("ldap: a username matching two entries is refused, not guessed",
+        ambiguous.message.includes("matched 2 directory entries"), ambiguous.message);
+
+      // Direct bind, with a deliberately wrong service password: succeeding
+      // proves the service account was never used.
+      const direct = await authenticateLdap(
+        ldapCfg(url, { userDnTemplate: `uid={{username}},ou=people,${BASE_DN}`, bindPassword: "WRONG" }),
+        "mika", "mika-secret",
+      );
+      check("ldap: a DN template binds without the service account", direct.username === "mika", direct);
+      check("ldap: groups are still discovered on that path", direct.groups.includes("requ-maintainers"), direct.groups);
+
+      const badService = await rejects(() => authenticateLdap(ldapCfg(url, { bindPassword: "WRONG" }), "vera", "vera-secret"));
+      check("ldap: a bad service password is reported as a configuration fault, not a bad login",
+        !badService.invalid && badService.message.includes("REQU_LDAP_BIND_DN"), badService);
+    });
+
+    // --- groups found by searching the group tree (OpenLDAP without memberOf) ---
+    await withFixture({ groupDiscovery: "search" }, async (url) => {
+      const u = await authenticateLdap(ldapCfg(url), "mika", "mika-secret");
+      check("ldap: groups are found by searching the group tree when there is no memberOf",
+        u.groups.includes("requ-maintainers"), u.groups);
+      const nora = await authenticateLdap(ldapCfg(url), "nora", "nora-secret");
+      check("ldap: a user in no group authenticates with no groups", nora.groups.length === 0, nora.groups);
+    });
+
+    // --- a directory that normalises attribute names to lower case ---
+    // Attribute descriptions are case-insensitive (RFC 4512). Reading them by
+    // exact key finds nothing, and a user with no groups silently drops to the
+    // default role — so this is checked, not assumed.
+    await withFixture({ groupDiscovery: "memberOf", lowercaseAttributes: true }, async (url) => {
+      const u = await authenticateLdap(ldapCfg(url), "vera", "vera-secret");
+      check("ldap: attributes are read whatever case the directory used", u.displayName === "Vera Viewer", u.displayName);
+      check("ldap: mail too", u.email === "vera@example.test", u.email);
+      check("ldap: and the groups, which decide the role", u.groups.includes("requ-readers"), u.groups);
+    });
+
+    // --- LDAPS, against a real TLS handshake ---
+    await withFixture({ tls: true }, async (url) => {
+      check("ldap: the fixture is serving ldaps", url.startsWith("ldaps://"), url);
+      const u = await authenticateLdap(ldapCfg(url), "mika", "mika-secret");
+      check("ldaps: a bind over TLS works", u.username === "mika" && u.groups.includes("requ-maintainers"), u);
+
+      // ldapts enables TLS when tlsOptions is present *or* the scheme is ldaps,
+      // so a self-signed certificate must still be refused when verification is on.
+      const strict = await rejects(() => authenticateLdap(ldapCfg(url, { tlsRejectUnauthorized: true }), "mika", "mika-secret"));
+      check("ldaps: an untrusted certificate is refused when verification is on",
+        !strict.invalid && /certificate|self[- ]signed/i.test(strict.message), strict.message);
+    });
+
+    const { checkLdapConnection } = await import("../src/auth/ldap.js");
+    await withFixture({}, async (url) => {
+      let healthy = true;
+      try { await checkLdapConnection(ldapCfg(url)); } catch { healthy = false; }
+      check("ldap: the health check reaches a working directory", healthy);
+    });
+    let unhealthy = false;
+    try { await checkLdapConnection(ldapCfg("ldap://127.0.0.1:1")); } catch { unhealthy = true; }
+    check("ldap: the health check reports an unreachable directory", unhealthy);
+  }
+
+  // =========================================================================
+  console.log("\n— signing in to the server against that directory —");
+  // =========================================================================
+  //
+  // The whole round trip a person makes: sign in, get a session, mint a token
+  // from that session, and drive MCP with the token — with the role the
+  // directory's groups earned them, and nothing more.
+  {
+    const root = path.join(tmp, "ldapproj");
+    await fs.mkdir(root, { recursive: true });
+    const slug = slugFor(root);
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+
+    const env = {
+      REQU_AUTH_MODE: "ldap",
+      REQU_AUTH_SECRET: SECRET,
+      REQU_AUTH_DB: path.join(tmp, "ldap-auth.db"),
+      REQU_AUDIT: "on",
+      REQU_LDAP_URL: fixture.url,
+      REQU_LDAP_ALLOW_PLAINTEXT: "true",
+      REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN,
+      REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=maintainer",
+      REQU_AUTH_DEFAULT_ROLE: "none",
+    };
+
+    const h = await startHarness([root], "smoke-auth-ldap", { env, connectMcp: false });
+    try {
+      const signIn = async (username: string, password: string) => {
+        const res = await fetch(`${h.base}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        const body = await res.json().catch(() => ({}));
+        return { status: res.status, body, cookie: res.headers.get("set-cookie") };
+      };
+
+      const bad = await signIn("mika", "wrong-password");
+      check("sign-in: a wrong password is refused", bad.status === 401, bad.status);
+      check("sign-in: no cookie is issued", !bad.cookie, bad.cookie);
+
+      const noRole = await signIn("nora", "nora-secret");
+      check("sign-in: a user no group maps to is refused when there is no default role",
+        noRole.status === 401, { status: noRole.status, body: noRole.body });
+
+      const ok = await signIn("mika", "mika-secret");
+      check("sign-in: correct credentials are accepted", ok.status === 200, ok.body);
+      check("sign-in: the directory's group became a role", ok.body.roles?.includes("maintainer") === true, ok.body.roles);
+      check("sign-in: the display name comes from the directory", ok.body.user?.displayName === "Mika Maintainer", ok.body.user);
+      check("sign-in: a session cookie is set", (ok.cookie ?? "").includes("requ_session="), ok.cookie);
+      check("sign-in: the cookie is HttpOnly", (ok.cookie ?? "").includes("HttpOnly"), ok.cookie);
+      check("sign-in: the cookie is SameSite=Lax", (ok.cookie ?? "").includes("SameSite=Lax"), ok.cookie);
+      check("sign-in: the roles say where they came from", (ok.body.roleSources ?? []).some((r: any) => r.source === "group"), ok.body.roleSources);
+
+      const cookie = (ok.cookie ?? "").split(";")[0];
+
+      const me = await getJson(`${h.base}/api/auth/me`, { Cookie: cookie });
+      check("session: the cookie identifies the user", me.body.username === "mika" && me.body.kind === "session", me.body);
+      check("session: it carries the maintainer permissions", me.body.permissions?.includes("requirement:write") === true, me.body.permissions);
+
+      // A session can mint a token, and that token drives MCP.
+      const mint = await fetch(`${h.base}/api/auth/tokens`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookie },
+        body: JSON.stringify({ name: "from the dashboard" }),
+      });
+      const minted = await mint.json().catch(() => ({}));
+      check("token: a session can mint one", mint.status === 201 && typeof minted.token === "string", minted);
+      check("token: the plaintext is returned only in the creation response",
+        !JSON.stringify((await getJson(`${h.base}/api/auth/tokens`, { Cookie: cookie })).body).includes(minted.token), "listed tokens contain the secret");
+
+      const viaToken = await startHarness([root], "smoke-auth-ldap-token", {
+        env,
+        headers: { Authorization: `Bearer ${minted.token}` },
+      });
+      try {
+        const init = await viaToken.call("init_project", { key: slug, name: "LDAP Project", initialPhase: "v1.0", force: true });
+        check("token: a token minted in the dashboard drives MCP", !init.isError, init.data);
+        const created = await viaToken.call("create_requirement", { title: "Signed in for real", priority: "high" });
+        check("token: the maintainer role carries over to MCP", !created.isError, created.data);
+
+        const hist = await getJson(
+          `${viaToken.base}/api/history/requirement/${encodeURIComponent(created.data?.id)}?project=${slug}`,
+          { Authorization: `Bearer ${minted.token}` },
+        );
+        check("token: the change is attributed to the directory user", hist.body.changes?.[0]?.actorId === "mika", hist.body.changes?.[0]);
+      } finally {
+        await viaToken.stop();
+      }
+
+      // Signing out has to end the session for real, not just drop the cookie.
+      const out = await fetch(`${h.base}/api/auth/logout`, { method: "POST", headers: { Cookie: cookie } });
+      check("sign-out: succeeds", out.ok, out.status);
+      const after = await getJson(`${h.base}/api/auth/me`, { Cookie: cookie });
+      check("sign-out: the old cookie no longer authenticates", after.body.authenticated === false, after.body);
+
+      // A viewer signs in and is held to viewer rights.
+      const vera = await signIn("vera", "vera-secret");
+      check("sign-in: a reader's group maps to viewer", vera.body.roles?.includes("viewer") === true, vera.body.roles);
+      const veraCookie = (vera.cookie ?? "").split(";")[0];
+      const denied = await fetch(`${h.base}/api/config?project=${slug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: veraCookie },
+        body: JSON.stringify({ brief: "should not land" }),
+      });
+      check("session: a viewer's write over REST is refused", denied.status === 403, denied.status);
+
+      // Disabling an account ends its sessions immediately.
+      const mikaAgain = await signIn("mika", "mika-secret");
+      const mikaCookie = (mikaAgain.cookie ?? "").split(";")[0];
+      // Point the modules at *this* section's database. The config caches
+      // sqlitePath, so resetting the store alone would write to whichever
+      // database an earlier section left configured.
+      const { authStore, setAuthStore } = await import("../src/auth/store.js");
+      const { resetAuthConfig } = await import("../src/auth/config.js");
+      process.env.REQU_AUTH_DB = env.REQU_AUTH_DB;
+      process.env.REQU_AUTH_SECRET = SECRET;
+      process.env.REQU_AUTH_MODE = "disabled";
+      resetAuthConfig();
+      setAuthStore(null);
+      await authStore().setUserDisabled("mika", true);
+      await authStore().revokeSessionsForUser("mika");
+      const disabled = await getJson(`${h.base}/api/auth/me`, { Cookie: mikaCookie });
+      check("admin: disabling an account ends its session at once", disabled.body.authenticated === false, disabled.body);
+      const blocked = await signIn("mika", "mika-secret");
+      check("admin: a disabled account cannot sign back in", blocked.status === 401, blocked.status);
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+  }
+
+  // =========================================================================
+  console.log("\n— project membership —");
+  // =========================================================================
+  //
+  // Adding someone to one project must delegate exactly that: the right to work
+  // on it, and — for an admin — the right to decide who else can. Nothing about
+  // any other project, and nothing server-wide.
+  {
+    const root = path.join(tmp, "memberproj");
+    const other = path.join(tmp, "otherproj");
+    await fs.mkdir(root, { recursive: true });
+    await fs.mkdir(other, { recursive: true });
+    const slug = slugFor(root);
+    const otherSlug = slugFor(other);
+    const authDb = path.join(tmp, "members-auth.db");
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+
+    // vera is a reader in the directory. Make her admin of this project only.
+    process.env.REQU_AUTH_DB = authDb;
+    process.env.REQU_AUTH_SECRET = SECRET;
+    process.env.REQU_AUTH_MODE = "disabled";
+    const { resetAuthConfig } = await import("../src/auth/config.js");
+    const { authStore, setAuthStore } = await import("../src/auth/store.js");
+    resetAuthConfig();
+    setAuthStore(null);
+    await authStore().init();
+    await authStore().grantRole({
+      userId: "vera", projectId: slug, role: "admin", grantedBy: "smoke", grantedAt: new Date().toISOString(),
+    });
+
+    const env = {
+      REQU_AUTH_MODE: "ldap",
+      REQU_AUTH_SECRET: SECRET,
+      REQU_AUTH_DB: authDb,
+      REQU_AUDIT: "on",
+      REQU_LDAP_URL: fixture.url,
+      REQU_LDAP_ALLOW_PLAINTEXT: "true",
+      REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN,
+      REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=maintainer",
+      REQU_AUTH_DEFAULT_ROLE: "none",
+    };
+
+    const h = await startHarness([root, other], "smoke-auth-members", { env, connectMcp: false });
+    try {
+      const signIn = async (username: string, password: string) => {
+        const res = await fetch(`${h.base}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        return {
+          status: res.status,
+          body: await res.json().catch(() => ({})),
+          cookie: (res.headers.get("set-cookie") ?? "").split(";")[0],
+        };
+      };
+      const post = async (url: string, cookie: string, payload: unknown) => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: cookie },
+          body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json().catch(() => ({})) };
+      };
+
+      const vera = await signIn("vera", "vera-secret");
+      check("membership: a project-scoped admin can sign in", vera.status === 200, vera.body);
+
+      // --- the escalation this design exists to prevent ---
+      const escalate = await post(`${h.base}/api/admin/roles?project=${slug}`, vera.cookie, {
+        userId: "vera", projectId: "*", role: "admin",
+      });
+      check("membership: a project admin cannot grant themselves a server-wide role",
+        escalate.status === 403, escalate);
+      const stillNotGlobal = await getJson(`${h.base}/api/auth/me`, { Cookie: vera.cookie });
+      check("membership: and does not hold server-wide administration",
+        (stillNotGlobal.body.globalPermissions ?? []).includes("admin:users") === false,
+        stillNotGlobal.body.globalPermissions);
+      check("membership: while still administering their own project",
+        (await getJson(`${h.base}/api/auth/me?project=${slug}`, { Cookie: vera.cookie })).body.permissions?.includes("project:members") === true);
+
+      const serverAdminRoutes = await getJson(`${h.base}/api/admin/users?project=${slug}`, { Cookie: vera.cookie });
+      check("membership: server administration stays closed to them", serverAdminRoutes.status === 403, serverAdminRoutes.status);
+
+      // --- adding someone who has never signed in ---
+      const added = await post(`${h.base}/api/projects/${slug}/members`, vera.cookie, {
+        username: "nora", role: "maintainer",
+      });
+      check("membership: a member can be added before they have ever signed in", added.status === 200, added.body);
+      check("membership: they are listed as invited", added.body.invited === true, added.body);
+      check("membership: with the role they were given", added.body.projectRole === "maintainer", added.body);
+
+      const listed = await getJson(`${h.base}/api/projects/${slug}/members`, { Cookie: vera.cookie });
+      const names = (listed.body.members ?? []).map((x: any) => x.userId);
+      check("membership: the members list includes both of them", names.includes("vera") && names.includes("nora"), names);
+      const veraRow = (listed.body.members ?? []).find((x: any) => x.userId === "vera");
+      check("membership: a directory group shows as inherited, not as a grant made here",
+        (veraRow?.inherited ?? []).some((i: any) => i.source === "group"), veraRow);
+
+      // --- the invited user can now actually sign in ---
+      const nora = await signIn("nora", "nora-secret");
+      check("membership: someone whose only role is on one project can sign in", nora.status === 200, nora.body);
+      const noraHere = await getJson(`${h.base}/api/auth/me?project=${slug}`, { Cookie: nora.cookie });
+      check("membership: and holds their role on that project", noraHere.body.roles?.includes("maintainer") === true, noraHere.body.roles);
+      check("membership: with nothing server-wide", (noraHere.body.globalPermissions ?? []).length === 0, noraHere.body.globalPermissions);
+      const noraElsewhere = await getJson(`${h.base}/api/auth/me?project=${otherSlug}`, { Cookie: nora.cookie });
+      check("membership: and nothing on another project", (noraElsewhere.body.roles ?? []).length === 0, noraElsewhere.body.roles);
+
+      const noraWrite = await fetch(`${h.base}/api/config?project=${slug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: nora.cookie },
+        body: JSON.stringify({ brief: "a maintainer may write here" }),
+      });
+      check("membership: the granted role really works on that project", noraWrite.status !== 403, noraWrite.status);
+      const noraWriteElsewhere = await fetch(`${h.base}/api/config?project=${otherSlug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: nora.cookie },
+        body: JSON.stringify({ brief: "but not here" }),
+      });
+      check("membership: and nowhere else", noraWriteElsewhere.status === 403, noraWriteElsewhere.status);
+
+      // --- a member is not an administrator of the project ---
+      const noraAdds = await post(`${h.base}/api/projects/${slug}/members`, nora.cookie, {
+        username: "mika", role: "admin",
+      });
+      check("membership: a maintainer cannot change who else is a member", noraAdds.status === 403, noraAdds);
+
+      // --- an admin of one project is not an admin of another ---
+      const veraElsewhere = await getJson(`${h.base}/api/projects/${otherSlug}/members`, { Cookie: vera.cookie });
+      check("membership: a project admin cannot read another project's members", veraElsewhere.status === 403, veraElsewhere.status);
+
+      // --- changing a role replaces it rather than stacking ---
+      const demoted = await post(`${h.base}/api/projects/${slug}/members`, vera.cookie, {
+        username: "nora", role: "viewer",
+      });
+      check("membership: changing a role replaces the old one", demoted.body.projectRole === "viewer", demoted.body);
+      check("membership: the old role is really gone",
+        JSON.stringify(demoted.body.roles) === JSON.stringify(["viewer"]), demoted.body.roles);
+
+      // --- removal ---
+      const removed = await fetch(`${h.base}/api/projects/${slug}/members/nora`, {
+        method: "DELETE", headers: { Cookie: vera.cookie },
+      });
+      const removedBody = await removed.json().catch(() => ({}));
+      check("membership: a member can be removed", removed.status === 200 && removedBody.removed === true, removedBody);
+      check("membership: and then has no access at all", removedBody.stillHasAccess === false, removedBody);
+      const afterRemoval = await getJson(`${h.base}/api/auth/me?project=${slug}`, { Cookie: nora.cookie });
+      check("membership: their existing session loses the role immediately",
+        (afterRemoval.body.roles ?? []).length === 0, afterRemoval.body.roles);
+
+      // --- the last administrator cannot lock everyone out ---
+      const selfRemove = await fetch(`${h.base}/api/projects/${slug}/members/vera`, {
+        method: "DELETE", headers: { Cookie: vera.cookie },
+      });
+      check("membership: the only administrator cannot remove themselves", selfRemove.status === 400, selfRemove.status);
+
+      // --- inherited access cannot be removed from the project ---
+      await post(`${h.base}/api/projects/${slug}/members`, vera.cookie, { username: "mika", role: "admin" });
+      const mika = await signIn("mika", "mika-secret");
+      check("membership: a second administrator can be added", mika.status === 200, mika.body);
+      const withMika = await getJson(`${h.base}/api/projects/${slug}/members`, { Cookie: vera.cookie });
+      const mikaRow = (withMika.body.members ?? []).find((x: any) => x.userId === "mika");
+      check("membership: their directory role is shown alongside the one granted here",
+        (mikaRow?.inherited ?? []).some((i: any) => i.role === "maintainer" && i.source === "group"), mikaRow);
+      const dropMika = await fetch(`${h.base}/api/projects/${slug}/members/mika`, {
+        method: "DELETE", headers: { Cookie: vera.cookie },
+      });
+      const dropBody = await dropMika.json().catch(() => ({}));
+      check("membership: removing them drops only the grant made here",
+        dropBody.removed === true && dropBody.stillHasAccess === true, dropBody);
+      check("membership: their directory-granted role survives",
+        (dropBody.remainingRoles ?? []).includes("maintainer"), dropBody.remainingRoles);
+
+      // --- the audit trail records membership decisions ---
+      const auditRes = await getJson(`${h.base}/api/audit?project=${slug}&limit=200`, { Cookie: vera.cookie });
+      const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
+      check("membership: adding a member is audited", actions.includes("members.add"), actions.slice(0, 10));
+      check("membership: removing one is audited", actions.includes("members.remove"), actions.slice(0, 10));
+      const refused = (auditRes.body.entries ?? []).find((e: any) => e.outcome === "denied" && e.actorId === "nora");
+      check("membership: a refused membership change is audited", Boolean(refused), refused);
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+  }
+
+
+  // =========================================================================
+  console.log("\n— custom roles —");
+  // =========================================================================
+  //
+  // A team that works in product owners, analysts and QA engineers should be
+  // able to say so. That means roles are data, which means they can be written
+  // — and the moment they can be written, the question that decides whether the
+  // whole feature is safe is: can someone write themselves a role that grants
+  // more than they have? Every check below is ultimately about that.
+  {
+    const root = path.join(tmp, "roleproj");
+    await fs.mkdir(root, { recursive: true });
+    const slug = slugFor(root);
+    const authDb = path.join(tmp, "roles-auth.db");
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+
+    process.env.REQU_AUTH_DB = authDb;
+    process.env.REQU_AUTH_SECRET = SECRET;
+    process.env.REQU_AUTH_MODE = "disabled";
+    const { resetAuthConfig } = await import("../src/auth/config.js");
+    const { authStore, setAuthStore } = await import("../src/auth/store.js");
+    resetAuthConfig();
+    setAuthStore(null);
+    await authStore().init();
+    // vera administers this one project; mika is a server administrator.
+    await authStore().grantRole({
+      userId: "vera", projectId: slug, role: "admin", grantedBy: "smoke", grantedAt: new Date().toISOString(),
+    });
+
+    const env = {
+      REQU_AUTH_MODE: "ldap",
+      REQU_AUTH_SECRET: SECRET,
+      REQU_AUTH_DB: authDb,
+      REQU_AUDIT: "on",
+      REQU_AUTH_ADMINS: "mika",
+      REQU_LDAP_URL: fixture.url,
+      REQU_LDAP_ALLOW_PLAINTEXT: "true",
+      REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN,
+      REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer",
+      REQU_AUTH_DEFAULT_ROLE: "none",
+    };
+
+    const h = await startHarness([root], "smoke-auth-roles", { env, connectMcp: false });
+    try {
+      const signIn = async (username: string, password: string) => {
+        const res = await fetch(`${h.base}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        return { status: res.status, cookie: (res.headers.get("set-cookie") ?? "").split(";")[0] };
+      };
+      const send = async (method: string, url: string, cookie: string, payload?: unknown) => {
+        const res = await fetch(url, {
+          method,
+          headers: { "Content-Type": "application/json", Cookie: cookie },
+          ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
+        });
+        return { status: res.status, body: (await res.json().catch(() => ({}))) as any };
+      };
+
+      const mika = await signIn("mika", "mika-secret");
+      const vera = await signIn("vera", "vera-secret");
+      check("roles: the server administrator signs in", mika.status === 200, mika.status);
+      check("roles: the project administrator signs in", vera.status === 200, vera.status);
+
+      // --- reading the catalogue ---
+      const anon = await getJson(`${h.base}/api/roles`);
+      check("roles: the catalogue needs a signed-in caller", anon.status === 401, anon.status);
+
+      const asVera = await send("GET", `${h.base}/api/roles`, vera.cookie);
+      check("roles: any signed-in caller can read the catalogue", asVera.status === 200, asVera.status);
+      check(
+        "roles: the presets are there",
+        ["viewer", "qa", "product-owner", "requirements-analyst"].every((id: string) =>
+          (asVera.body.roles ?? []).some((r: any) => r.id === id)),
+        (asVera.body.roles ?? []).map((r: any) => r.id),
+      );
+      check("roles: reading it says whether you may edit it", asVera.body.canEdit === false, asVera.body.canEdit);
+      check(
+        "roles: the permission catalogue comes with it",
+        (asVera.body.permissions ?? []).some((p: any) => p.id === "scenario:write" && p.label),
+        (asVera.body.permissions ?? []).length,
+      );
+
+      // --- who may change the shared catalogue ---
+      const veraWrites = await send("POST", `${h.base}/api/roles`, vera.cookie, {
+        name: "Sneaky", permissions: ["admin:users"],
+      });
+      check("roles: a project administrator cannot change the shared catalogue", veraWrites.status === 403, veraWrites.body);
+
+      const created = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Release Manager",
+        description: "Cuts the baselines.",
+        permissions: ["spec:read", "history:read", "version:manage"],
+      });
+      check("roles: a server administrator can define one", created.status === 201, created.body);
+      check("roles: the id is derived from the name", created.body.id === "release-manager", created.body.id);
+      check("roles: it is not marked built-in", created.body.builtIn === false, created.body);
+      check("roles: it records who made it", created.body.createdBy === "mika", created.body.createdBy);
+
+      const dup = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Release Manager", permissions: ["spec:read"],
+      });
+      check("roles: the same id twice is refused", dup.status === 409, dup.body);
+
+      const bogus = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Wizard", permissions: ["spec:read", "everything:write"],
+      });
+      check(
+        "roles: an unknown permission is refused rather than dropped",
+        bogus.status === 400 && String(bogus.body.error).includes("everything:write"),
+        bogus.body,
+      );
+
+      // --- editing ---
+      const edited = await send("PATCH", `${h.base}/api/roles/release-manager`, mika.cookie, {
+        name: "Release Manager",
+        description: "Cuts the baselines and exports them.",
+        permissions: ["spec:read", "history:read", "version:manage", "project:export"],
+      });
+      check("roles: it can be edited", edited.status === 200 && edited.body.permissions.includes("project:export"), edited.body);
+
+      const renamed = await send("PATCH", `${h.base}/api/roles/release-manager`, mika.cookie, {
+        id: "release-boss", name: "Release Manager", permissions: ["spec:read"],
+      });
+      check("roles: the id cannot change under a live grant", renamed.status === 400, renamed.body);
+
+      // A built-in role is the team's to reinterpret, but not to remove.
+      const builtIn = await send("PATCH", `${h.base}/api/roles/qa`, mika.cookie, {
+        name: "QA Engineer",
+        description: "Here, QA also maintains the screens.",
+        permissions: ["spec:read", "history:read", "project:export", "scenario:write", "execution:write", "screen:write"],
+      });
+      check("roles: a built-in role can be reinterpreted", builtIn.status === 200, builtIn.body);
+      check("roles: and stays built-in", builtIn.body.builtIn === true, builtIn.body);
+      const deleteBuiltIn = await send("DELETE", `${h.base}/api/roles/qa`, mika.cookie);
+      check("roles: a built-in role cannot be deleted", deleteBuiltIn.status === 400, deleteBuiltIn.body);
+
+      // --- the escalation guard ---
+      //
+      // nora is given just enough to administer the project's members. She must
+      // not be able to turn that into anything more, by any route.
+      const delegate = await send("POST", `${h.base}/api/roles`, mika.cookie, {
+        name: "Team Lead",
+        description: "Decides who is on the team, and nothing else.",
+        permissions: ["spec:read", "project:members"],
+      });
+      check("roles: a narrow delegating role can be defined", delegate.status === 201, delegate.body);
+      const grantNora = await send("POST", `${h.base}/api/admin/roles`, mika.cookie, {
+        userId: "nora", projectId: slug, role: "team-lead",
+      });
+      check("roles: it can be granted on one project", grantNora.status === 200, grantNora.body);
+
+      // Only now can she sign in: with no directory group mapped and no default
+      // role, that one grant is her whole reason to be let in at all.
+      const nora = await signIn("nora", "nora-secret");
+      check("roles: a grant on one project is enough to sign in", nora.status === 200, nora.status);
+
+      const escalateDefine = await send("POST", `${h.base}/api/projects/${slug}/roles`, nora.cookie, {
+        name: "Super Lead", permissions: ["spec:read", "project:members", "requirement:write"],
+      });
+      check(
+        "roles: you cannot define a role granting more than you hold",
+        escalateDefine.status === 403 && escalateDefine.body.code === "ROLE_ESCALATION",
+        escalateDefine.body,
+      );
+      check(
+        "roles: and the refusal names the permission that was out of reach",
+        String(escalateDefine.body.error).includes("requirement:write"),
+        escalateDefine.body.error,
+      );
+
+      const escalateAssign = await send("POST", `${h.base}/api/projects/${slug}/members`, nora.cookie, {
+        username: "nora", role: "maintainer",
+      });
+      check(
+        "roles: nor assign one that grants more than you hold",
+        escalateAssign.status === 403,
+        escalateAssign.body,
+      );
+
+      const withinReach = await send("POST", `${h.base}/api/projects/${slug}/roles`, nora.cookie, {
+        name: "Team Reader", permissions: ["spec:read"],
+      });
+      check("roles: what you do hold, you can pass on", withinReach.status === 201, withinReach.body);
+
+      const globalInProject = await send("POST", `${h.base}/api/projects/${slug}/roles`, vera.cookie, {
+        name: "Project Overlord", permissions: ["spec:read", "admin:users"],
+      });
+      check(
+        "roles: a project's own role cannot claim a server-wide permission",
+        globalInProject.status === 400 && globalInProject.body.code === "ROLE_SCOPE",
+        globalInProject.body,
+      );
+
+      // Appointing a second administrator of a project is not an escalation,
+      // even though the admin role names a server-wide permission it cannot
+      // confer here.
+      const secondAdmin = await send("POST", `${h.base}/api/projects/${slug}/members`, vera.cookie, {
+        username: "nora", role: "admin",
+      });
+      check("roles: a project administrator can appoint another", secondAdmin.status === 200, secondAdmin.body);
+
+      // --- project-scoped roles ---
+      const projectQa = await send("POST", `${h.base}/api/projects/${slug}/roles`, vera.cookie, {
+        id: "qa",
+        name: "QA (this project)",
+        description: "Here, QA also writes the requirements it tests.",
+        permissions: ["spec:read", "scenario:write", "execution:write", "requirement:write"],
+      });
+      check("roles: a project can redefine a shared role for itself", projectQa.status === 201, projectQa.body);
+
+      const projectList = await send("GET", `${h.base}/api/projects/${slug}/roles`, vera.cookie);
+      const qaHere = (projectList.body.roles ?? []).find((r: any) => r.id === "qa");
+      check("roles: the project's version is the one it sees", qaHere?.projectId === slug, qaHere);
+      check("roles: which is editable there", qaHere?.editable === true, qaHere);
+      const sharedHere = (projectList.body.roles ?? []).find((r: any) => r.id === "release-manager");
+      check("roles: a shared role is assignable but not editable there", sharedHere && sharedHere.editable === false, sharedHere);
+
+      // What it grants must actually follow the project's definition.
+      await send("POST", `${h.base}/api/projects/${slug}/members`, vera.cookie, { username: "dup1", role: "qa" });
+      const dupMembers = await send("GET", `${h.base}/api/projects/${slug}/members`, vera.cookie);
+      const dupRow = (dupMembers.body.members ?? []).find((x: any) => x.userId === "dup1");
+      check(
+        "roles: a member gets the project's reading of the role",
+        (dupRow?.permissions ?? []).includes("requirement:write"),
+        dupRow?.permissions,
+      );
+
+      // --- deleting ---
+      const inUse = await send("DELETE", `${h.base}/api/projects/${slug}/roles/qa`, vera.cookie);
+      check("roles: one that people still hold is not deleted by accident", inUse.status === 409, inUse.body);
+      check("roles: and the refusal says who holds it", String(inUse.body.error).includes("dup1"), inUse.body.error);
+
+      const forced = await send("DELETE", `${h.base}/api/projects/${slug}/roles/qa?force=true`, vera.cookie);
+      check("roles: forcing it through deletes the role", forced.status === 200 && forced.body.deleted === true, forced.body);
+      check("roles: and revokes the grants that pointed at it", (forced.body.revoked ?? []).includes("dup1"), forced.body);
+
+      const afterDelete = await send("GET", `${h.base}/api/projects/${slug}/roles`, vera.cookie);
+      const qaAfter = (afterDelete.body.roles ?? []).find((r: any) => r.id === "qa");
+      check("roles: the shared role shows through again once the project's is gone", qaAfter?.projectId === null, qaAfter);
+
+      const dropShared = await send("DELETE", `${h.base}/api/roles/release-manager`, mika.cookie);
+      check("roles: a shared role nobody holds is deleted outright", dropShared.status === 200, dropShared.body);
+      const sharedAfter = await send("GET", `${h.base}/api/roles`, mika.cookie);
+      check(
+        "roles: and is gone from the shared catalogue",
+        !(sharedAfter.body.roles ?? []).some((r: any) => r.id === "release-manager"),
+        (sharedAfter.body.roles ?? []).map((r: any) => r.id),
+      );
+
+      // --- the audit trail ---
+      const auditRes = await send("GET", `${h.base}/api/audit?scope=all&limit=300`, mika.cookie);
+      const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
+      check("roles: defining a role is audited", actions.includes("roles.create"), actions.slice(0, 12));
+      check("roles: editing one is audited", actions.includes("roles.update"), actions.slice(0, 12));
+      check("roles: deleting one is audited", actions.includes("roles.delete"), actions.slice(0, 12));
+      const denied = (auditRes.body.entries ?? []).find(
+        (e: any) => e.outcome === "denied" && e.actorId === "nora" && String(e.action).startsWith("roles"),
+      );
+      check("roles: a refused escalation is audited", Boolean(denied), denied);
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+  }
+
+  // =========================================================================
+  console.log("\n— two-factor authentication —");
+  // =========================================================================
+  //
+  // TOTP, which is what Microsoft Authenticator speaks for third-party accounts.
+  // The algorithm itself is checked against the RFC vectors below; this section
+  // is about the flow around it: that a password alone stops being enough, that
+  // a code cannot be replayed or brute-forced, and that losing a phone is
+  // recoverable without an administrator.
+  {
+    const { totpAt, stepFor, verifyTotp, hotp, base32Encode, generateRecoveryCodes, hashRecoveryCode, matchRecoveryCode, PERIOD_SECONDS } =
+      await import("../src/auth/totp.js");
+    const { sealSecret, openSecret } = await import("../src/auth/secret-box.js");
+
+    // --- the algorithm, against the published vectors ---
+    const rfcKey = Buffer.from("12345678901234567890", "utf-8");
+    const rfc4226 = ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"];
+    check(
+      "totp: matches every RFC 4226 HOTP vector",
+      rfc4226.every((expected, counter) => hotp(rfcKey, counter) === expected),
+      rfc4226.map((_, c) => hotp(rfcKey, c)),
+    );
+    const rfcSecret = base32Encode(rfcKey);
+    const rfc6238: Array<[number, string]> = [
+      [59, "287082"], [1111111109, "081804"], [1111111111, "050471"],
+      [1234567890, "005924"], [2000000000, "279037"],
+      // Past 2^32 seconds: catches a counter written with a 32-bit shift.
+      [20000000000, "353130"],
+    ];
+    check(
+      "totp: matches every RFC 6238 TOTP vector, including beyond 2^32 seconds",
+      rfc6238.every(([t, expected]) => totpAt(rfcSecret, Math.floor(t / PERIOD_SECONDS)) === expected),
+      rfc6238.map(([t]) => totpAt(rfcSecret, Math.floor(t / PERIOD_SECONDS))),
+    );
+
+    const at = 1_700_000_000_000;
+    const nowStep = Math.floor(at / 1000 / PERIOD_SECONDS);
+    check("totp: a code one step early is accepted (clock drift)", verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep - 1), { atMs: at }).ok);
+    check("totp: a code one step late is accepted", verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep + 1), { atMs: at }).ok);
+    check("totp: two steps out is refused", !verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep - 2), { atMs: at }).ok);
+    const spent = verifyTotp(rfcSecret, totpAt(rfcSecret, nowStep), { atMs: at, minStep: nowStep });
+    check("totp: a spent step is refused as a replay", !spent.ok && spent.reason === "replayed", spent);
+
+    // --- the seed is encrypted at rest ---
+    const sealed = sealSecret(rfcSecret, SECRET);
+    check("totp: the stored seed is not the seed", !sealed.includes(rfcSecret), sealed.slice(0, 24));
+    check("totp: it opens with the right server secret", openSecret(sealed, SECRET) === rfcSecret);
+    check("totp: and not with a different one", openSecret(sealed, "some-other-secret-entirely-0123456789") === null);
+    check("totp: tampering with the ciphertext is detected", openSecret(sealed.slice(0, -4) + "AAAA", SECRET) === null);
+
+    const rcs = generateRecoveryCodes();
+    const rcHashes = rcs.map((c) => hashRecoveryCode(c, SECRET));
+    check("totp: recovery codes are stored only as hashes", !rcHashes.some((h) => rcs.some((c) => h.includes(c.replace("-", "")))));
+    check("totp: a recovery code matches regardless of case or dashes", matchRecoveryCode(rcs[2].toLowerCase(), rcHashes, SECRET) === 2);
+
+    // --- the flow ---
+    const root = path.join(tmp, "tfaproj");
+    await fs.mkdir(root, { recursive: true });
+    const authDb = path.join(tmp, "tfa-auth.db");
+    const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+    const env = {
+      REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_AUTH_DB: authDb, REQU_AUDIT: "on",
+      REQU_LDAP_URL: fixture.url, REQU_LDAP_ALLOW_PLAINTEXT: "true", REQU_LDAP_BASE_DN: BASE_DN,
+      REQU_LDAP_BIND_DN: SERVICE_DN, REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+      REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+      REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=maintainer",
+      REQU_2FA: "optional",
+    };
+
+    const h = await startHarness([root], "smoke-auth-2fa", { env, connectMcp: false });
+    try {
+      const post = async (p: string, payload: unknown, cookie = "") => {
+        const res = await fetch(`${h.base}${p}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+          body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json().catch(() => ({})), cookie: (res.headers.get("set-cookie") ?? "").split(";")[0] };
+      };
+      const signIn = (u: string, p: string) => post("/api/auth/login", { username: u, password: p });
+
+      // Nothing changes for someone who has not enrolled.
+      const plain = await signIn("mika", "mika-secret");
+      check("2fa: an un-enrolled user signs in on the password alone", plain.status === 200 && Boolean(plain.cookie), plain.body);
+      check("2fa: and is told no second factor is owed", plain.body.twoFactor?.required === false, plain.body.twoFactor);
+      const cookie = plain.cookie;
+
+      const status0 = await getJson(`${h.base}/api/auth/2fa`, { Cookie: cookie });
+      check("2fa: the server offers it", status0.body.available === true && status0.body.mode === "optional", status0.body);
+      check("2fa: and reports nobody enrolled yet", status0.body.enrolled === false, status0.body);
+
+      // Enrolment.
+      const setup = await post("/api/auth/2fa/setup", {}, cookie);
+      check("2fa: setup returns a provisioning URI", String(setup.body.uri ?? "").startsWith("otpauth://totp/"), setup.body.uri);
+      check("2fa: the URI names the issuer and the account", String(setup.body.uri).includes("issuer=requ") && String(setup.body.uri).includes("mika%40example.test"), setup.body.uri);
+      check("2fa: a QR code is rendered server-side", String(setup.body.qrSvg ?? "").startsWith("<svg"), String(setup.body.qrSvg).slice(0, 20));
+      check("2fa: the secret is also offered for manual entry", /^[A-Z2-7 ]+$/.test(setup.body.secret ?? ""), setup.body.secret);
+      const secret = new URL(String(setup.body.uri).replace("otpauth://", "http://")).searchParams.get("secret")!;
+
+      const wrongConfirm = await post("/api/auth/2fa/confirm", { code: "000000" }, cookie);
+      check("2fa: a wrong code does not complete enrolment", wrongConfirm.status === 400, wrongConfirm.body);
+      const stillOff = await getJson(`${h.base}/api/auth/2fa`, { Cookie: cookie });
+      check("2fa: so the account is still un-enrolled", stillOff.body.enrolled === false, stillOff.body);
+
+      const confirmed = await post("/api/auth/2fa/confirm", { code: totpAt(secret, stepFor()) }, cookie);
+      check("2fa: the right code completes enrolment", confirmed.status === 200, confirmed.body);
+      const recoveryCodes: string[] = confirmed.body.recoveryCodes ?? [];
+      check("2fa: ten recovery codes are issued once", recoveryCodes.length === 10, recoveryCodes.length);
+
+      const listed = await getJson(`${h.base}/api/auth/2fa`, { Cookie: cookie });
+      check("2fa: the account now reports enrolled", listed.body.enrolled === true, listed.body);
+      check("2fa: the recovery codes are never listed back", !JSON.stringify(listed.body).includes(recoveryCodes[0]), listed.body);
+
+      // Signing in now takes two steps.
+      const second = await signIn("mika", "mika-secret");
+      check("2fa: the password alone no longer yields a session", !second.cookie, second.cookie);
+      check("2fa: a code is demanded", second.body.twoFactor?.step === "code", second.body.twoFactor);
+      const challenge = second.body.twoFactor?.challenge;
+      check("2fa: a challenge is handed back", typeof challenge === "string" && challenge.length > 0);
+
+      // The pending session is not a credential.
+      const pendingUse = await getJson(`${h.base}/api/auth/me`, { Cookie: `requ_session=${encodeURIComponent(challenge)}` });
+      check("2fa: the pending session authenticates nothing", pendingUse.body.authenticated === false, pendingUse.body);
+      const pendingApi = await getJson(`${h.base}/api/summary?project=${slugFor(root)}`, { Cookie: `requ_session=${encodeURIComponent(challenge)}` });
+      check("2fa: nor does it reach the API", pendingApi.status === 401, pendingApi.status);
+
+      const badCode = await post("/api/auth/2fa/verify", { challenge, code: "123456" });
+      check("2fa: a wrong code is refused", badCode.status === 401, badCode.body);
+      check("2fa: and yields no cookie", !badCode.cookie);
+
+      const reusedEnrolCode = await post("/api/auth/2fa/verify", { challenge, code: totpAt(secret, stepFor()) });
+      check(
+        "2fa: the code spent on enrolment cannot be reused to sign in",
+        reusedEnrolCode.status === 401 && String(reusedEnrolCode.body.error).includes("already been used"),
+        reusedEnrolCode.body,
+      );
+
+      const freshCode = totpAt(secret, stepFor() + 1);
+      const verified = await post("/api/auth/2fa/verify", { challenge, code: freshCode });
+      check("2fa: a fresh code completes the sign-in", verified.status === 200 && Boolean(verified.cookie), verified.body);
+      const me = await getJson(`${h.base}/api/auth/me`, { Cookie: verified.cookie });
+      check("2fa: and the session works", me.body.authenticated === true && me.body.username === "mika", me.body);
+
+      // Replay across sign-ins.
+      const third = await signIn("mika", "mika-secret");
+      const replayed = await post("/api/auth/2fa/verify", { challenge: third.body.twoFactor.challenge, code: freshCode });
+      check("2fa: the same code cannot be replayed on a new sign-in", replayed.status === 401, replayed.body);
+
+      // Recovery codes.
+      const fourth = await signIn("mika", "mika-secret");
+      const viaRecovery = await post("/api/auth/2fa/verify", { challenge: fourth.body.twoFactor.challenge, code: recoveryCodes[0] });
+      check("2fa: a recovery code signs you in", viaRecovery.status === 200 && Boolean(viaRecovery.cookie), viaRecovery.body);
+      check("2fa: and says how many are left", viaRecovery.body.recoveryCodesRemaining === 9, viaRecovery.body);
+      const fifth = await signIn("mika", "mika-secret");
+      const reusedRecovery = await post("/api/auth/2fa/verify", { challenge: fifth.body.twoFactor.challenge, code: recoveryCodes[0] });
+      check("2fa: a recovery code works exactly once", reusedRecovery.status === 401, reusedRecovery.body);
+
+      // An expired or forged challenge is useless.
+      const forged = await post("/api/auth/2fa/verify", { challenge: `${challenge}x`, code: totpAt(secret, stepFor() + 2) });
+      check("2fa: a tampered challenge is refused", forged.status === 401, forged.body);
+
+      // Removing it requires proving possession.
+      const mikaSession = viaRecovery.cookie;
+      const badDisable = await post("/api/auth/2fa/disable", { code: "000000" }, mikaSession);
+      check("2fa: removing it needs a current code", badDisable.status === 401, badDisable.body);
+
+      // The successful removal runs on a second account, because each accepted
+      // code advances the replay watermark and only one step either side of now
+      // is ever accepted — so mika has no unspent step left in this window.
+      const vera = await signIn("vera", "vera-secret");
+      const veraSetup = await post("/api/auth/2fa/setup", {}, vera.cookie);
+      const veraSecret = new URL(String(veraSetup.body.uri).replace("otpauth://", "http://")).searchParams.get("secret")!;
+      await post("/api/auth/2fa/confirm", { code: totpAt(veraSecret, stepFor()) }, vera.cookie);
+      const veraEnrolled = await signIn("vera", "vera-secret");
+      check("2fa: a second account enrols independently", veraEnrolled.body.twoFactor?.step === "code", veraEnrolled.body.twoFactor);
+
+      const disabled = await post("/api/auth/2fa/disable", { code: totpAt(veraSecret, stepFor() + 1) }, vera.cookie);
+      check("2fa: with a current code, it is removed", disabled.status === 200, disabled.body);
+      const afterDisable = await signIn("vera", "vera-secret");
+      check("2fa: and the password alone signs in again", Boolean(afterDisable.cookie), afterDisable.body.twoFactor);
+
+      // A token is its own credential; it does not carry a second factor.
+      const tokenRes = await post("/api/auth/tokens", { name: "ci" }, mikaSession);
+      check("2fa: a token can still be minted", tokenRes.status === 201, tokenRes.body);
+      const viaToken = await getJson(`${h.base}/api/auth/me`, { Authorization: `Bearer ${tokenRes.body.token}` });
+      check("2fa: and keeps working as a credential of its own, with no code", viaToken.body.authenticated === true, viaToken.body);
+
+      // The audit trail records the second factor.
+      const auditRes = await getJson(`${h.base}/api/audit?scope=all&limit=200`, { Cookie: mikaSession });
+      const actions = (auditRes.body.entries ?? []).map((e: any) => e.action);
+      check("2fa: enrolment is audited", actions.includes("2fa.enrolled"), actions.slice(0, 12));
+      check("2fa: removal is audited", actions.includes("2fa.disabled"), actions.slice(0, 12));
+      const denials = (auditRes.body.entries ?? []).filter((e: any) => e.outcome === "denied");
+      check("2fa: refused codes are audited", denials.length > 0, denials.slice(0, 3));
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+
+    // --- a policy that requires it ---
+    const strictRoot = path.join(tmp, "tfastrict");
+    await fs.mkdir(strictRoot, { recursive: true });
+    const strictFixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+    const strict = await startHarness([strictRoot], "smoke-auth-2fa-required", {
+      connectMcp: false,
+      env: {
+        REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_AUTH_DB: path.join(tmp, "tfa-strict.db"), REQU_AUDIT: "on",
+        REQU_LDAP_URL: strictFixture.url, REQU_LDAP_ALLOW_PLAINTEXT: "true", REQU_LDAP_BASE_DN: BASE_DN,
+        REQU_LDAP_BIND_DN: SERVICE_DN, REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+        REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+        REQU_LDAP_ROLE_MAP: "requ-maintainers=maintainer",
+        REQU_2FA: "required",
+      },
+    });
+    try {
+      const post = async (p: string, payload: unknown) => {
+        const res = await fetch(`${strict.base}${p}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json().catch(() => ({})), cookie: (res.headers.get("set-cookie") ?? "").split(";")[0] };
+      };
+      const first = await post("/api/auth/login", { username: "mika", password: "mika-secret" });
+      check("2fa required: a user without one gets no session", !first.cookie, first.cookie);
+      check("2fa required: and is sent to enrolment", first.body.twoFactor?.step === "enrol", first.body.twoFactor);
+
+      const challenge = first.body.twoFactor.challenge;
+      const offer = await post("/api/auth/2fa/enrol", { challenge });
+      check("2fa required: enrolment is offered against the challenge", String(offer.body.enrolment?.uri ?? "").startsWith("otpauth://"), offer.body);
+      const secret = new URL(String(offer.body.enrolment.uri).replace("otpauth://", "http://")).searchParams.get("secret")!;
+
+      const wrong = await post("/api/auth/2fa/enrol", { challenge, code: "000000" });
+      check("2fa required: a wrong code does not let them past", wrong.status === 400 && !wrong.cookie, wrong.body);
+
+      const done = await post("/api/auth/2fa/enrol", { challenge, code: totpAt(secret, stepFor()) });
+      check("2fa required: enrolling completes the sign-in", done.status === 200 && Boolean(done.cookie), done.body);
+      check("2fa required: recovery codes are issued at the same time", (done.body.recoveryCodes ?? []).length === 10, done.body.recoveryCodes?.length);
+
+      const statusRes = await getJson(`${strict.base}/api/auth/2fa`, { Cookie: done.cookie });
+      check("2fa required: the account reports it as required", statusRes.body.required === true && statusRes.body.enrolled === true, statusRes.body);
+      const cannotRemove = await fetch(`${strict.base}/api/auth/2fa/disable`, {
+        method: "POST", headers: { "Content-Type": "application/json", Cookie: done.cookie },
+        body: JSON.stringify({ code: totpAt(secret, stepFor() + 1) }),
+      });
+      check("2fa required: it cannot be removed while policy demands it", cannotRemove.status === 403, cannotRemove.status);
+    } finally {
+      await strict.stop();
+      await strictFixture.stop();
+    }
+
+    // --- configuration guards ---
+    const { loadAuthConfig, resetAuthConfig } = await import("../src/auth/config.js");
+    const snap = { ...process.env };
+    const tryCfg = (env: Record<string, string | undefined>): string | null => {
+      for (const [k, v] of Object.entries(env)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      resetAuthConfig();
+      try { loadAuthConfig(); return null; } catch (e) { return (e as Error).message; }
+      finally {
+        for (const k of Object.keys(env)) { if (snap[k] === undefined) delete process.env[k]; else process.env[k] = snap[k]!; }
+        resetAuthConfig();
+      }
+    };
+    check("2fa: an unknown mode is refused", (tryCfg({ REQU_2FA: "maybe" }) ?? "").includes("REQU_2FA"));
+    check(
+      "2fa: it cannot be switched on without authentication",
+      (tryCfg({ REQU_2FA: "required", REQU_AUTH_MODE: "disabled" }) ?? "").includes("REQU_AUTH_MODE=ldap"),
+    );
+    // Roles live in the database, which is not reachable at boot, so config
+    // checks the id's shape and the catalogue decides the rest.
+    check(
+      "2fa: a malformed role id in the required-roles list is refused",
+      (tryCfg({
+        REQU_2FA: "optional", REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET,
+        REQU_LDAP_URL: "ldaps://d", REQU_LDAP_BASE_DN: "dc=x", REQU_2FA_REQUIRED_ROLES: "Wizard!",
+      }) ?? "").includes("Wizard!"),
+    );
+    check(
+      "2fa: a custom role in the required-roles list is accepted",
+      tryCfg({
+        REQU_2FA: "optional", REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET,
+        REQU_LDAP_URL: "ldaps://d", REQU_LDAP_BASE_DN: "dc=x", REQU_2FA_REQUIRED_ROLES: "release-manager",
+      }) === null,
+    );
+    check(
+      "2fa: requiring it for roles while switched off is refused",
+      (tryCfg({ REQU_2FA: "off", REQU_2FA_REQUIRED_ROLES: "admin" }) ?? "").includes("REQU_2FA=off"),
+    );
+  }
+
+  // =========================================================================
+  console.log("\n— login throttling —");
+  // =========================================================================
+  {
+    const { resetLoginThrottle, loginRetryAfterMs, recordLoginFailure, clearLoginFailures } =
+      await import("../src/auth/throttle.js");
+    resetLoginThrottle();
+
+    check("a first attempt is not throttled", loginRetryAfterMs("mallory", "10.0.0.1") === 0);
+    for (let i = 0; i < 4; i++) recordLoginFailure("mallory", "10.0.0.1");
+    check("four failures are still allowed through", loginRetryAfterMs("mallory", "10.0.0.1") === 0);
+    recordLoginFailure("mallory", "10.0.0.1");
+    check("the fifth failure starts a back-off", loginRetryAfterMs("mallory", "10.0.0.1") > 0);
+
+    // Guessing a second account from the same address is blocked by the IP counter.
+    check("the address is throttled too, not just the username", loginRetryAfterMs("someone-else", "10.0.0.1") > 0);
+    check("an unrelated address is unaffected", loginRetryAfterMs("mallory2", "10.0.0.2") === 0);
+
+    const first = loginRetryAfterMs("mallory", "10.0.0.1");
+    recordLoginFailure("mallory", "10.0.0.1");
+    check("the back-off grows with each further failure", loginRetryAfterMs("mallory", "10.0.0.1") > first);
+
+    clearLoginFailures("mallory", "10.0.0.1");
+    check("a successful sign-in clears the counter", loginRetryAfterMs("mallory", "10.0.0.1") === 0);
+    resetLoginThrottle();
+  }
+
+  // =========================================================================
+  console.log("\n— configuration guards —");
+  // =========================================================================
+  {
+    const { loadAuthConfig, resetAuthConfig } = await import("../src/auth/config.js");
+    const snapshot = { ...process.env };
+    const withEnv = async (env: Record<string, string | undefined>, fn: () => void) => {
+      for (const [k, v] of Object.entries(env)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      resetAuthConfig();
+      try { fn(); } finally {
+        for (const k of Object.keys(env)) {
+          if (snapshot[k] === undefined) delete process.env[k];
+          else process.env[k] = snapshot[k]!;
+        }
+        resetAuthConfig();
+      }
+    };
+
+    const throws = (fn: () => void): string | null => {
+      try { fn(); return null; } catch (e) { return (e as Error).message; }
+    };
+
+    await withEnv({ REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: undefined }, () => {
+      check("ldap mode without a secret is refused", throws(loadAuthConfig)?.includes("REQU_AUTH_SECRET") === true);
+    });
+    await withEnv({ REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: undefined }, () => {
+      check("ldap mode without a URL is refused", throws(loadAuthConfig)?.includes("REQU_LDAP_URL") === true);
+    });
+    await withEnv(
+      { REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: "ldap://dir:389", REQU_LDAP_BASE_DN: "dc=x" },
+      () => {
+        check("plaintext ldap:// is refused unless explicitly allowed", throws(loadAuthConfig)?.includes("plaintext") === true);
+      },
+    );
+    await withEnv(
+      {
+        REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: "ldap://dir:389",
+        REQU_LDAP_BASE_DN: "dc=x", REQU_LDAP_ALLOW_PLAINTEXT: "true",
+      },
+      () => {
+        check("plaintext ldap:// is allowed once acknowledged", throws(loadAuthConfig) === null);
+      },
+    );
+    await withEnv(
+      { REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: "ldaps://dir", REQU_LDAP_BASE_DN: "dc=x", REQU_LDAP_ROLE_MAP: "grp=Wizard!" },
+      () => {
+        check("a malformed role id in the group map is refused", throws(loadAuthConfig)?.includes("Wizard!") === true);
+      },
+    );
+    // A well-formed id the catalogue does not know is accepted at boot — a
+    // deployment may define its roles after wiring up the directory — and
+    // reported once the database is reachable.
+    await withEnv(
+      { REQU_AUTH_MODE: "ldap", REQU_AUTH_SECRET: SECRET, REQU_LDAP_URL: "ldaps://dir", REQU_LDAP_BASE_DN: "dc=x", REQU_LDAP_ROLE_MAP: "grp=release-manager" },
+      () => {
+        check("a custom role in the group map is accepted", throws(loadAuthConfig) === null);
+      },
+    );
+    await withEnv({ REQU_AUTH_MODE: "sometimes" }, () => {
+      check("an unknown auth mode is refused", throws(loadAuthConfig)?.includes("REQU_AUTH_MODE") === true);
+    });
+
+    // Filter injection: a username may not end the filter or match everything.
+    const { escapeFilterValue } = await import("../src/auth/ldap.js");
+    check("filter escaping neutralises a wildcard", escapeFilterValue("*") === "\\2a");
+    check("filter escaping neutralises parentheses", escapeFilterValue(")(uid=admin") === "\\29\\28uid=admin");
+
+    await securityRegressionChecks(tmp);
+    await roleCatalogueChecks(path.join(tmp, "roles-unit.db"));
+
+    const { parseToken, mintToken, hashTokenSecret } = await import("../src/auth/tokens.js");
+    const t = mintToken("pepper");
+    const parsedToken = parseToken(t.plaintext)!;
+    check("a minted token round-trips through the parser", parsedToken.id === t.id);
+    check("the stored hash matches the presented secret", hashTokenSecret(parsedToken.secret, "pepper") === t.hash);
+    check("the stored hash does not match a different pepper", hashTokenSecret(parsedToken.secret, "other") !== t.hash);
+    check("the plaintext is not recoverable from the hash", !t.hash.includes(parsedToken.secret));
+    check("a foreign token is rejected by the parser", parseToken("ghp_something") === null);
+
+    // The id half is base64url, whose alphabet includes `_` and `-`. Splitting
+    // on an underscore cut about one token in six at the wrong place and made it
+    // unusable, so the round-trip is checked over a population, not one sample.
+    let misparsed = 0;
+    for (let i = 0; i < 2000; i++) {
+      const minted = mintToken("pepper");
+      const back = parseToken(minted.plaintext);
+      if (!back || back.id !== minted.id || hashTokenSecret(back.secret, "pepper") !== minted.hash) misparsed++;
+    }
+    check("every minted token parses back to itself", misparsed === 0, `${misparsed}/2000 failed`);
+  }
+
+  await fs.rm(tmp, { recursive: true, force: true });
+
+  console.log(`\n${passed} passed, ${failed} failed`);
+  if (failed > 0) process.exit(1);
+}
+
+/**
+ * The role catalogue, checked directly rather than through a server.
+ *
+ * These are the guarantees a deployment relies on when it starts inventing its
+ * own roles: the presets mean what their names say, a project can redefine a
+ * role for itself without touching anyone else, and capping a token can only
+ * ever remove permissions.
+ */
+// ---------------------------------------------------------------------------
+// Security regressions
+// ---------------------------------------------------------------------------
+//
+// Each block below pins a finding from the September 2026 security review so
+// it cannot come back quietly: the project named for authorisation must be the
+// project whose data is served; every write route must be in the permission
+// table; the dashboard shell must carry its policy headers; the login throttle
+// must key on an address the caller cannot choose; and cross-origin access
+// must be opt-in.
+async function securityRegressionChecks(tmp: string): Promise<void> {
+  console.log("\n— security regressions —");
+
+  const { permissionForRoute, explicitRoutePermission } = await import("../src/auth/rbac.js");
+  check("routes: activating a version requires version:manage",
+    permissionForRoute("POST", "/api/versions/active") === "version:manage",
+    permissionForRoute("POST", "/api/versions/active"));
+
+  // The route table is checked against the routes web-api.ts actually serves,
+  // so an entry that drifts from its route — the way `/activate` did — fails
+  // here instead of quietly handing the route to the method-based fallback.
+  const webApi = await fs.readFile(path.join(repoRoot, "src", "web-api.ts"), "utf-8");
+  const served = [...webApi.matchAll(/matchRoute\(pathname,\s*method,\s*"([^"]+)",\s*"([A-Z]+)"\)/g)]
+    .map((m) => ({ path: m[1], method: m[2] }));
+  check("routes: the parser sees the routes web-api.ts declares", served.length > 30, served.length);
+  const selfAuthorising = /^\/api\/(auth|admin|roles|projects\/[^/]+\/(members|roles))(\/|$)/;
+  const uncovered = served
+    .filter((r) => r.method !== "GET" && !selfAuthorising.test(r.path))
+    .filter((r) => explicitRoutePermission(r.method, r.path.replace(/:[a-zA-Z]+/g, "x")) === null)
+    .map((r) => `${r.method} ${r.path}`);
+  check("routes: every write route has an explicit permission entry", uncovered.length === 0, uncovered);
+
+  const root = path.join(tmp, "secproj");
+  await fs.mkdir(root, { recursive: true });
+  const slug = slugFor(root);
+  const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+  const baseEnv = {
+    REQU_AUTH_MODE: "ldap",
+    REQU_AUTH_SECRET: SECRET,
+    REQU_AUDIT: "on",
+    REQU_LDAP_URL: fixture.url,
+    REQU_LDAP_ALLOW_PLAINTEXT: "true",
+    REQU_LDAP_BASE_DN: BASE_DN,
+    REQU_LDAP_BIND_DN: SERVICE_DN,
+    REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+    REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+    // mika administers; vera only reads.
+    REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=admin",
+    REQU_AUTH_DEFAULT_ROLE: "none",
+  };
+  const json = { "Content-Type": "application/json" };
+  const signIn = async (base: string, username: string) => {
+    const res = await fetch(`${base}/api/auth/login`, {
+      method: "POST", headers: json, body: JSON.stringify({ username, password: `${username}-secret` }),
+    });
+    return (res.headers.get("set-cookie") ?? "").split(";")[0];
+  };
+  const failLogin = async (base: string, username: string, forwardedFor: string) =>
+    (await fetch(`${base}/api/auth/login`, {
+      method: "POST", headers: { ...json, "X-Forwarded-For": forwardedFor },
+      body: JSON.stringify({ username, password: "not-it" }),
+    })).status;
+
+  // --- defaults: no trusted proxy, no CORS ---
+  {
+    const h = await startHarness([root], "smoke-auth-sec", {
+      env: { ...baseEnv, REQU_AUTH_DB: path.join(tmp, "sec-auth.db") }, connectMcp: false,
+    });
+    try {
+      const admin = await signIn(h.base, "mika");
+      const viewer = await signIn(h.base, "vera");
+      check("sec: both test users signed in", admin.startsWith("requ_session=") && viewer.startsWith("requ_session="));
+      const init = await fetch(`${h.base}/api/init?project=${slug}`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ name: "Security" }),
+      });
+      check("sec: the project initialises", init.status === 200, init.status);
+
+      // F-01 — the project named for authorisation is the project served.
+      const real = await getJson(`${h.base}/api/requirements?project=${slug}`, { Cookie: viewer });
+      check("scope: the real project name is served", real.status === 200, real.status);
+      const bogus = await getJson(`${h.base}/api/requirements?project=some-other-name`, { Cookie: viewer });
+      check("scope: an unknown project name is refused, not silently mapped to the only project",
+        bogus.status === 404, { status: bogus.status, body: bogus.body });
+
+      const badToken = await fetch(`${h.base}/api/auth/tokens`, {
+        method: "POST", headers: { ...json, Cookie: admin },
+        body: JSON.stringify({ name: "probe", projects: ["some-other-name"], maxRole: "viewer" }),
+      });
+      check("scope: a token cannot be scoped to a project the server does not have", badToken.status === 400, badToken.status);
+      const goodToken = await fetch(`${h.base}/api/auth/tokens`, {
+        method: "POST", headers: { ...json, Cookie: admin },
+        body: JSON.stringify({ name: "probe", projects: [slug], maxRole: "viewer" }),
+      });
+      check("scope: a token scoped to a real project is minted", goodToken.status === 201, goodToken.status);
+
+      const badGrant = await fetch(`${h.base}/api/projects/some-other-name/members`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ username: "vera", role: "viewer" }),
+      });
+      check("scope: a role cannot be granted on a project the server does not have", badGrant.status === 404, badGrant.status);
+      const goodGrant = await fetch(`${h.base}/api/projects/${slug}/members`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ username: "vera", role: "viewer" }),
+      });
+      check("scope: a grant on a real project still works", goodGrant.status < 300, goodGrant.status);
+
+      // F-02 — activation is a lifecycle action.
+      const viewerActivate = await fetch(`${h.base}/api/versions/active?project=${slug}`, {
+        method: "POST", headers: { ...json, Cookie: viewer }, body: JSON.stringify({ current: "1.0.0" }),
+      });
+      const viewerBody = await viewerActivate.json().catch(() => ({}));
+      check("versions: a viewer may not activate a version", viewerActivate.status === 403, viewerActivate.status);
+      check("versions: the refusal names version:manage", String(viewerBody.error).includes("version:manage"), viewerBody);
+      const ghost = await fetch(`${h.base}/api/versions/active?project=${slug}`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ current: "9.9.9" }),
+      });
+      check("versions: a version that does not exist cannot be made current", ghost.status === 400, ghost.status);
+
+      // F-08 — /mcp is for token holders.
+      const mcpWithCookie = await fetch(`${h.base}/mcp`, {
+        method: "POST", headers: { ...json, Accept: "application/json, text/event-stream", Cookie: admin },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      check("mcp: a dashboard session cookie is not accepted", mcpWithCookie.status === 401, mcpWithCookie.status);
+
+      // F-06 — policy headers on the shell and the API.
+      const shell = await fetch(`${h.base}/`);
+      const csp = shell.headers.get("content-security-policy") ?? "";
+      const scriptSrc = /script-src ([^;]+)/.exec(csp)?.[1] ?? "";
+      check("headers: the dashboard shell carries a Content-Security-Policy", csp.length > 0);
+      check("headers: scripts are limited to this server and the pinned CDN", scriptSrc.includes("'self'") && scriptSrc.includes("https://cdn.jsdelivr.net"), scriptSrc);
+      check("headers: inline scripts are not allowed", !scriptSrc.includes("'unsafe-inline'"), scriptSrc);
+      check("headers: nosniff on the shell", shell.headers.get("x-content-type-options") === "nosniff");
+      check("headers: framing limited to the same origin", shell.headers.get("x-frame-options") === "SAMEORIGIN");
+      const api = await fetch(`${h.base}/api/version`, { headers: { Origin: "https://evil.example" } });
+      check("headers: nosniff on the API", api.headers.get("x-content-type-options") === "nosniff");
+
+      // F-09 — no CORS unless configured.
+      check("cors: no Access-Control-Allow-Origin by default", api.headers.get("access-control-allow-origin") === null,
+        api.headers.get("access-control-allow-origin"));
+
+      // F-04 — X-Forwarded-For from an untrusted peer is ignored.
+      for (let i = 1; i <= 5; i++) await failLogin(h.base, `ghost${i}`, "203.0.113.1");
+      const sixth = await failLogin(h.base, "ghost6", "203.0.113.2");
+      check("throttle: a spoofed X-Forwarded-For does not open a fresh bucket", sixth === 429, sixth);
+    } finally {
+      await h.stop();
+    }
+  }
+
+  // --- configured: a trusted proxy in front, one allowed browser origin ---
+  {
+    const h = await startHarness([root], "smoke-auth-sec-proxy", {
+      env: {
+        ...baseEnv,
+        REQU_AUTH_DB: path.join(tmp, "sec-proxy-auth.db"),
+        REQU_TRUSTED_PROXIES: "127.0.0.1,::1",
+        REQU_CORS_ORIGINS: "https://app.example",
+      },
+      connectMcp: false,
+    });
+    try {
+      for (let i = 1; i <= 5; i++) await failLogin(h.base, `spook${i}`, "203.0.113.1");
+      const other = await failLogin(h.base, "spook6", "203.0.113.2");
+      check("throttle: behind a trusted proxy the forwarded address is the one counted", other === 401, other);
+      const same = await failLogin(h.base, "spook7", "203.0.113.1");
+      check("throttle: …and the forwarded address that failed five times is throttled", same === 429, same);
+
+      const allowed = await fetch(`${h.base}/api/version`, { headers: { Origin: "https://app.example" } });
+      check("cors: a configured origin is allowed", allowed.headers.get("access-control-allow-origin") === "https://app.example",
+        allowed.headers.get("access-control-allow-origin"));
+      const denied = await fetch(`${h.base}/api/version`, { headers: { Origin: "https://evil.example" } });
+      check("cors: any other origin gets no CORS headers", denied.headers.get("access-control-allow-origin") === null);
+      const preflight = await fetch(`${h.base}/api/version`, { method: "OPTIONS", headers: { Origin: "https://app.example" } });
+      check("cors: preflight answers for the configured origin",
+        preflight.status === 204 && preflight.headers.get("access-control-allow-origin") === "https://app.example", preflight.status);
+      check("cors: credentials are never allowed", preflight.headers.get("access-control-allow-credentials") === null);
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+  }
+}
+
+async function roleCatalogueChecks(dbPath: string): Promise<void> {
+  const { setAuthStore, authStore } = await import("../src/auth/store.js");
+  const { resetAuthConfig } = await import("../src/auth/config.js");
+  const { resetSeed, rolesFor, permissionsForRoles, roleExists, PRESET_ROLES } =
+    await import("../src/auth/role-catalogue.js");
+  const { effectivePermissions } = await import("../src/auth/roles.js");
+
+  // A database of its own, so the catalogue starts empty and the seed is really
+  // being observed rather than something an earlier suite left behind.
+  const previousDb = process.env.REQU_AUTH_DB;
+  process.env.REQU_AUTH_DB = dbPath;
+  resetAuthConfig();
+  setAuthStore(null);
+  resetSeed();
+  try {
+    const shared = await rolesFor(null);
+    check(
+      "every preset role is seeded",
+      PRESET_ROLES.every((preset) => shared.some((r) => r.id === preset.id)),
+      shared.map((r) => r.id),
+    );
+    check("seeded roles are marked built-in", shared.every((r) => r.builtIn));
+
+    // Seeding twice must not duplicate or overwrite.
+    resetSeed();
+    const again = await rolesFor(null);
+    check("seeding is idempotent", again.length === shared.length, [shared.length, again.length]);
+
+    const qa = await permissionsForRoles(["qa"], null);
+    check(
+      "a QA engineer writes scenarios and records runs",
+      qa.has("scenario:write") && qa.has("execution:write"),
+    );
+    check(
+      "a QA engineer cannot rewrite the requirements being tested",
+      !qa.has("requirement:write") && !qa.has("story:write"),
+    );
+
+    const analyst = await permissionsForRoles(["requirements-analyst"], null);
+    check(
+      "a requirements analyst writes the specification",
+      analyst.has("requirement:write") && analyst.has("story:write") && analyst.has("screen:write"),
+    );
+    check(
+      "a requirements analyst does not report on delivery",
+      !analyst.has("execution:write") && !analyst.has("version:manage"),
+    );
+
+    const po = await permissionsForRoles(["product-owner"], null);
+    check(
+      "a product owner owns scope and baselines",
+      po.has("requirement:write") && po.has("phase:write") && po.has("version:manage"),
+    );
+    check("a product owner does not write tests", !po.has("scenario:write"));
+
+    const viewer = await permissionsForRoles(["viewer"], null);
+    check(
+      "a viewer changes nothing",
+      ![...viewer].some((perm) => perm.endsWith(":write") || perm.endsWith(":manage")),
+      [...viewer],
+    );
+    check("a maintainer is not a server administrator", !(await permissionsForRoles(["maintainer"], null)).has("admin:users"));
+    check("an administrator can administer", (await permissionsForRoles(["admin"], null)).has("admin:users"));
+
+    // Holding two roles adds their permissions up.
+    const both = await permissionsForRoles(["qa", "requirements-analyst"], null);
+    check("roles union", both.has("scenario:write") && both.has("requirement:write"));
+
+    // A role that no longer exists costs the access it granted; it does not
+    // break every request its holder makes.
+    const ghost = await permissionsForRoles(["no-such-role"], null);
+    check("an unknown role grants nothing", ghost.size === 0);
+    check("an unknown role does not exist", !(await roleExists("no-such-role", null)));
+
+    // --- project-scoped roles ---
+    await authStore().putRole({
+      id: "qa",
+      name: "QA (checkout)",
+      description: "This project lets QA edit the requirements it tests.",
+      permissions: ["spec:read", "scenario:write", "execution:write", "requirement:write"],
+      projectId: "checkout",
+      builtIn: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdBy: "mika",
+    });
+    await authStore().putRole({
+      id: "release-manager",
+      name: "Release Manager",
+      description: "Only meaningful on this project.",
+      permissions: ["spec:read", "version:manage"],
+      projectId: "checkout",
+      builtIn: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdBy: "mika",
+    });
+
+    const onCheckout = await permissionsForRoles(["qa"], "checkout");
+    check("a project-scoped role shadows the shared one of the same id", onCheckout.has("requirement:write"));
+    check("the shared role is unchanged elsewhere", !(await permissionsForRoles(["qa"], "storefront")).has("requirement:write"));
+    check("a project's own role is assignable there", await roleExists("release-manager", "checkout"));
+    check("a project's own role is not assignable elsewhere", !(await roleExists("release-manager", "storefront")));
+    check("a project's own role is not shared", !(await roleExists("release-manager", null)));
+
+    // --- capping a token ---
+    //
+    // A catalogue has no ladder, so a ceiling is an intersection: the token gets
+    // what its owner and the ceiling role both hold, and nothing else.
+    const capped = await effectivePermissions({ roles: ["maintainer"], projectId: null, ceiling: "qa" });
+    check("capping keeps what both hold", capped.has("scenario:write") && capped.has("execution:write"));
+    check("capping drops what the ceiling lacks", !capped.has("requirement:write") && !capped.has("version:manage"));
+
+    const raised = await effectivePermissions({ roles: ["viewer"], projectId: null, ceiling: "admin" });
+    check("a ceiling can never add a permission", !raised.has("admin:users") && !raised.has("requirement:write"));
+
+    const uncapped = await effectivePermissions({ roles: ["qa"], projectId: null, ceiling: null });
+    check("no ceiling leaves the role's own permissions", uncapped.has("scenario:write"));
+
+    // --- configuration that names a role the catalogue does not have ---
+    const { warnUnknownConfiguredRoles } = await import("../src/auth/role-catalogue.js");
+    const warnings: string[] = [];
+    const unknown = await warnUnknownConfiguredRoles(
+      {
+        roleMap: new Map([["cn=wizards", "wizard"], ["cn=qa", "qa"]]),
+        defaultRole: "viewer",
+        twoFactorRequiredRoles: [],
+      } as unknown as AuthConfig,
+      (m) => warnings.push(m),
+    );
+    check("a group mapped to no role is reported at startup", unknown.join() === "wizard", unknown);
+    check("the warning says where the id came from", warnings[0]?.includes("REQU_LDAP_ROLE_MAP") === true, warnings);
+    check("a project-scoped role does not count as shared", !(await roleExists("release-manager", null)));
+  } finally {
+    if (previousDb === undefined) delete process.env.REQU_AUTH_DB;
+    else process.env.REQU_AUTH_DB = previousDb;
+    resetAuthConfig();
+    setAuthStore(null);
+    resetSeed();
+  }
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

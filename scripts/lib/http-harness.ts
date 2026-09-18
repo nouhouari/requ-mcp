@@ -34,14 +34,32 @@ export type Harness = {
   base: string;
   /** Project key of the primary root. */
   key: string;
+  /** Port the server is listening on. */
+  port: number;
   stop: () => Promise<void>;
+};
+
+export type HarnessOptions = {
+  /** Extra environment for the server process — how the auth suite switches modes. */
+  env?: Record<string, string>;
+  /** Headers sent on every MCP request, e.g. an `Authorization` bearer token. */
+  headers?: Record<string, string>;
+  /**
+   * Skip connecting the MCP client. Needed when the server refuses unauthenticated
+   * MCP calls: `client.connect` would fail before any assertion could run.
+   */
+  connectMcp?: boolean;
 };
 
 /**
  * Start the built server over HTTP with SQLite and connect an MCP client.
  * `roots` are project roots; the first is the default the `call` helper targets.
  */
-export async function startHarness(roots: string[], name = "smoke"): Promise<Harness> {
+export async function startHarness(
+  roots: string[],
+  name = "smoke",
+  options: HarnessOptions = {},
+): Promise<Harness> {
   // Spread ports so concurrently-run suites do not collide.
   const port = 8800 + Math.floor(Math.random() * 900);
   const child: ChildProcess = spawn(process.execPath, [path.join(repoRoot, "dist", "index.js")], {
@@ -54,6 +72,7 @@ export async function startHarness(roots: string[], name = "smoke"): Promise<Har
       REQU_PG_URL: "",
       REQU_ROOT: "",
       REQU_DB: "",
+      ...(options.env ?? {}),
     },
     stdio: "ignore",
   });
@@ -73,7 +92,13 @@ export async function startHarness(roots: string[], name = "smoke"): Promise<Har
   }
 
   const client = new Client({ name, version: "0.0.0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`)));
+  if (options.connectMcp !== false) {
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+        requestInit: options.headers ? { headers: options.headers } : undefined,
+      }),
+    );
+  }
 
   const key = slugFor(roots[0]);
 
@@ -88,6 +113,7 @@ export async function startHarness(roots: string[], name = "smoke"): Promise<Har
   return {
     base,
     key,
+    port,
     call: (tool, args) => callOn(key, tool, args),
     callOn,
     stop: async () => {

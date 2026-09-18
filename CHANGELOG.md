@@ -4,9 +4,172 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Security
+Findings from a review of the LDAP/RBAC branch against a live instance, each
+now covered by `npm run smoke:auth`:
+- **Project scope was not enforced against the data it gated.** With one project
+  loaded, the REST layer served that project for any `?project=` value while
+  permissions and token scopes were evaluated for the value given, so a role or
+  token bound to a made-up name acted on the real project. The store is now
+  resolved from the same name authorisation used; unknown names are 404, and a
+  token scope or role grant must name a project the server has.
+- **Activating a version required `requirement:write` instead of
+  `version:manage`.** The permission table guarded a route spelling the server
+  never served. Fixed, and the table is now checked against the routes
+  `web-api.ts` declares so a drifted entry fails the build. Setting a version
+  that does not exist as current or draft is refused even when no versions
+  exist yet.
+- **Stored XSS through the project brief.** The brief was rendered from
+  Markdown without sanitising, unlike architecture decisions. It now goes
+  through DOMPurify and falls back to escaped text if the sanitiser is missing.
+- **`X-Forwarded-For` was trusted from anyone**, letting a caller pick the
+  address the login throttle counted. It is now honoured only from
+  `REQU_TRUSTED_PROXIES`.
+- Response hardening: a Content Security Policy on the dashboard shell (no
+  inline scripts), `nosniff`, `X-Frame-Options`, `Referrer-Policy`, HSTS when
+  the cookie is `Secure`; CDN scripts pinned with Subresource Integrity; Tailwind
+  compiled at build time instead of the runtime CDN; CORS off unless
+  `REQU_CORS_ORIGINS` lists origins; `/mcp` accepts tokens only, never the
+  dashboard cookie; internal failures answer with a reference id instead of the
+  raw error text.
+
 ## [2.0.0] – unreleased
 
 ### Added
+- **Authentication, RBAC and an audit trail.** The server can now require users
+  to sign in against an LDAP directory, decide what each of them may do, and
+  record it. Development is unaffected: `REQU_AUTH_MODE` defaults to `disabled`,
+  where there is no login and every caller keeps full access.
+
+  ```bash
+  REQU_AUTH_MODE=ldap
+  REQU_AUTH_SECRET=…                       # signs sessions, peppers token hashes
+  REQU_LDAP_URL=ldaps://ldap.example.com:636
+  REQU_LDAP_BASE_DN=dc=example,dc=com
+  REQU_LDAP_ROLE_MAP='requ-admins=admin;requ-leads=maintainer;requ-devs=contributor'
+  ```
+
+  - **Roles you define yourself** — a role is a named set of per-entity
+    permissions, applied identically to an MCP tool call and to the REST
+    endpoint that does the same thing. Eight are seeded (viewer, contributor,
+    maintainer, admin, product owner, requirements analyst, QA, developer) and
+    a team can edit them or add its own. Roles come from directory groups, from
+    `REQU_AUTH_ADMINS`, and from explicit grants made in the dashboard.
+  - **Personal access tokens** for MCP clients, minted from the dashboard and
+    shown exactly once (only a peppered hash is stored). A token can be capped
+    at a role, limited to named projects, given an expiry, and revoked — which
+    takes effect on the next call.
+  - **Audit log** — one row per tool call and API request, *including refused
+    ones*, with the actor, source, project, version and the permission that was
+    missing.
+  - **Change history** — per-entity, issue-tracker style: what changed on
+    REQ-014, which fields, from what to what, and by whom. Produced by a recorder
+    wrapped around the store, so an edit is recorded the same way whether it came
+    from an agent over MCP or from a person in the dashboard.
+
+  See [Authentication](README.md#authentication-roles-and-the-audit-trail) and
+  [ADR-0002](docs/adr/0002-ldap-authentication-rbac-and-audit.md).
+
+- **An in-process LDAP server for the test suite**
+  (`scripts/lib/ldap-fixture.ts`), so `npm run smoke:auth` exercises the real
+  bind path in CI without a container or network access — wrong passwords,
+  unknown users, filter injection, `memberOf` versus group-tree discovery, a
+  DN-template direct bind, LDAPS over a generated certificate, and the full
+  sign-in → session → token → MCP round trip.
+
+- **Two-factor authentication (TOTP).** `REQU_2FA=optional|required` adds a
+  second factor from an authenticator app. **Microsoft Authenticator** enrols
+  requ as a standard TOTP account — its push approval is proprietary to Entra ID
+  and closed to third parties — and the same QR code works with Google
+  Authenticator, 1Password and anything else that reads `otpauth://`.
+  `REQU_2FA_REQUIRED_ROLES=admin` requires it only for the roles that matter.
+
+  Signing in becomes two steps, with a *pending* session in between that
+  authenticates nothing. Codes are single-use (the spent time step is recorded,
+  so a code cannot be replayed inside its own window), attempts are throttled on
+  the same counters as the password, and the TOTP seed — the one secret that
+  cannot be hashed, since verification needs it back — is encrypted at rest with
+  AES-256-GCM under a key derived from `REQU_AUTH_SECRET`.
+
+  Ten single-use recovery codes are issued once at enrolment for a lost phone;
+  an administrator can reset an enrolment from the **Access** tab, which also
+  ends that user's sessions. Access tokens are unaffected: they are a credential
+  of their own and there is no phone behind an MCP client.
+
+  The TOTP implementation is written directly on `node:crypto` — no dependency —
+  and is checked against every published RFC 4226 and RFC 6238 test vector,
+  including the beyond-2³²-seconds case that catches a 32-bit counter overflow.
+  See [Two-factor authentication](README.md#two-factor-authentication).
+
+- **Project membership.** Roles already resolved per project; there is now a way
+  to manage them. The **Access** tab's *Members* panel — and
+  `GET|POST /api/projects/:slug/members`, `DELETE …/members/:userId` — adds
+  someone to one project by their directory username, with a role that applies
+  there and nowhere else. They need not have signed in first: the grant waits
+  for them, they show as *invited*, and the directory fills in their details on
+  first sign-in. The list shows **where each role came from** — granted here,
+  inherited from a directory group, granted server-wide, or the configured
+  default — and only the first is editable.
+
+  A project's `admin` manages that project's members and nothing else; server-wide
+  administration remains separate. The new `project:members` permission is
+  resolved against the project being administered, while `admin:users` is always
+  resolved globally.
+
+- **Roles built from permissions.** A role is now a named set of permissions
+  stored in the database, not one of four names in the source. That exists
+  because of one thing the old model could not say: *a QA engineer writes the
+  scenarios that verify a requirement and records their results, but must not be
+  able to rewrite the requirement they are testing.* With a single `spec:write`
+  permission those are the same grant.
+
+  Permissions are therefore split per entity — `requirement:write`,
+  `story:write`, `scenario:write`, `screen:write`, `adr:write`,
+  `component:write`, `phase:write`, `execution:write`, `vcs:write`, alongside the
+  reads and the lifecycle and administration permissions.
+
+  Eight roles are seeded on first boot. The original four keep their meaning
+  exactly, so existing grants, tokens and `REQU_LDAP_ROLE_MAP` entries are
+  unaffected by the upgrade; `product-owner`, `requirements-analyst`, `qa` and
+  `developer` join them as a starting vocabulary. All eight can be edited but
+  not deleted, and no role's id ever changes, because grants and tokens point at
+  it by id.
+
+  The **Access** tab's *Roles* card is a permission checklist, grouped by area,
+  each permission carrying the sentence explaining what holding it lets someone
+  do. Over the API: `GET|POST /api/roles` and `PATCH|DELETE /api/roles/:id` for
+  the shared catalogue, and `/api/projects/:slug/roles…` for the roles one
+  project defines for itself — which shadow a shared role of the same id, so
+  "QA means something different on this project" can be said without renaming
+  anything.
+
+  **You cannot give away what you do not have:** defining, editing, deleting or
+  assigning a role is refused when it would hand out a permission the caller
+  does not hold in that scope. Editing checks only the permissions being
+  *added*, so rights can always be taken away. Deleting a role people still hold
+  needs `force`, which revokes those grants rather than leaving them pointing at
+  nothing.
+
+  Capping an access token is now an **intersection** rather than a ceiling on a
+  ladder — with roles a team defines, nothing says whether QA outranks a
+  requirements analyst — so a capped token gets what its owner and the ceiling
+  role both allow. A maintainer can now mint a token that records test results
+  and cannot touch requirements. `/api/auth/me` reports the ceiling beside the
+  owner's roles.
+
+  See [Permissions and roles](README.md#permissions-and-roles) and
+  [ADR-0003](docs/adr/0003-roles-as-editable-permission-sets.md).
+
+- **New REST endpoints** — `GET /api/auth/config`, `POST /api/auth/login`,
+  `POST /api/auth/logout`, `GET /api/auth/me`, `GET|POST /api/auth/tokens`,
+  `DELETE /api/auth/tokens/:id`, `GET /api/audit`, `GET /api/history`,
+  `GET /api/history/:entity/:id`, `/api/roles…` and `/api/projects/:slug/roles…`
+  for the role catalogue, and `/api/admin/*` for role administration.
+
+- **Audit and Access dashboard tabs** — recent changes with their field-level
+  diffs, a filterable audit log, and user/role administration. A **History**
+  button on requirements and stories opens that entity's change log.
+
 - **Specification versioning.** A project can now hold several *versions* of its
   specification — requirements, stories, screens, ADRs, components and phases.
   Locking one freezes it so a delivery team can build against a baseline that
@@ -44,6 +207,35 @@ All notable changes to this project will be documented here.
 
 - **`export_project { allVersions: true }`** exports the whole history plus the
   version registry; import restores every version with its lock state.
+
+### Fixed
+- **A project administrator could grant themselves server-wide administration.**
+  `/api/admin/*` checked `admin:users` against the roles the request had been
+  authenticated with, and a caller holding `admin` on one project arrives
+  carrying every permission — so `POST /api/admin/roles` with
+  `projectId: "*"` succeeded. Server-wide administration is now always evaluated
+  in the global scope, where a project-scoped grant does not apply.
+- **A user whose only role was on one project could not sign in.** Sign-in
+  resolved roles globally and refused when the result was empty, so with
+  `REQU_AUTH_DEFAULT_ROLE=none` anyone invited to a single project was turned
+  away at the door. Access on any project now counts.
+- **A role could not be granted to anyone who had not already signed in**, which
+  is the wrong way round for setting a team up. Grants now create a placeholder
+  account, shown as *invited* until the directory fills it in.
+- **LDAP attributes are now read case-insensitively.** Attribute descriptions
+  are case-insensitive per RFC 4512, and directories disagree in practice. An
+  exact-key lookup silently found nothing on a directory that returns
+  `memberof` rather than `memberOf` — so every user would have appeared to
+  belong to no group and quietly dropped to the default role. The user entry is
+  also now fetched with `*` rather than a list of named attributes, since
+  servers match a requested attribute list case-sensitively often enough that
+  asking for `displayName` can return nothing.
+- **Plaintext `ldap://` connections no longer fail the TLS handshake.** `ldapts`
+  turns TLS on when `tlsOptions` is present *or* the scheme is `ldaps:`, and
+  requ passed `tlsOptions` unconditionally — so a deployment that had
+  acknowledged plaintext with `REQU_LDAP_ALLOW_PLAINTEXT=true` still failed,
+  reported as "socket disconnected before secure TLS connection was
+  established", which points nowhere near the cause.
 
 ### Changed — BREAKING
 - **Writes to a locked version are rejected.** Once a version is locked, every

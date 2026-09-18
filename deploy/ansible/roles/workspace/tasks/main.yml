@@ -1,0 +1,20 @@
+---
+- name: Make the workspace directory
+  ansible.builtin.file:
+    path: "{{ requ_workspace_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Clone or update the repositories requ inspects
+  ansible.builtin.git:
+    repo: "{{ item.repo }}"
+    dest: "{{ requ_workspace_dir }}/{{ item.name }}"
+    version: "{{ item.ref | default('HEAD') }}"
+    update: true
+    force: false
+    depth: 1
+    key_file: "{{ ((requ_workspace_deploy_key | default('', true)) | length > 0) | ternary(requ_workspace_deploy_key, omit) }}"
+    accept_newhostkey: true
+  loop: "{{ requ_workspace_repos }}"
+  loop_control:
+    label: "{{ item.name }}"

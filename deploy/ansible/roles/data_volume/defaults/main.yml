@@ -1,0 +1,9 @@
+---
+requ_data_fstype: ext4
+# The attached OpenStack volume. Provisioning sets requ_data_volume_id and the
+# device is derived from it (virtio-blk exposes the first 20 characters of the
+# volume id). On virtio-scsi clouds, or for a hand-made VM, set
+# requ_data_device in the inventory, e.g. /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_<id>.
+requ_data_device: "{{ ('/dev/disk/by-id/virtio-' ~ requ_data_volume_id[:20]) if requ_data_volume_id is defined else '' }}"
+# postgres:16-alpine runs as uid/gid 70.
+requ_pgdata_owner: "70"

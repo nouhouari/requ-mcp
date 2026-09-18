@@ -1,0 +1,135 @@
+---
+- name: Settle the image reference
+  ansible.builtin.set_fact:
+    requ_image_effective: "{{ requ_image_effective | default(requ_image) }}"
+    requ_tag_effective: "{{ requ_tag_effective | default(requ_tag) }}"
+
+- name: Make the application directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ requ_app_dir }}"
+    - "{{ requ_app_dir }}/certs"
+
+- name: Install the LDAPS CA chain from a file
+  ansible.builtin.copy:
+    src: "{{ requ_ldap_ca_cert_src }}"
+    dest: "{{ requ_app_dir }}/certs/ldap-ca.pem"
+    mode: "0644"
+  when: requ_ldap_ca_cert_src | length > 0
+
+- name: Install the LDAPS CA chain from inline text
+  ansible.builtin.copy:
+    content: "{{ requ_ldap_ca_cert_pem }}"
+    dest: "{{ requ_app_dir }}/certs/ldap-ca.pem"
+    mode: "0644"
+  when: requ_ldap_ca_cert_src | length == 0 and requ_ldap_ca_cert_pem | length > 0
+
+- name: Render the compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ requ_app_dir }}/docker-compose.yml"
+    mode: "0600"
+
+- name: Render the compose environment
+  ansible.builtin.template:
+    src: compose.env.j2
+    dest: "{{ requ_app_dir }}/.env"
+    mode: "0600"
+  no_log: true
+
+- name: Render the application environment
+  ansible.builtin.template:
+    src: requ.env.j2
+    dest: "{{ requ_app_dir }}/requ.env"
+    mode: "0600"
+  no_log: true
+
+- name: Rendered only, stopping here
+  ansible.builtin.debug:
+    msg: "Compose files rendered under {{ requ_app_dir }}; nothing pulled or started (requ_render_only)."
+  when: requ_render_only | bool
+
+- name: Log in to the image registry
+  community.docker.docker_login:
+    registry_url: "{{ requ_image_effective.split('/')[0] }}"
+    username: "{{ requ_registry_username }}"
+    password: "{{ requ_registry_password }}"
+  when: requ_registry_username | length > 0 and not (requ_render_only | bool)
+  no_log: true
+
+- name: Is the stack already running
+  community.docker.docker_container_info:
+    name: requ-postgres-1
+  register: existing_postgres
+  when: not (requ_render_only | bool)
+
+- name: Dump the database before touching the containers
+  ansible.builtin.systemd_service:
+    name: requ-backup.service
+    state: started
+  when:
+    - not (requ_render_only | bool)
+    - requ_backup_before_deploy | bool
+    - existing_postgres.exists
+    - existing_postgres.container.State.Running | default(false)
+  changed_when: false
+  failed_when: false
+
+- name: Start or update the stack
+  when: not (requ_render_only | bool)
+  block:
+    - name: Apply the compose file
+      community.docker.docker_compose_v2:
+        project_src: "{{ requ_app_dir }}"
+        state: present
+        pull: "{{ 'never' if (requ_image_build | bool) else ('always' if requ_tag_effective == 'latest' else 'missing') }}"
+        build: "{{ 'always' if (requ_image_build | bool) else 'never' }}"
+        remove_orphans: true
+        wait: true
+        wait_timeout: 120
+
+    - name: Wait for requ to answer
+      ansible.builtin.uri:
+        url: "http://{{ requ_bind_ip }}:{{ requ_port }}/api/version"
+      register: requ_version
+      until: requ_version.status == 200
+      retries: 30
+      delay: 2
+
+    - name: Authentication came up in the configured mode
+      ansible.builtin.uri:
+        url: "http://{{ requ_bind_ip }}:{{ requ_port }}/api/auth/config"
+        return_content: true
+      register: requ_auth_config
+      failed_when: requ_auth_config.json.mode != requ_auth_mode
+  rescue:
+    - name: Container state
+      ansible.builtin.command:
+        cmd: docker compose ps -a
+        chdir: "{{ requ_app_dir }}"
+      register: compose_ps
+      changed_when: false
+      failed_when: false
+
+    - name: Last lines of the requ log
+      ansible.builtin.command:
+        cmd: docker compose logs --tail=200 requ
+        chdir: "{{ requ_app_dir }}"
+      register: compose_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Show what happened
+      ansible.builtin.debug:
+        msg:
+          - "{{ compose_ps.stdout_lines | default([]) }}"
+          - "{{ compose_logs.stdout_lines | default([]) }}"
+
+    - name: Stop here
+      ansible.builtin.fail:
+        msg: >-
+          requ did not become healthy. A configuration the server refuses makes it exit 1 and
+          restart in a loop; the log above names the setting. Fix the variable and re-run --tags requ.

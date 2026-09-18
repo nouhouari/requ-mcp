@@ -1,0 +1,13 @@
+# Full run: create the OpenStack resources when `provision` is true, configure
+# the host, prove the deployment.
+#
+#   ansible-playbook site.yml --ask-vault-pass                 # existing VM from inventory/
+#   ansible-playbook site.yml -e provision=true --ask-vault-pass
+#   ansible-playbook site.yml --tags requ -e requ_tag=2.1.1    # upgrade only
+---
+- name: Provision
+  ansible.builtin.import_playbook: provision.yml
+- name: Configure
+  ansible.builtin.import_playbook: configure.yml
+- name: Verify
+  ansible.builtin.import_playbook: verify.yml

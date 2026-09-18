@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { promises as fsp, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { SqliteStore } from "./sqlite-store.js";
 import { PostgresStore } from "./postgres-store.js";
@@ -35,6 +36,14 @@ import { ExportPayload, testKey, type CoverageMode, type Scenario, type TestStat
 import { buildExport, applyImport } from "./export-import.js";
 import { checkUiCoverage, isStale, resolveElements, screenExits } from "./screen-coverage.js";
 import { buildOpenApiDocument } from "./openapi.js";
+import { audit, flushChanges, recordingStore } from "./audit.js";
+import { handleAuditRoutes } from "./audit-routes.js";
+import { authenticateRequest, clientIp } from "./auth/authenticate.js";
+import { authConfig } from "./auth/config.js";
+import { newContext, runWithContext, type RequestContext } from "./auth/context.js";
+import { can, devPrincipal, type Permission, type Principal } from "./auth/model.js";
+import { isPublicRoute, permissionForRoute } from "./auth/rbac.js";
+import { handleAuthRoutes } from "./auth/routes.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -69,19 +78,77 @@ const MIME: Record<string, string> = {
   ".attach": "text/plain; charset=utf-8",
 };
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+/**
+ * Kept for the many response sites that spread it; CORS headers are now set
+ * per request by `applyCors`, so this stays empty.
+ */
+const CORS_HEADERS: Record<string, string> = {};
+
+/**
+ * Cross-origin access is opt-in (REQU_CORS_ORIGINS). The dashboard is
+ * same-origin and MCP clients are not browsers, so by default no browser on
+ * another origin gets to drive the API — with a wildcard, any page could have
+ * used a leaked personal access token from a script. Credentials are never
+ * allowed: the session cookie stays same-origin whatever the list says.
+ */
+function applyCors(req: IncomingMessage, res: ServerResponse): void {
+  const origins = authConfig().corsOrigins;
+  if (origins.length === 0) return;
+  const origin = req.headers.origin;
+  if (typeof origin !== "string" || !origin) return;
+  const allowed = origins.includes("*") ? "*" : origins.includes(origin) ? origin : null;
+  if (!allowed) return;
+  res.setHeader("Access-Control-Allow-Origin", allowed);
+  if (allowed !== "*") res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requ-Token");
+}
+
+/**
+ * What the dashboard shell may load and do. Scripts come from this server and
+ * the pinned jsDelivr files only — no inline scripts, so a payload smuggled
+ * into rendered content cannot run even if a sanitiser is bypassed.
+ * `'unsafe-eval'` is Alpine evaluating the expressions in the markup; inline
+ * *styles* are Alpine's `x-show`. Screen mockups render in a sandboxed srcdoc
+ * frame, which is what `frame-src` is for.
+ */
+const DASHBOARD_CSP = [
+  "default-src 'self'",
+  "script-src 'self' https://cdn.jsdelivr.net 'unsafe-eval'",
+  "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "img-src 'self' data: blob:",
+  "connect-src 'self'",
+  "frame-src 'self' blob: data:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join("; ");
+
+/** Headers every response carries, whatever route produced it. */
+function applySecurityHeaders(res: ServerResponse): void {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("Referrer-Policy", "same-origin");
+  // Only meaningful over TLS, which is exactly when the cookie is Secure.
+  if (authConfig().cookieSecure) res.setHeader("Strict-Transport-Security", "max-age=31536000");
+}
+
+/**
+ * A failure the caller did not cause. The real error goes to the server log
+ * under a reference the caller is given; the response itself says nothing
+ * about drivers, file paths or column names.
+ */
+function internalError(res: ServerResponse, err: unknown, req: IncomingMessage): void {
+  const ref = randomBytes(4).toString("hex");
+  console.error(`[requ-mcp] ${req.method ?? "?"} ${(req.url ?? "").split("?")[0]} failed (ref ${ref}):`, err);
+  jsonError(res, 500, `Internal server error (ref ${ref}).`, "INTERNAL");
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function setHeaders(res: ServerResponse, headers: Record<string, string>): void {
-  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
-}
 
 function jsonOk(res: ServerResponse, data: unknown): void {
   const body = JSON.stringify(data);
@@ -210,10 +277,11 @@ async function serveIndexHtml(res: ServerResponse): Promise<void> {
   const filePath = path.join(PUBLIC_DIR, "index.html");
   try {
     let html = await fsp.readFile(filePath, "utf-8");
-    html = html.replace(/(\/public\/(?:app|style)\.[a-z]+)"/g, `$1?v=${SERVER_VERSION}"`);
+    html = html.replace(/(\/public\/(?:app|style|tailwind|mermaid-boot)\.[a-z]+)"/g, `$1?v=${SERVER_VERSION}"`);
     const buf = Buffer.from(html, "utf-8");
     res.writeHead(200, {
       ...CORS_HEADERS,
+      "Content-Security-Policy": DASHBOARD_CSP,
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-cache",
       "Content-Length": buf.length,
@@ -522,22 +590,35 @@ async function resolveStore(
   // An unregistered version is not an empty one: writing to it would create a
   // whole baseline that list_versions and the dashboard cannot see, while still
   // consuming ids. Reject it here, as the MCP layer does.
-  const atVersion = async (store: AnyHttpStore): Promise<StoreResult> => {
+  //
+  // Every store handed out is wrapped by the change recorder, so a REST edit
+  // lands in the same history as the equivalent MCP tool call without each
+  // route having to remember to record it.
+  const atVersion = async (store: AnyHttpStore, slug: string): Promise<StoreResult> => {
     const version = searchParams.get("version");
-    if (!version) return { status: "ok", store };
+    if (!version) return { status: "ok", store: recordingStore(store, slug) };
     const known = await store.listVersions();
     if (!known.some((v) => v.version === version)) {
       return { status: "unknown_version", version, known: known.map((v) => v.version) };
     }
-    return { status: "ok", store: store.at(version) as AnyHttpStore };
+    return { status: "ok", store: recordingStore(store.at(version) as AnyHttpStore, slug) };
   };
 
-  if (stores.size === 1) return atVersion([...stores.values()][0]);
+  // Whatever named the project for authorisation must name the data too. A
+  // single-project server may omit `?project=`, but when it is given it has to
+  // match: silently serving "the only project" for some other name let a role
+  // or token scoped to that other name act on this project's data.
   const slug = searchParams.get("project");
-  if (!slug) return { status: "ambiguous", available: [...stores.keys()] };
+  if (!slug) {
+    if (stores.size === 1) {
+      const [only] = [...stores.entries()];
+      return atVersion(only[1], only[0]);
+    }
+    return { status: "ambiguous", available: [...stores.keys()] };
+  }
   const store = stores.get(slug);
   if (!store) return { status: "unknown_project", slug };
-  return atVersion(store);
+  return atVersion(store, slug);
 }
 
 function handleStoreResult(
@@ -570,6 +651,31 @@ function handleStoreResult(
 // Main export
 // ---------------------------------------------------------------------------
 
+/**
+ * The project a request is about, for authorisation and for the audit trail.
+ *
+ * `?project=` when given; otherwise the only loaded project, since a
+ * single-project server never needs the parameter. Null when neither applies —
+ * the route itself will then report the ambiguity.
+ */
+function projectSlugFor(stores: Map<string, AnyHttpStore>, searchParams: URLSearchParams): string | null {
+  const explicit = searchParams.get("project");
+  // A name the server does not know resolves to no project at all, so only
+  // global roles apply — never a stale grant that happens to spell the same
+  // name, and never the one project that is loaded.
+  if (explicit) return stores.has(explicit) ? explicit : null;
+  return stores.size === 1 ? [...stores.keys()][0] : null;
+}
+
+/**
+ * Authenticate the request, enforce the permission its route requires, and run
+ * the rest of the handling inside a context the audit trail and the change
+ * recorder can read.
+ *
+ * Static files — the dashboard shell itself — are served without a check: it is
+ * a login screen until `/api/auth/me` says otherwise, and gating the HTML as
+ * well would only replace that screen with a browser credential box.
+ */
 export async function handleWebRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -578,17 +684,135 @@ export async function handleWebRequest(
   const rawUrl = req.url ?? "/";
   const method = req.method ?? "GET";
 
+  applySecurityHeaders(res);
+  applyCors(req, res);
+
   // Handle CORS preflight.
   if (method === "OPTIONS") {
-    setHeaders(res, CORS_HEADERS);
     res.writeHead(204).end();
     return true;
   }
 
+  // Everything that exposes project data goes through the guard. The Allure
+  // report is project data too — it lists the team's test names and failures —
+  // so it is gated exactly like the API rather than left open because it happens
+  // to be static files.
+  const isGuarded =
+    rawUrl === "/api" ||
+    rawUrl.startsWith("/api?") ||
+    rawUrl.startsWith("/api/") ||
+    rawUrl === "/events" ||
+    rawUrl.startsWith("/events?") ||
+    rawUrl === "/allure" ||
+    rawUrl.startsWith("/allure/") ||
+    rawUrl.startsWith("/allure?");
+  if (!isGuarded) return routeWebRequest(req, res, stores);
+
   // Discover DB-native projects so the dashboard/API see them without env preload.
-  if (rawUrl.startsWith("/api/") || rawUrl === "/events" || rawUrl.startsWith("/events?")) {
-    await ensureDbProjects(stores);
-  }
+  await ensureDbProjects(stores);
+
+  const pathname = rawUrl.split("?")[0];
+  const searchParams = new URL(rawUrl, "http://localhost").searchParams;
+  // /allure/<slug>/… names its project in the path; everything else uses ?project=.
+  const allureSlug = /^\/allure\/([^/?]+)/.exec(pathname)?.[1] ?? null;
+  const projectSlug = allureSlug ?? projectSlugFor(stores, searchParams);
+
+  const attempt = await authenticateRequest(req, projectSlug);
+  const principal: Principal | null = attempt.ok ? attempt.principal : null;
+
+  const ctx: RequestContext = newContext({
+    // An unauthenticated request still needs a context so the denial is audited;
+    // it carries no roles, so it cannot pass any permission check.
+    principal: principal ?? anonymousPrincipal(),
+    source: "web",
+    ip: clientIp(req),
+    userAgent: (req.headers["user-agent"] as string | undefined) ?? null,
+    projectKey: projectSlug,
+  });
+
+  return runWithContext(ctx, async () => {
+    try {
+      // Login, logout and "who am I" are how a caller becomes authenticated, so
+      // they run before the guard.
+      if (await handleAuthRoutes(req, res, pathname, method, {
+        principal,
+        projectSlug,
+        source: "web",
+        resolveProject: (value) => (stores.has(value) ? value : null),
+      })) {
+        return true;
+      }
+
+      if (!principal && !isPublicRoute(method, pathname)) {
+        audit({
+          action: `${method} ${pathname}`,
+          outcome: "denied",
+          source: "web",
+          detail: { reason: attempt.ok ? "no principal" : attempt.reason },
+        });
+        jsonError(res, attempt.ok ? 401 : attempt.status, attempt.ok ? "Authentication required." : attempt.reason, "UNAUTHENTICATED");
+        return true;
+      }
+
+      const permission = permissionForRoute(method, pathname);
+      if (permission && principal && !can(principal, permission)) {
+        audit({ action: `${method} ${pathname}`, outcome: "denied", source: "web", permission });
+        jsonError(
+          res,
+          403,
+          `Permission denied: '${permission}' is required for ${method} ${pathname}.`,
+          "FORBIDDEN",
+        );
+        return true;
+      }
+
+      if (
+        principal &&
+        (await handleAuditRoutes(req, res, pathname, method, searchParams, principal, projectSlug, CORS_HEADERS))
+      ) {
+        return true;
+      }
+
+      const handled = await routeWebRequest(req, res, stores);
+      // Reads are not audited individually: the dashboard polls, and a row per
+      // poll would drown the record. Writes always are.
+      if (handled && method !== "GET" && method !== "HEAD") {
+        audit({
+          action: `${method} ${pathname}`,
+          outcome: res.statusCode >= 400 ? "error" : "ok",
+          source: "web",
+          permission,
+          projectId: projectSlug,
+          detail: { status: res.statusCode },
+        });
+      }
+      return handled;
+    } finally {
+      await flushChanges(ctx.changes);
+    }
+  });
+}
+
+/** A caller who presented nothing, or something invalid: no roles, no rights. */
+function anonymousPrincipal(): Principal {
+  return {
+    ...devPrincipal(),
+    kind: "anonymous",
+    userId: "anonymous",
+    username: "anonymous",
+    displayName: "Unauthenticated",
+    roles: [],
+    permissions: new Set<Permission>(),
+  };
+}
+
+async function routeWebRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  stores: Map<string, AnyHttpStore>,
+): Promise<boolean> {
+  const rawUrl = req.url ?? "/";
+  const method = req.method ?? "GET";
 
   // -------------------------------------------------------------------------
   // SSE — GET /events
@@ -757,7 +981,7 @@ export async function handleWebRequest(
         const url = stores.size > 1 ? `/allure/${slug}/` : "/allure/";
         jsonOk(res, { available, url });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -808,6 +1032,11 @@ export async function handleWebRequest(
         } else {
           store = [...stores.values()][0];
         }
+
+        // This route resolves its own store (the project may not exist yet), so
+        // it has to opt into the change recorder that resolveStore applies for
+        // every other route.
+        store = recordingStore(store, [...stores.entries()].find(([, s]) => s === store)?.[0] ?? "project");
 
         // Derive / validate key.
         let key: string;
@@ -863,7 +1092,7 @@ export async function handleWebRequest(
 
         jsonOk(res, { initialized: true, config: await store.readConfig() });
       } catch (err) {
-        jsonError(res, 500, (err as Error).message);
+        internalError(res, err, req);
       }
       return true;
     }
@@ -877,7 +1106,7 @@ export async function handleWebRequest(
         const summary = await computeSummary(r.store);
         jsonOk(res, summary);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -922,7 +1151,7 @@ export async function handleWebRequest(
           })
         );
         jsonOk(res, results.filter(Boolean));
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -937,7 +1166,7 @@ export async function handleWebRequest(
           draftVersion: cfg.draftVersion ?? null,
           versions,
         });
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -971,7 +1200,7 @@ export async function handleWebRequest(
           summary: { [entity]: diff.summary[entity] },
           entities: { [entity]: diff.entities[entity] },
         });
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -985,7 +1214,7 @@ export async function handleWebRequest(
         const result = await createVersion(r.store, body as never);
         if (!result.ok) { jsonError(res, 409, result.error); return true; }
         jsonOk(res, result.data);
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -1001,7 +1230,7 @@ export async function handleWebRequest(
           const result = await lockVersion(r.store, params.version, body as never);
           if (!result.ok) { jsonError(res, 409, result.error); return true; }
           jsonOk(res, result.data);
-        } catch (err) { jsonError(res, 500, String(err)); }
+        } catch (err) { internalError(res, err, req); }
         return true;
       }
     }
@@ -1018,7 +1247,7 @@ export async function handleWebRequest(
           const result = await unlockVersion(r.store, params.version, body as never);
           if (!result.ok) { jsonError(res, 409, result.error); return true; }
           jsonOk(res, result.data);
-        } catch (err) { jsonError(res, 500, String(err)); }
+        } catch (err) { internalError(res, err, req); }
         return true;
       }
     }
@@ -1033,7 +1262,7 @@ export async function handleWebRequest(
         const result = await setActiveVersion(r.store, body as never);
         if (!result.ok) { jsonError(res, 400, result.error); return true; }
         jsonOk(res, result.data);
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -1044,7 +1273,7 @@ export async function handleWebRequest(
       try {
         jsonOk(res, await r.store.listRequirements());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1065,7 +1294,7 @@ export async function handleWebRequest(
             .map((s) => s.id);
           jsonOk(res, { ...req_, linkedStoryIds });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1078,7 +1307,7 @@ export async function handleWebRequest(
       try {
         jsonOk(res, await r.store.listStories());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1094,7 +1323,7 @@ export async function handleWebRequest(
           if (!story) { jsonError(res, 404, `Story ${params.id} not found`); return true; }
           jsonOk(res, story);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1114,7 +1343,7 @@ export async function handleWebRequest(
             .map((sc) => scenarioSummary(sc, storyById, undefined, true));
           jsonOk(res, list);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1166,7 +1395,7 @@ export async function handleWebRequest(
           scenariosPassing,
         });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1197,7 +1426,7 @@ export async function handleWebRequest(
           });
         jsonOk(res, { total: list.length, adrs: list });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1220,7 +1449,7 @@ export async function handleWebRequest(
           });
           res.end(body);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1245,7 +1474,7 @@ export async function handleWebRequest(
             supersedes: adrs.filter((a) => a.supersededBy === adr.id).map((a) => a.id),
           });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1287,7 +1516,7 @@ export async function handleWebRequest(
           });
         jsonOk(res, { total: list.length, screens: list });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1312,7 +1541,7 @@ export async function handleWebRequest(
           });
           res.end(body);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1346,7 +1575,7 @@ export async function handleWebRequest(
             usedBy: screens.filter((s) => s.uses.includes(screen.id)).map((s) => s.id),
           });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1379,7 +1608,7 @@ export async function handleWebRequest(
           defaultPlatforms: config?.uiPlatforms ?? [],
         }));
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1391,7 +1620,7 @@ export async function handleWebRequest(
       try {
         jsonOk(res, await r.store.listComponents());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1403,7 +1632,7 @@ export async function handleWebRequest(
       try {
         jsonOk(res, await r.store.listPhases());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1416,7 +1645,7 @@ export async function handleWebRequest(
         if (!await r.store.isInitialized()) return notInitialized(res);
         jsonOk(res, await r.store.readConfig());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1440,7 +1669,7 @@ export async function handleWebRequest(
         await r.store.writeConfig(updated);
         jsonOk(res, await r.store.readConfig());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1452,7 +1681,7 @@ export async function handleWebRequest(
       try {
         jsonOk(res, await r.store.listVcsRefs());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1468,7 +1697,7 @@ export async function handleWebRequest(
         const trend = buildTrend(requirements, stories, storyMap, executionsByPhase, phases, mode);
         jsonOk(res, trend);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1490,7 +1719,7 @@ export async function handleWebRequest(
         const gaps = findGaps(requirements, stories, storyMap, status, phaseId, mode, phases);
         jsonOk(res, gaps);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1526,7 +1755,7 @@ export async function handleWebRequest(
         };
         jsonOk(res, enriched);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1578,7 +1807,7 @@ export async function handleWebRequest(
           scenarios: page.map((sc) => scenarioSummary(sc, storyById, statusMap?.get(sc.testKey), includeContent)),
         });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1605,7 +1834,7 @@ export async function handleWebRequest(
             source: sc.source,
           });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1622,7 +1851,7 @@ export async function handleWebRequest(
         const list = [...counts.entries()].map(([tag, count]) => ({ tag, count })).sort((a, b) => a.tag.localeCompare(b.tag));
         jsonOk(res, list);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1645,7 +1874,7 @@ export async function handleWebRequest(
         });
         res.end(body);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1682,7 +1911,7 @@ export async function handleWebRequest(
       } catch (err) {
         const msg = (err as Error).message;
         if (msg === "Payload too large") { jsonError(res, 413, msg); }
-        else { jsonError(res, 500, msg); }
+        else { internalError(res, err, req); }
       }
       return true;
     }
@@ -1742,7 +1971,7 @@ export async function handleWebRequest(
         await r.store.appendExecutions(phaseId, [exec]);
         jsonOk(res, { phase: phaseId, recorded: exec });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }

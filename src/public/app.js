@@ -183,11 +183,116 @@ document.addEventListener('alpine:init', function () {
       diffLoading: false,
       diffError: '',
 
+      // ── Authentication, roles and the audit trail ───────────────────────────
+      // `auth.loaded` gates the whole shell: until the server has said whether
+      // it requires a login, neither the dashboard nor the login form is shown,
+      // so a secured instance never flashes its contents at a signed-out visitor.
+      auth: {
+        loaded: false,
+        enabled: false,
+        mode: 'disabled',
+        auditEnabled: false,
+        authenticated: false,
+        warning: null,
+        userId: '', username: '', displayName: '', email: null,
+        kind: '', tokenName: '',
+        roles: [], permissions: [], groups: [],
+        // What the caller may do server-wide, as opposed to on the project
+        // currently in view. A project's admin has project:members here but no
+        // admin:users, which is what keeps the two panels apart.
+        globalPermissions: [],
+      },
+      // `step` drives the sign-in card: password first, then — when the server
+      // says a second factor is owed — either a code or a forced enrolment.
+      login: { username: '', password: '', code: '', error: '', busy: false, step: 'password', challenge: '' },
+
+      // ── Second factor ───────────────────────────────────────────────────────
+      twofa: {
+        available: false, mode: 'off', enrolled: false, required: false,
+        confirmedAt: null, recoveryCodesRemaining: 0,
+      },
+      twofaSetup: null,      // { uri, qrSvg, secret } while enrolling
+      twofaCode: '',
+      twofaError: '',
+      twofaBusy: false,
+      /** Shown once, right after enrolling or reissuing. */
+      recoveryCodes: [],
+      recoveryCopied: false,
+
+      accountOpen: false,
+      tokens: [],
+      tokensLoading: false,
+      tokenForm: { name: '', maxRole: '', expiresInDays: '', projects: '' },
+      tokenBusy: false,
+      tokenError: '',
+      /** Shown once, right after minting: the server keeps only a hash. */
+      mintedToken: '',
+      mintedCopied: false,
+
+      auditEntries: [],
+      auditTotal: 0,
+      auditLoading: false,
+      auditFilters: { actor: '', action: '', outcome: '', source: '', scope: 'project' },
+      auditPage: 1,
+      auditPageSize: 50,
+
+      historyOpen: false,
+      historyEntity: '',
+      historyEntityId: '',
+      historyChanges: [],
+      historyLoading: false,
+
+      activity: [],
+      activityLoading: false,
+
+      adminUsers: [],
+      adminLoading: false,
+      adminError: '',
+      grantForm: { userId: '', role: 'viewer', projectId: '' },
+      ldapStatus: null,
+
+      members: [],
+      membersLoading: false,
+      membersError: '',
+      membersDefaultRole: null,
+      memberForm: { username: '', role: 'viewer' },
+      memberBusy: false,
+
+      // ── The role catalogue ──
+      //
+      // Two scopes: the shared roles the server defines, and the ones a project
+      // defines for itself. Both lists are kept because the pickers need every
+      // role that can be *assigned* here, while the editor only ever writes to
+      // one scope at a time.
+      sharedRoles: [],
+      projectRoles: [],
+      permissionCatalogue: [],
+      permissionGroups: [],
+      canEditSharedRoles: false,
+      canEditProjectRoles: false,
+      rolesLoading: false,
+      rolesError: '',
+      roleScope: 'project',
+      roleEditorOpen: false,
+      roleEditorMode: 'create',
+      roleForm: { id: '', name: '', description: '', permissions: [], builtIn: false, projectId: null },
+      roleBusy: false,
+
       // =========================================================================
       // Lifecycle
       // =========================================================================
 
       async init() {
+        // Who am I, and does this server even require a login? Everything else
+        // waits on the answer: loading project data first would just produce a
+        // screenful of 401s on a secured instance.
+        await this.loadAuth();
+        if (this.auth.enabled && !this.auth.authenticated) return;
+        await this.bootDashboard();
+      },
+
+      /** Load the dashboard proper. Split out so signing in can call it. */
+      async bootDashboard() {
         var vd = await this._fetch('/api/version');
         if (vd && vd.version) this.appVersion = vd.version;
         await this.loadProjects();
@@ -230,6 +335,12 @@ document.addEventListener('alpine:init', function () {
       async _fetch(url) {
         try {
           var res = await window.fetch(url);
+          // A session that expired mid-visit must return the user to the login
+          // form rather than quietly emptying every panel.
+          if (res.status === 401 && this.auth.enabled) {
+            this.auth.authenticated = false;
+            return null;
+          }
           if (res.status === 503) {
             var body = await res.json().catch(function () { return {}; });
             if (body && body.code === 'NOT_INITIALIZED') {
@@ -243,6 +354,861 @@ document.addEventListener('alpine:init', function () {
           return await res.json();
         } catch (_) {
           return null;
+        }
+      },
+
+      // =========================================================================
+      // Authentication, roles, tokens and the audit trail
+      // =========================================================================
+
+      /** True when the signed-in principal holds a permission on this project. */
+      can(permission) {
+        return (this.auth.permissions || []).indexOf(permission) !== -1;
+      },
+
+      /** True when they hold it server-wide, which is a stronger claim. */
+      canGlobal(permission) {
+        return (this.auth.globalPermissions || []).indexOf(permission) !== -1;
+      },
+
+      /** Whether the Access tab has anything to show this caller. */
+      canSeeAccess() {
+        return this.can('project:members') || this.canGlobal('admin:users');
+      },
+
+      /** Strongest role held, for the badge in the header. */
+      topRole() {
+        var order = ['viewer', 'contributor', 'maintainer', 'admin'];
+        var best = '';
+        (this.auth.roles || []).forEach(function (r) {
+          if (order.indexOf(r) > order.indexOf(best)) best = r;
+        });
+        return best;
+      },
+
+      roleClass(role) {
+        return role === 'admin' ? 'chip-red'
+          : role === 'maintainer' ? 'chip-indigo'
+          : role === 'contributor' ? 'chip-green'
+          : 'chip-slate';
+      },
+
+      async loadAuth() {
+        var cfg = await this._fetch('/api/auth/config');
+        if (cfg) {
+          this.auth.enabled = !!cfg.enabled;
+          this.auth.mode = cfg.mode || 'disabled';
+          this.auth.auditEnabled = !!cfg.auditEnabled;
+          this.auth.warning = cfg.warning || null;
+        }
+        var me = await this._fetch('/api/auth/me');
+        if (me && me.authenticated) {
+          this.auth.authenticated = true;
+          this.auth.userId = me.userId || '';
+          this.auth.username = me.username || '';
+          this.auth.displayName = me.displayName || me.username || '';
+          this.auth.email = me.email || null;
+          this.auth.kind = me.kind || '';
+          this.auth.tokenName = me.tokenName || '';
+          this.auth.roles = me.roles || [];
+          this.auth.permissions = me.permissions || [];
+          this.auth.globalPermissions = me.globalPermissions || [];
+          this.auth.groups = me.groups || [];
+        } else {
+          this.auth.authenticated = false;
+          this.auth.roles = [];
+          this.auth.permissions = [];
+          this.auth.globalPermissions = [];
+        }
+        this.auth.loaded = true;
+      },
+
+      async doLogin() {
+        if (this.login.busy) return;
+        this.login.busy = true;
+        this.login.error = '';
+        try {
+          var res = await window.fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: this.login.username, password: this.login.password }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) {
+            this.login.error = body.error || 'Sign-in failed.';
+            return;
+          }
+          // Never keep the password in the component once it has been used.
+          this.login.password = '';
+
+          // A second factor is still owed: no session cookie was set, and the
+          // challenge is what the next step is submitted against.
+          if (body.twoFactor && body.twoFactor.required) {
+            this.login.challenge = body.twoFactor.challenge;
+            this.login.step = body.twoFactor.step === 'enrol' ? 'enrol' : 'code';
+            if (this.login.step === 'enrol') await this.startForcedEnrolment();
+            return;
+          }
+          await this.afterSignIn();
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        } finally {
+          this.login.busy = false;
+        }
+      },
+
+      async afterSignIn() {
+        this.login.step = 'password';
+        this.login.challenge = '';
+        this.login.code = '';
+        await this.loadAuth();
+        if (this.auth.authenticated) await this.bootDashboard();
+      },
+
+      /** Submit the code from the authenticator app, or a recovery code. */
+      async submitLoginCode() {
+        if (this.login.busy) return;
+        if (!this.login.code.trim()) { this.login.error = 'Enter the code from your authenticator app.'; return; }
+        this.login.busy = true;
+        this.login.error = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge: this.login.challenge, code: this.login.code.trim() }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) {
+            this.login.error = body.error || 'That code was not accepted.';
+            // An expired challenge means starting over from the password.
+            if (body.code === 'BAD_CHALLENGE') this.login.step = 'password';
+            return;
+          }
+          if (body.usedRecoveryCode) {
+            window.alert(
+              'You signed in with a recovery code. ' + body.recoveryCodesRemaining +
+              ' remain — generate a new set from your account page.'
+            );
+          }
+          await this.afterSignIn();
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        } finally {
+          this.login.busy = false;
+        }
+      },
+
+      /** Policy demands a second factor this account does not have yet. */
+      async startForcedEnrolment() {
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/enrol', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge: this.login.challenge }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.login.error = body.error || 'Could not start enrolment.'; return; }
+          this.twofaSetup = body.enrolment;
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        }
+      },
+
+      async confirmForcedEnrolment() {
+        if (this.login.busy) return;
+        this.login.busy = true;
+        this.login.error = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/enrol', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge: this.login.challenge, code: this.login.code.trim() }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.login.error = body.error || 'That code was not accepted.'; return; }
+          this.recoveryCodes = body.recoveryCodes || [];
+          this.twofaSetup = null;
+          await this.afterSignIn();
+          // Shown after the dashboard loads: these cannot be retrieved later.
+          this.accountOpen = true;
+        } catch (e) {
+          this.login.error = 'Could not reach the server.';
+        } finally {
+          this.login.busy = false;
+        }
+      },
+
+      async doLogout() {
+        try {
+          await window.fetch('/api/auth/logout', { method: 'POST' });
+        } catch (_) { /* signing out locally regardless */ }
+        window.location.reload();
+      },
+
+      // ── Second factor, from the account page ────────────────────────────────
+
+      async loadTwoFactor() {
+        var d = await this._fetch('/api/auth/2fa');
+        if (d) this.twofa = d;
+      },
+
+      async startEnrolment() {
+        this.twofaBusy = true;
+        this.twofaError = '';
+        this.recoveryCodes = [];
+        try {
+          var res = await window.fetch('/api/auth/2fa/setup', { method: 'POST' });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'Could not start enrolment.'; return; }
+          this.twofaSetup = body;
+          this.twofaCode = '';
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        } finally {
+          this.twofaBusy = false;
+        }
+      },
+
+      async confirmEnrolment() {
+        if (this.twofaBusy) return;
+        this.twofaBusy = true;
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: this.twofaCode.trim() }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'That code was not accepted.'; return; }
+          this.recoveryCodes = body.recoveryCodes || [];
+          this.twofaSetup = null;
+          this.twofaCode = '';
+          await this.loadTwoFactor();
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        } finally {
+          this.twofaBusy = false;
+        }
+      },
+
+      cancelEnrolment() {
+        this.twofaSetup = null;
+        this.twofaCode = '';
+        this.twofaError = '';
+      },
+
+      async disableTwoFactor() {
+        var code = window.prompt('Enter a current code from your authenticator to confirm removing it:');
+        if (!code) return;
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/disable', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: code }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'Could not remove it.'; return; }
+          this.recoveryCodes = [];
+          await this.loadTwoFactor();
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        }
+      },
+
+      async reissueRecoveryCodes() {
+        var code = window.prompt('Enter a current code from your authenticator to issue a new set:');
+        if (!code) return;
+        this.twofaError = '';
+        try {
+          var res = await window.fetch('/api/auth/2fa/recovery-codes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: code }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.twofaError = body.error || 'Could not issue new codes.'; return; }
+          this.recoveryCodes = body.recoveryCodes || [];
+          await this.loadTwoFactor();
+        } catch (e) {
+          this.twofaError = 'Could not reach the server.';
+        }
+      },
+
+      async copyRecoveryCodes() {
+        try {
+          await navigator.clipboard.writeText(this.recoveryCodes.join('\n'));
+          this.recoveryCopied = true;
+          var self = this;
+          setTimeout(function () { self.recoveryCopied = false; }, 2000);
+        } catch (_) { /* clipboard blocked — they are on screen to select */ }
+      },
+
+      /** Administrator clearing a lost authenticator for someone else. */
+      async resetUserTwoFactor(user) {
+        if (!window.confirm(
+          'Reset two-factor authentication for ' + (user.displayName || user.id) + '?\n\n' +
+          'Their authenticator and recovery codes stop working and every session they have is ended. ' +
+          'Only do this once you are sure who you are talking to.'
+        )) return;
+        this.adminError = '';
+        try {
+          var res = await window.fetch('/api/admin/users/' + encodeURIComponent(user.id) + '/2fa', { method: 'DELETE' });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.adminError = body.error || 'Could not reset it.'; return; }
+          await this.loadAdminUsers();
+        } catch (e) {
+          this.adminError = 'Could not reach the server.';
+        }
+      },
+
+      // ── Personal access tokens ──────────────────────────────────────────────
+
+      async openAccount() {
+        this.accountOpen = true;
+        this.mintedToken = '';
+        this.mintedCopied = false;
+        this.tokenError = '';
+        this.twofaError = '';
+        await Promise.all([this.loadTokens(), this.loadTwoFactor()]);
+      },
+
+      async loadTokens() {
+        this.tokensLoading = true;
+        try {
+          var d = await this._fetch('/api/auth/tokens');
+          this.tokens = Array.isArray(d) ? d : [];
+        } finally {
+          this.tokensLoading = false;
+        }
+      },
+
+      async createToken() {
+        if (this.tokenBusy) return;
+        this.tokenBusy = true;
+        this.tokenError = '';
+        this.mintedToken = '';
+        this.mintedCopied = false;
+        try {
+          var payload = { name: this.tokenForm.name || 'MCP client' };
+          if (this.tokenForm.maxRole) payload.maxRole = this.tokenForm.maxRole;
+          var days = parseInt(this.tokenForm.expiresInDays, 10);
+          if (days > 0) payload.expiresInDays = days;
+          var projects = (this.tokenForm.projects || '').split(',').map(function (p) { return p.trim(); }).filter(Boolean);
+          if (projects.length) payload.projects = projects;
+
+          var res = await window.fetch('/api/auth/tokens', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.tokenError = body.error || 'Could not create the token.'; return; }
+          this.mintedToken = body.token || '';
+          this.tokenForm = { name: '', maxRole: '', expiresInDays: '', projects: '' };
+          await this.loadTokens();
+        } catch (e) {
+          this.tokenError = 'Could not reach the server.';
+        } finally {
+          this.tokenBusy = false;
+        }
+      },
+
+      async revokeToken(id) {
+        if (!window.confirm('Revoke this token? Any MCP client still using it will stop working immediately.')) return;
+        try {
+          await window.fetch('/api/auth/tokens/' + encodeURIComponent(id), { method: 'DELETE' });
+          await this.loadTokens();
+        } catch (_) { /* the list refresh will show the real state */ }
+      },
+
+      /** The MCP client configuration a freshly minted token goes into. */
+      mcpConfigSnippet() {
+        var origin = window.location.origin;
+        return JSON.stringify({
+          mcpServers: {
+            requ: {
+              type: 'http',
+              url: origin + '/mcp',
+              headers: { Authorization: 'Bearer ' + (this.mintedToken || '<your token>') },
+            },
+          },
+        }, null, 2);
+      },
+
+      async copyMinted(text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          this.mintedCopied = true;
+          var self = this;
+          setTimeout(function () { self.mintedCopied = false; }, 2000);
+        } catch (_) { /* clipboard blocked — the value is on screen to select */ }
+      },
+
+      // ── Audit log ───────────────────────────────────────────────────────────
+
+      async loadAudit() {
+        if (!this.can('audit:read')) return;
+        this.auditLoading = true;
+        try {
+          var params = new URLSearchParams();
+          params.set('limit', String(this.auditPageSize));
+          params.set('offset', String((this.auditPage - 1) * this.auditPageSize));
+          if (this.auditFilters.scope === 'all') params.set('scope', 'all');
+          else if (this.projects.length > 1 && this.activeProject) params.set('project', this.activeProject.slug);
+          if (this.auditFilters.actor)   params.set('actor', this.auditFilters.actor);
+          if (this.auditFilters.action)  params.set('action', this.auditFilters.action);
+          if (this.auditFilters.outcome) params.set('outcome', this.auditFilters.outcome);
+          if (this.auditFilters.source)  params.set('source', this.auditFilters.source);
+          var d = await this._fetch('/api/audit?' + params.toString());
+          this.auditEntries = (d && d.entries) || [];
+          this.auditTotal = (d && d.total) || 0;
+        } finally {
+          this.auditLoading = false;
+        }
+      },
+
+      auditPages() {
+        return Math.max(1, Math.ceil(this.auditTotal / this.auditPageSize));
+      },
+
+      gotoAuditPage(n) {
+        this.auditPage = Math.min(Math.max(1, n), this.auditPages());
+        this.loadAudit();
+      },
+
+      resetAuditFilters() {
+        this.auditFilters = { actor: '', action: '', outcome: '', source: '', scope: 'project' };
+        this.auditPage = 1;
+        this.loadAudit();
+      },
+
+      outcomeClass(outcome) {
+        return outcome === 'ok' ? 'chip-green' : outcome === 'denied' ? 'chip-red' : 'chip-amber';
+      },
+
+      // ── Change history (the Jira-style "what changed" panel) ────────────────
+
+      /** The project-wide activity stream shown alongside the audit log. */
+      async loadActivity() {
+        if (!this.can('history:read')) return;
+        this.activityLoading = true;
+        try {
+          var d = await this._fetch(this.apiUrlNoVersion('/api/history?limit=100'));
+          this.activity = (d && d.changes) || [];
+        } finally {
+          this.activityLoading = false;
+        }
+      },
+
+      /** Like apiUrl(), but without pinning a version: history spans all of them. */
+      apiUrlNoVersion(p) {
+        var out = p;
+        if (this.projects.length > 1 && this.activeProject) {
+          out += (out.indexOf('?') === -1 ? '?' : '&') + 'project=' + this.activeProject.slug;
+        }
+        return out;
+      },
+
+      async openHistory(entity, entityId) {
+        this.historyOpen = true;
+        this.historyEntity = entity;
+        this.historyEntityId = entityId;
+        this.historyChanges = [];
+        this.historyLoading = true;
+        try {
+          var p = '/api/history/' + encodeURIComponent(entity) + '/' + encodeURIComponent(entityId);
+          var d = await this._fetch(this.apiUrlNoVersion(p));
+          this.historyChanges = (d && d.changes) || [];
+        } finally {
+          this.historyLoading = false;
+        }
+      },
+
+      closeHistory() {
+        this.historyOpen = false;
+        this.historyChanges = [];
+      },
+
+      /** A field value rendered for the history table. */
+      historyValue(v) {
+        if (v === null || v === undefined || v === '') return '—';
+        if (Array.isArray(v)) return v.length ? v.join(', ') : '—';
+        if (typeof v === 'object') return JSON.stringify(v);
+        var s = String(v);
+        return s.length > 160 ? s.slice(0, 160) + '…' : s;
+      },
+
+      changeActionClass(action) {
+        return action === 'created' ? 'chip-green'
+          : action === 'deleted' ? 'chip-red'
+          : action === 'restored' ? 'chip-amber'
+          : 'chip-indigo';
+      },
+
+      // ── Project membership ──────────────────────────────────────────────────
+
+      /** The project the membership panel is about. */
+      memberProject() {
+        return this.activeProject ? this.activeProject.slug : null;
+      },
+
+      async loadMembers() {
+        var project = this.memberProject();
+        if (!project || !this.can('project:members')) return;
+        this.membersLoading = true;
+        this.membersError = '';
+        try {
+          var d = await this._fetch('/api/projects/' + encodeURIComponent(project) + '/members');
+          this.members = (d && d.members) || [];
+          this.membersDefaultRole = d ? d.defaultRole : null;
+        } finally {
+          this.membersLoading = false;
+        }
+      },
+
+      async addMember() {
+        var project = this.memberProject();
+        if (!project) return;
+        if (!this.memberForm.username.trim()) { this.membersError = 'Enter a username.'; return; }
+        this.memberBusy = true;
+        this.membersError = '';
+        try {
+          var res = await window.fetch('/api/projects/' + encodeURIComponent(project) + '/members', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: this.memberForm.username.trim(), role: this.memberForm.role }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.membersError = body.error || 'Could not add that member.'; return; }
+          this.memberForm.username = '';
+          await this.loadMembers();
+        } catch (e) {
+          this.membersError = 'Could not reach the server.';
+        } finally {
+          this.memberBusy = false;
+        }
+      },
+
+      /** Changing a role is the same call as adding: one role per person here. */
+      async setMemberRole(member, role) {
+        var project = this.memberProject();
+        if (!project || role === member.projectRole) return;
+        this.membersError = '';
+        try {
+          var res = await window.fetch('/api/projects/' + encodeURIComponent(project) + '/members', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: member.userId, role: role }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.membersError = body.error || 'Could not change that role.'; }
+          await this.loadMembers();
+        } catch (e) {
+          this.membersError = 'Could not reach the server.';
+        }
+      },
+
+      async removeMember(member) {
+        var project = this.memberProject();
+        if (!project) return;
+        if (!window.confirm('Remove ' + (member.displayName || member.userId) + ' from ' + project + '?')) return;
+        this.membersError = '';
+        try {
+          var res = await window.fetch(
+            '/api/projects/' + encodeURIComponent(project) + '/members/' + encodeURIComponent(member.userId),
+            { method: 'DELETE' },
+          );
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.membersError = body.error || 'Could not remove that member.'; return; }
+          // Access inherited from a group or a server-wide grant survives, and
+          // saying so beats a row that stubbornly refuses to disappear.
+          if (body.stillHasAccess) {
+            this.membersError =
+              (member.displayName || member.userId) +
+              ' still reaches this project through ' +
+              (body.remainingRoles || []).join(', ') +
+              ' granted elsewhere. Remove that grant to revoke access entirely.';
+          }
+          await this.loadMembers();
+        } catch (e) {
+          this.membersError = 'Could not reach the server.';
+        }
+      },
+
+      /** Explains, in words, where a member's access comes from. */
+      memberOrigin(member) {
+        var bits = [];
+        if (member.projectRole) bits.push('added here as ' + member.projectRole);
+        (member.inherited || []).forEach(function (i) {
+          if (i.source === 'group') bits.push(i.role + ' from a directory group');
+          else if (i.source === 'global') bits.push(i.role + ' on all projects');
+          else if (i.source === 'bootstrap') bits.push('server administrator');
+          else if (i.source === 'default') bits.push(i.role + ' by default');
+        });
+        return bits.join(' · ');
+      },
+
+      // ── The role catalogue ──────────────────────────────────────────────────
+
+      /**
+       * Load both scopes.
+       *
+       * The shared catalogue is readable by anyone signed in — you cannot be
+       * asked to choose a role without being told what the choices mean — so
+       * this runs for every user, not only administrators.
+       */
+      async loadRoles() {
+        this.rolesLoading = true;
+        this.rolesError = '';
+        try {
+          var shared = await this._fetch('/api/roles');
+          if (shared) {
+            this.sharedRoles = shared.roles || [];
+            this.permissionCatalogue = shared.permissions || [];
+            this.permissionGroups = shared.permissionGroups || [];
+            this.canEditSharedRoles = !!shared.canEdit;
+          }
+          var project = this.memberProject();
+          if (project && this.can('project:members')) {
+            var own = await this._fetch('/api/projects/' + encodeURIComponent(project) + '/roles');
+            if (own) {
+              this.projectRoles = own.roles || [];
+              this.canEditProjectRoles = !!own.canEdit;
+            }
+          } else {
+            this.projectRoles = [];
+            this.canEditProjectRoles = false;
+          }
+          if (!this.canEditProjectRoles && this.canEditSharedRoles) this.roleScope = 'shared';
+        } finally {
+          this.rolesLoading = false;
+        }
+      },
+
+      /** Every role that can be given to someone on the project in view. */
+      assignableRoles() {
+        return this.projectRoles.length ? this.projectRoles : this.sharedRoles;
+      },
+
+      /** The list the editor is currently showing. */
+      visibleRoles() {
+        return this.roleScope === 'shared' ? this.sharedRoles : this.projectRoles;
+      },
+
+      canEditScope() {
+        return this.roleScope === 'shared' ? this.canEditSharedRoles : this.canEditProjectRoles;
+      },
+
+      /** A role's human name, falling back to the id for one that is gone. */
+      roleName(id) {
+        var all = this.assignableRoles();
+        for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i].name;
+        return id;
+      },
+
+      /** What a role grants, in words, for a title attribute. */
+      roleSummary(role) {
+        var self = this;
+        return (role.permissions || [])
+          .map(function (p) { return self.permissionLabel(p); })
+          .join(', ') || 'nothing';
+      },
+
+      permissionLabel(id) {
+        for (var i = 0; i < this.permissionCatalogue.length; i++) {
+          if (this.permissionCatalogue[i].id === id) return this.permissionCatalogue[i].label;
+        }
+        return id;
+      },
+
+      permissionsInGroup(groupId) {
+        return this.permissionCatalogue.filter(function (p) { return p.group === groupId; });
+      },
+
+      /**
+       * A project cannot confer a server-wide permission, so the editor does not
+       * offer one — refusing the save afterwards would be a worse way to say it.
+       */
+      permissionOfferedHere(permission) {
+        return !(this.roleScope === 'project' && permission.id === 'admin:users');
+      },
+
+      newRole() {
+        this.roleEditorMode = 'create';
+        this.roleForm = { id: '', name: '', description: '', permissions: ['spec:read'], builtIn: false, projectId: null };
+        this.rolesError = '';
+        this.roleEditorOpen = true;
+      },
+
+      editRole(role) {
+        this.roleEditorMode = 'edit';
+        this.roleForm = {
+          id: role.id,
+          name: role.name,
+          description: role.description || '',
+          permissions: (role.permissions || []).slice(),
+          builtIn: !!role.builtIn,
+          projectId: role.projectId,
+        };
+        this.rolesError = '';
+        this.roleEditorOpen = true;
+      },
+
+      /** Start from an existing role — the usual way a team's own role begins. */
+      copyRole(role) {
+        this.roleEditorMode = 'create';
+        this.roleForm = {
+          id: '',
+          name: role.name + ' (copy)',
+          description: role.description || '',
+          permissions: (role.permissions || []).slice(),
+          builtIn: false,
+          projectId: null,
+        };
+        this.rolesError = '';
+        this.roleEditorOpen = true;
+      },
+
+      closeRoleEditor() {
+        this.roleEditorOpen = false;
+        this.rolesError = '';
+      },
+
+      roleHasPermission(id) {
+        return this.roleForm.permissions.indexOf(id) !== -1;
+      },
+
+      toggleRolePermission(id) {
+        var at = this.roleForm.permissions.indexOf(id);
+        if (at === -1) this.roleForm.permissions.push(id);
+        else this.roleForm.permissions.splice(at, 1);
+      },
+
+      roleScopeBase() {
+        if (this.roleScope === 'shared') return '/api/roles';
+        return '/api/projects/' + encodeURIComponent(this.memberProject() || '') + '/roles';
+      },
+
+      async saveRole() {
+        if (!this.roleForm.name.trim()) { this.rolesError = 'Give the role a name.'; return; }
+        this.roleBusy = true;
+        this.rolesError = '';
+        try {
+          var creating = this.roleEditorMode === 'create';
+          var url = this.roleScopeBase() + (creating ? '' : '/' + encodeURIComponent(this.roleForm.id));
+          var payload = {
+            name: this.roleForm.name.trim(),
+            description: this.roleForm.description.trim(),
+            permissions: this.roleForm.permissions,
+          };
+          // The id is settled when the role is created and never moves: grants,
+          // tokens and the directory group map all point at it.
+          if (creating && this.roleForm.id.trim()) payload.id = this.roleForm.id.trim();
+          var res = await window.fetch(url, {
+            method: creating ? 'POST' : 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.rolesError = body.error || 'Could not save that role.'; return; }
+          this.roleEditorOpen = false;
+          await this.loadRoles();
+          await this.loadMembers();
+        } catch (e) {
+          this.rolesError = 'Could not reach the server.';
+        } finally {
+          this.roleBusy = false;
+        }
+      },
+
+      async deleteRole(role) {
+        if (!window.confirm('Delete the role "' + role.name + '"?')) return;
+        this.rolesError = '';
+        var url = this.roleScopeBase() + '/' + encodeURIComponent(role.id);
+        try {
+          var res = await window.fetch(url, { method: 'DELETE' });
+          var body = await res.json().catch(function () { return {}; });
+          // A role people still hold is refused first, and only deleted once the
+          // consequence — losing that access — has been said out loud.
+          if (res.status === 409) {
+            if (!window.confirm(body.error + '\n\nDelete it anyway and revoke those grants?')) return;
+            res = await window.fetch(url + '?force=true', { method: 'DELETE' });
+            body = await res.json().catch(function () { return {}; });
+          }
+          if (!res.ok) { this.rolesError = body.error || 'Could not delete that role.'; return; }
+          await this.loadRoles();
+          await this.loadMembers();
+        } catch (e) {
+          this.rolesError = 'Could not reach the server.';
+        }
+      },
+
+      // ── Access administration ───────────────────────────────────────────────
+
+      async loadAdminUsers() {
+        if (!this.canGlobal('admin:users')) return;
+        this.adminLoading = true;
+        this.adminError = '';
+        try {
+          var d = await this._fetch('/api/admin/users');
+          this.adminUsers = Array.isArray(d) ? d : [];
+          this.ldapStatus = await this._fetch('/api/admin/ldap-check');
+        } finally {
+          this.adminLoading = false;
+        }
+      },
+
+      async grantRole() {
+        if (!this.grantForm.userId) { this.adminError = 'Pick a user first.'; return; }
+        this.adminError = '';
+        try {
+          var res = await window.fetch('/api/admin/roles', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId: this.grantForm.userId,
+              role: this.grantForm.role,
+              projectId: this.grantForm.projectId || '*',
+            }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.adminError = body.error || 'Could not grant the role.'; return; }
+          await this.loadAdminUsers();
+        } catch (e) {
+          this.adminError = 'Could not reach the server.';
+        }
+      },
+
+      async revokeBinding(userId, projectId, role) {
+        if (!window.confirm('Revoke ' + role + ' from ' + userId + (projectId === '*' ? ' (all projects)' : ' on ' + projectId) + '?')) return;
+        try {
+          await window.fetch('/api/admin/roles/revoke', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: userId, projectId: projectId, role: role }),
+          });
+          await this.loadAdminUsers();
+        } catch (_) { /* the refresh will show the real state */ }
+      },
+
+      async setUserDisabled(userId, disabled) {
+        var verb = disabled ? 'Disable' : 'Re-enable';
+        if (!window.confirm(verb + ' ' + userId + '?')) return;
+        this.adminError = '';
+        try {
+          var res = await window.fetch('/api/admin/users/' + encodeURIComponent(userId), {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disabled: disabled }),
+          });
+          var body = await res.json().catch(function () { return {}; });
+          if (!res.ok) { this.adminError = body.error || 'Could not update the account.'; return; }
+          await this.loadAdminUsers();
+        } catch (e) {
+          this.adminError = 'Could not reach the server.';
         }
       },
 
@@ -720,8 +1686,7 @@ document.addEventListener('alpine:init', function () {
           blocks.push(body);
           return '\n\nREQU_MERMAID_' + (blocks.length - 1) + '_END\n\n';
         });
-        var html = this.renderMarkdown(stripped);
-        if (window.DOMPurify) html = window.DOMPurify.sanitize(html);
+        var html = this.renderMarkdown(stripped); // sanitized (or escaped) by renderMarkdown
         return html.replace(/REQU_MERMAID_(\d+)_END/g, function (_m, i) {
           var src = blocks[Number(i)] || '';
           var escaped = src
@@ -825,6 +1790,8 @@ document.addEventListener('alpine:init', function () {
         if (id === 'screens')    { this.loadScreens(); }
         if (id === 'adrs')       { this.loadAdrs(); }
         if (id === 'versions')   { this.loadVersions(); }
+        if (id === 'audit')      { this.auditPage = 1; this.loadAudit(); this.loadActivity(); }
+        if (id === 'access')     { this.loadMembers(); this.loadRoles(); this.loadAdminUsers(); }
         // The Overview canvases use x-show (not x-if), so their x-init only ever
         // fires once at page load. If the 'overview' tab wasn't the active tab at
         // that moment (e.g. multi-project installs default to 'global' — see
@@ -847,9 +1814,12 @@ document.addEventListener('alpine:init', function () {
        * dir=1 → next, dir=-1 → prev, dir=-999 → first, dir=999 → last.
        */
       shiftFocus(dir) {
-        var tabs = this.projects.length > 1
-          ? ['global', 'overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions']
-          : ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions'];
+        var tabs = ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage', 'components', 'vcs', 'scenarios', 'versions'];
+        if (this.projects.length > 1) tabs.unshift('global');
+        // The last two tabs exist only for the roles that may open them, so the
+        // arrow-key ring has to match what is actually rendered.
+        if (this.can('audit:read')) tabs.push('audit');
+        if (this.canSeeAccess()) tabs.push('access');
         var idx = tabs.indexOf(this.tab);
         if (dir === -999) { idx = 0; }
         else if (dir === 999) { idx = tabs.length - 1; }
@@ -1034,14 +2004,19 @@ document.addEventListener('alpine:init', function () {
         };
       },
 
-      /** Produce highlighted, HTML-escaped markup for gherkin content. */
+      /**
+       * Produce highlighted, HTML-escaped markup for gherkin content (bound
+       * with x-html). hljs escapes its input, and the result is additionally
+       * run through DOMPurify; without the sanitizer we fall back to escaped
+       * plain text.
+       */
       highlightGherkin: function (text) {
         try {
-          if (window.hljs && window.hljs.getLanguage && window.hljs.getLanguage('gherkin')) {
-            return window.hljs.highlight(text, { language: 'gherkin' }).value;
+          if (window.DOMPurify && window.hljs && window.hljs.getLanguage && window.hljs.getLanguage('gherkin')) {
+            return window.DOMPurify.sanitize(window.hljs.highlight(text, { language: 'gherkin' }).value);
           }
         } catch (_) { /* fall through to escaped plain text */ }
-        return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return this.escapeHtml(text);
       },
 
       /** Resolve the tag expression to a set of matching scenario ids via the API. */
@@ -1707,17 +2682,37 @@ document.addEventListener('alpine:init', function () {
         });
       },
 
-      renderMarkdown: function(text) {
-        if (!text) return '';
-        if (window.marked) {
-          return window.marked.parse(text);
-        }
-        // safe plain-text fallback
-        return text
+      /** HTML-escape a string for insertion as text inside markup. */
+      escapeHtml: function (s) {
+        return String(s)
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;')
-          .replace(/\n/g, '<br>');
+          .replace(/"/g, '&quot;');
+      },
+
+      /**
+       * Markdown → HTML for x-html bindings (project brief, ADR bodies). The
+       * source is user-controlled, so marked's output always goes through
+       * DOMPurify. Fails closed: without the sanitizer the text is rendered
+       * escaped, never as raw marked output.
+       */
+      renderMarkdown: function(text) {
+        if (!text) return '';
+        if (window.marked && window.DOMPurify) {
+          return window.DOMPurify.sanitize(window.marked.parse(text));
+        }
+        return '<pre class="whitespace-pre-wrap font-sans">' + this.escapeHtml(text) + '</pre>';
+      },
+
+      /**
+       * Server-produced SVG (the 2FA enrolment QR code) for an x-html binding.
+       * Restricted to DOMPurify's SVG profile; without the sanitizer nothing is
+       * rendered (the secret is shown as text next to it either way).
+       */
+      safeSvg: function (svg) {
+        if (!svg || !window.DOMPurify) return '';
+        return window.DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true } });
       },
 
       // =========================================================================

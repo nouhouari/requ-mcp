@@ -1,0 +1,19 @@
+---
+# Settings several roles and the verify play share. Every other role depends
+# on this one, so these defaults are in scope wherever they are needed.
+requ_data_mount: /srv/requ
+requ_port: 8788
+# The private address the reverse proxy connects to. Never 127.0.0.1: the
+# container would then see Docker's gateway instead of the proxy's address and
+# REQU_TRUSTED_PROXIES could not match.
+requ_bind_ip: "{{ ansible_facts.default_ipv4.address }}"
+# Pin a version for reproducible deploys; `latest` is pulled on every run.
+requ_tag: "2.1.0"
+requ_image_build: false
+requ_auth_mode: ldap
+# off | optional | required
+requ_2fa: optional
+backup_dir: "{{ requ_data_mount }}/backups"
+# Take a first dump as soon as the timer is installed, so verify.yml can prove
+# the mechanism works.
+backup_run_now: true

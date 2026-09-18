@@ -1,0 +1,25 @@
+#!/bin/bash
+# Managed by Ansible (requ deployment). Dumps the requ database into
+# {{ backup_dir }} and prunes dumps older than {{ backup_retention_days }} days.
+#
+# pg_dump runs inside the postgres container over its socket, so no password
+# travels on a command line. One dump covers projects, auth, roles and audit.
+set -euo pipefail
+
+APP_DIR="{{ requ_data_mount }}/app"
+BACKUP_DIR="{{ backup_dir }}"
+RETENTION_DAYS="{{ backup_retention_days }}"
+
+cd "$APP_DIR"
+set -a; . ./.env; set +a
+
+mkdir -p "$BACKUP_DIR"
+stamp="$(date +%Y%m%d-%H%M%S)"
+target="$BACKUP_DIR/requ-$stamp.sql.gz"
+
+docker compose exec -T postgres pg_dump -U "$PG_USER" --no-owner "$PG_DB" | gzip > "$target.tmp"
+mv "$target.tmp" "$target"
+chmod 0600 "$target"
+
+find "$BACKUP_DIR" -name 'requ-*.sql.gz' -mtime "+$RETENTION_DAYS" -delete
+echo "requ backup written: $target ($(du -h "$target" | cut -f1))"

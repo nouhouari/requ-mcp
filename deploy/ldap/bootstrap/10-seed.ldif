@@ -1,0 +1,89 @@
+# Test fixtures. Passwords are throwaway: <uid>-secret.
+# Three group styles on purpose:
+#  - groupOfUniqueNames/uniqueMember  → tracked by the image's memberOf overlay
+#  - groupOfNames/member              → found only by requ's group-tree search
+#  - posixGroup/memberUid             → found only by requ's group-tree search
+dn: ou=people,{{ LDAP_BASE_DN }}
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,{{ LDAP_BASE_DN }}
+objectClass: organizationalUnit
+ou: groups
+
+dn: uid=alice,ou=people,{{ LDAP_BASE_DN }}
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Admin
+sn: Admin
+displayName: Alice Admin
+mail: alice@example.com
+userPassword: alice-secret
+
+dn: uid=bob,ou=people,{{ LDAP_BASE_DN }}
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Builder
+sn: Builder
+displayName: Bob Builder
+mail: bob@example.com
+userPassword: bob-secret
+
+dn: uid=carol,ou=people,{{ LDAP_BASE_DN }}
+objectClass: inetOrgPerson
+uid: carol
+cn: Carol Contributor
+sn: Contributor
+mail: carol@example.com
+userPassword: carol-secret
+
+dn: uid=dave,ou=people,{{ LDAP_BASE_DN }}
+objectClass: inetOrgPerson
+uid: dave
+cn: Dave Nogroup
+sn: Nogroup
+userPassword: dave-secret
+
+dn: uid=erin,ou=people,{{ LDAP_BASE_DN }}
+objectClass: inetOrgPerson
+objectClass: posixAccount
+uid: erin
+cn: Erin Posix
+sn: Posix
+uidNumber: 10005
+gidNumber: 10005
+homeDirectory: /home/erin
+userPassword: erin-secret
+
+dn: cn=ldap-admins,ou=groups,{{ LDAP_BASE_DN }}
+objectClass: groupOfUniqueNames
+cn: ldap-admins
+uniqueMember: uid=alice,ou=people,{{ LDAP_BASE_DN }}
+
+dn: cn=ldap-maintainers,ou=groups,{{ LDAP_BASE_DN }}
+objectClass: groupOfUniqueNames
+cn: ldap-maintainers
+uniqueMember: uid=alice,ou=people,{{ LDAP_BASE_DN }}
+uniqueMember: uid=bob,ou=people,{{ LDAP_BASE_DN }}
+
+dn: cn=requ-admins,ou=groups,{{ LDAP_BASE_DN }}
+objectClass: groupOfNames
+cn: requ-admins
+member: uid=alice,ou=people,{{ LDAP_BASE_DN }}
+
+dn: cn=requ-maintainers,ou=groups,{{ LDAP_BASE_DN }}
+objectClass: groupOfNames
+cn: requ-maintainers
+member: uid=alice,ou=people,{{ LDAP_BASE_DN }}
+member: uid=bob,ou=people,{{ LDAP_BASE_DN }}
+
+dn: cn=requ-contributors,ou=groups,{{ LDAP_BASE_DN }}
+objectClass: groupOfNames
+cn: requ-contributors
+member: uid=carol,ou=people,{{ LDAP_BASE_DN }}
+
+dn: cn=requ-posix,ou=groups,{{ LDAP_BASE_DN }}
+objectClass: posixGroup
+cn: requ-posix
+gidNumber: 20001
+memberUid: erin

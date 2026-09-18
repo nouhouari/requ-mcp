@@ -1,0 +1,41 @@
+# Configure a host in the `requ` group: baseline, Docker, the data volume, the
+# workspace repositories, requ itself, and the backup timer.
+---
+- name: Configure the requ host
+  hosts: requ
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Is cloud-init present
+      ansible.builtin.stat:
+        path: /usr/bin/cloud-init
+      register: cloud_init_bin
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init_status
+      changed_when: false
+      # 2 = "done with recoverable errors", which a first boot often reports.
+      failed_when: cloud_init_status.rc not in [0, 2]
+      when: cloud_init_bin.stat.exists
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+  roles:
+    - role: common
+      tags: [common]
+    - role: docker
+      tags: [docker]
+    - role: data_volume
+      tags: [data]
+    - role: workspace
+      tags: [workspace]
+    - role: requ_app
+      tags: [requ]
+    - role: backup
+      tags: [backup]

@@ -1,0 +1,132 @@
+# Create the OpenStack resources requ runs on, then hand the new host to the
+# configure play. Everything is keyed by name with state=present, so running
+# it again against an existing stack changes nothing.
+#
+# Requires clouds.yaml on the control machine (os_cloud names the entry) and
+# the openstacksdk Python package.
+---
+- name: Provision the requ host on OpenStack
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [provision]
+  vars:
+    provision: false
+  tasks:
+    - name: Provision
+      when: provision | bool
+      block:
+        - name: Check the variables the cloud resources need
+          ansible.builtin.assert:
+            that:
+              - os_flavor is defined and os_flavor | length > 0
+              - os_network is defined and os_network | length > 0
+              - os_admin_cidr is defined and os_admin_cidr | length > 0
+              - os_proxy_cidrs is defined and os_proxy_cidrs | length > 0
+            fail_msg: "Set os_flavor, os_network, os_admin_cidr and os_proxy_cidrs in inventory/group_vars/all/openstack.yml."
+
+        - name: Register the SSH keypair
+          openstack.cloud.keypair:
+            cloud: "{{ os_cloud }}"
+            name: "{{ os_keypair_name }}"
+            public_key_file: "{{ os_keypair_public_key_file }}"
+            state: present
+          when: os_keypair_create | bool
+
+        - name: Create the security group
+          openstack.cloud.security_group:
+            cloud: "{{ os_cloud }}"
+            name: "{{ os_sg_name }}"
+            description: "requ: SSH from administrators, 8788 from the reverse proxy"
+            state: present
+
+        - name: Allow SSH from the administrators' network
+          openstack.cloud.security_group_rule:
+            cloud: "{{ os_cloud }}"
+            security_group: "{{ os_sg_name }}"
+            protocol: tcp
+            port_range_min: 22
+            port_range_max: 22
+            remote_ip_prefix: "{{ os_admin_cidr }}"
+            state: present
+
+        - name: Allow the reverse proxy to reach requ
+          openstack.cloud.security_group_rule:
+            cloud: "{{ os_cloud }}"
+            security_group: "{{ os_sg_name }}"
+            protocol: tcp
+            port_range_min: "{{ requ_port | default(8788) }}"
+            port_range_max: "{{ requ_port | default(8788) }}"
+            remote_ip_prefix: "{{ item }}"
+            state: present
+          loop: "{{ os_proxy_cidrs }}"
+
+        - name: Create the data volume
+          openstack.cloud.volume:
+            cloud: "{{ os_cloud }}"
+            name: "{{ os_volume_name }}"
+            size: "{{ os_volume_size_gb }}"
+            volume_type: "{{ os_volume_type | default(omit) }}"
+            state: present
+          register: requ_volume
+
+        - name: Create the server
+          openstack.cloud.server:
+            cloud: "{{ os_cloud }}"
+            name: "{{ os_server_name }}"
+            image: "{{ os_image }}"
+            flavor: "{{ os_flavor }}"
+            key_name: "{{ os_keypair_name }}"
+            network: "{{ os_network }}"
+            security_groups: ["{{ os_sg_name }}"]
+            auto_ip: false
+            userdata: |
+              #cloud-config
+              package_update: true
+            wait: true
+            timeout: 600
+            state: present
+          register: requ_server
+
+        - name: Attach the data volume
+          openstack.cloud.server_volume:
+            cloud: "{{ os_cloud }}"
+            server: "{{ os_server_name }}"
+            volume: "{{ os_volume_name }}"
+            state: present
+
+        - name: Assign a floating IP
+          openstack.cloud.floating_ip:
+            cloud: "{{ os_cloud }}"
+            server: "{{ os_server_name }}"
+            network: "{{ os_floating_ip_pool | default(omit) }}"
+            reuse: true
+            wait: true
+            state: present
+          register: requ_fip
+          when: os_assign_floating_ip | bool
+
+        - name: Work out the addresses
+          ansible.builtin.set_fact:
+            requ_fixed_ip: >-
+              {{ (requ_server.server.addresses[os_network] | map(attribute='addr') | select('match', '^[0-9]+\.') | list | first) }}
+            requ_reach_ip: >-
+              {{ (requ_fip.floating_ip.floating_ip_address if (os_assign_floating_ip | bool) else
+                  (requ_server.server.addresses[os_network] | map(attribute='addr') | select('match', '^[0-9]+\.') | list | first)) }}
+
+        - name: Hand the host to the configure play
+          ansible.builtin.add_host:
+            name: "{{ os_server_name }}"
+            groups: requ
+            ansible_host: "{{ requ_reach_ip }}"
+            ansible_user: "{{ os_ansible_user }}"
+            ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+            requ_bind_ip: "{{ requ_fixed_ip }}"
+            requ_data_volume_id: "{{ requ_volume.volume.id }}"
+          changed_when: false
+
+        - name: Show where the host is
+          ansible.builtin.debug:
+            msg: >-
+              {{ os_server_name }} reachable at {{ requ_reach_ip }}, requ will bind
+              {{ requ_fixed_ip }}:{{ requ_port | default(8788) }}, volume {{ requ_volume.volume.id }}

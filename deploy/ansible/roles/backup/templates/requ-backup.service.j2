@@ -1,0 +1,9 @@
+# Managed by Ansible (requ deployment).
+[Unit]
+Description=Dump the requ database
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/requ-backup.sh

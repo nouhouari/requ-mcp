@@ -1,0 +1,100 @@
+# Prove the deployment without changing it. Runs on the host; with
+# verify_public=true a second play checks the public URL through the proxy.
+---
+- name: Verify requ on the host
+  hosts: requ
+  become: true
+  tags: [verify]
+  roles:
+    - role: requ_defaults
+  tasks:
+    - name: The data volume is mounted
+      ansible.builtin.assert:
+        that: ansible_facts.mounts | selectattr('mount', 'equalto', requ_data_mount) | list | length == 1
+        fail_msg: "{{ requ_data_mount }} is not a mountpoint; Postgres would be writing to the root disk."
+      when: not (requ_skip_mount_check | default(false) | bool)
+
+    - name: Postgres has initialised its data directory
+      ansible.builtin.stat:
+        path: "{{ requ_data_mount }}/pgdata/PG_VERSION"
+      register: pg_version_file
+      failed_when: not pg_version_file.stat.exists
+
+    - name: Compose services are running and healthy
+      ansible.builtin.command:
+        cmd: docker compose ps --format json
+        chdir: "{{ requ_data_mount }}/app"
+      register: compose_ps
+      changed_when: false
+
+    - name: Both services report healthy
+      ansible.builtin.assert:
+        that:
+          - services | length == 2
+          - services | map(attribute='State') | list == ['running', 'running']
+          - services | map(attribute='Health') | list == ['healthy', 'healthy']
+        fail_msg: "{{ services }}"
+      vars:
+        # `docker compose ps --format json` prints one JSON object per line.
+        services: "{{ compose_ps.stdout_lines | map('from_json') | list }}"
+
+    - name: The version endpoint answers
+      ansible.builtin.uri:
+        url: "http://{{ requ_bind_ip }}:{{ requ_port }}/api/version"
+        return_content: true
+      register: version
+
+    - name: The running version is the one asked for
+      ansible.builtin.assert:
+        that: version.json.version == requ_tag
+        fail_msg: "running {{ version.json.version }}, expected {{ requ_tag }}"
+      when: not (requ_image_build | bool) and requ_tag != 'latest'
+
+    - name: Authentication is in the configured mode
+      ansible.builtin.uri:
+        url: "http://{{ requ_bind_ip }}:{{ requ_port }}/api/auth/config"
+        return_content: true
+      register: auth_config
+      failed_when: >-
+        auth_config.json.mode != requ_auth_mode
+        or auth_config.json.twoFactor != requ_2fa
+        or (requ_auth_mode == 'ldap' and auth_config.json.warning is not none)
+
+    - name: The MCP endpoint refuses anonymous callers
+      ansible.builtin.uri:
+        url: "http://{{ requ_bind_ip }}:{{ requ_port }}/mcp"
+        method: POST
+        body_format: json
+        body: {jsonrpc: "2.0", id: 1, method: "tools/list"}
+        headers: {Accept: "application/json, text/event-stream"}
+        status_code: 401
+      when: requ_auth_mode == 'ldap'
+
+    - name: The backup timer is enabled
+      ansible.builtin.stat:
+        path: /etc/systemd/system/timers.target.wants/requ-backup.timer
+      register: timer_link
+      failed_when: not timer_link.stat.exists
+
+    - name: A database dump exists
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns: "requ-*.sql.gz"
+      register: dumps
+      failed_when: backup_run_now | bool and dumps.matched == 0
+
+- name: Verify requ through the reverse proxy
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [verify]
+  tasks:
+    - name: The public URL answers over TLS with HSTS
+      ansible.builtin.uri:
+        url: "{{ public_url }}/api/version"
+        return_content: true
+      register: public_version
+      failed_when: public_version.status != 200 or 'strict_transport_security' not in public_version
+      vars:
+        public_url: "{{ hostvars[groups['requ'][0]].requ_public_url | default('') }}"
+      when: (verify_public | default(false) | bool) and public_url | length > 0
