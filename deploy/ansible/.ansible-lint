@@ -1,0 +1,7 @@
+---
+profile: production
+skip_list:
+  # Variables are deliberately named by what they configure (requ_*, os_*,
+  # backup_*) rather than by the role that defaults them: the inventory is one
+  # contract the team edits, and several roles read the same setting.
+  - var-naming[no-role-prefix]

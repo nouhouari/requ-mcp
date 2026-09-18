@@ -1,0 +1,9 @@
+---
+requ_workspace_dir: "{{ requ_data_mount }}/workspace"
+# Repositories requ inspects, cloned here and mounted read-only at /workspace.
+# Projects must record paths as the container sees them: /workspace/<name>/...
+#   - { name: my-app, repo: "git@git.example.com:team/my-app.git", ref: main }
+requ_workspace_repos: []
+# Private key on the HOST used to clone private repositories (leave empty for
+# public ones). Put the key in place with your own means; it is not managed here.
+requ_workspace_deploy_key: ""

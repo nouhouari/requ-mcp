@@ -1,0 +1,49 @@
+---
+- name: The data device must be known
+  ansible.builtin.assert:
+    that: requ_data_device | length > 0
+    fail_msg: "Set requ_data_device (or requ_data_volume_id) for {{ inventory_hostname }}."
+
+- name: Wait for the volume to appear
+  ansible.builtin.wait_for:
+    path: "{{ requ_data_device }}"
+    timeout: 120
+
+# Skips when a filesystem already exists, so a re-run or a volume restored from
+# a snapshot is never reformatted.
+- name: Format the volume on first use
+  community.general.filesystem:
+    fstype: "{{ requ_data_fstype }}"
+    dev: "{{ requ_data_device }}"
+
+- name: Mount the volume
+  ansible.posix.mount:
+    path: "{{ requ_data_mount }}"
+    src: "{{ requ_data_device }}"
+    fstype: "{{ requ_data_fstype }}"
+    opts: defaults,nofail
+    state: mounted
+
+- name: Re-read the mount table
+  ansible.builtin.setup:
+    gather_subset: [mounts]
+
+- name: Postgres must never land on the root disk
+  ansible.builtin.assert:
+    that: ansible_facts.mounts | selectattr('mount', 'equalto', requ_data_mount) | list | length == 1
+    fail_msg: "{{ requ_data_mount }} is not a mountpoint after mounting {{ requ_data_device }}."
+
+# pgdata is a subdirectory on purpose: initdb refuses a directory that already
+# holds lost+found, which every fresh ext4 mount root does.
+- name: Lay out the volume
+  ansible.builtin.file:
+    path: "{{ requ_data_mount }}/{{ item.name }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { name: app, owner: root, mode: "0700" }
+    - { name: pgdata, owner: "{{ requ_pgdata_owner }}", mode: "0700" }
+    - { name: backups, owner: root, mode: "0700" }
+    - { name: workspace, owner: root, mode: "0755" }

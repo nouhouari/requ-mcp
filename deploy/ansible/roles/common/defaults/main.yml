@@ -1,0 +1,12 @@
+---
+# Packages every host gets. git is for the workspace role, jq for operators.
+common_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - jq
+  - unattended-upgrades
+# Corporate NTP servers; empty keeps the image's defaults.
+ntp_servers: []
+common_ssh_password_auth: false

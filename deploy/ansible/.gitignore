@@ -1,0 +1,4 @@
+# Real inventory, addresses and vault live outside the public repository.
+inventory/
+*.retry
+.vault-pass

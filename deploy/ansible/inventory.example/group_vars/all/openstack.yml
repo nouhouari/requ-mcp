@@ -1,0 +1,19 @@
+# OpenStack resources, used only with `-e provision=true`.
+# Authentication comes from ~/.config/openstack/clouds.yaml (entry `os_cloud`).
+os_cloud: openstack
+os_server_name: requ-01
+os_image: "Ubuntu 24.04"
+os_flavor: ""            # e.g. m1.medium — 2 vCPU / 4 GB is comfortable
+os_network: ""           # tenant network the proxy can reach
+os_keypair_name: requ-deploy
+os_keypair_create: false
+os_keypair_public_key_file: ~/.ssh/id_ed25519.pub
+os_sg_name: requ
+os_admin_cidr: ""        # where you run Ansible and SSH from, e.g. 10.20.0.0/24
+os_proxy_cidrs: []       # the reverse proxy, e.g. ["10.30.0.5/32"]
+os_volume_name: requ-data
+os_volume_size_gb: 20
+# os_volume_type: ssd
+os_assign_floating_ip: false
+# os_floating_ip_pool: public
+os_ansible_user: ubuntu

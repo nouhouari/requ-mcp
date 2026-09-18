@@ -1,0 +1,75 @@
+---
+# --- image -------------------------------------------------------------------
+requ_image: ghcr.io/nouhouari/requ-mcp
+# Build on the VM instead of pulling (until the image is published, or for a
+# fork). The ref must contain the production Dockerfile. requ_tag and
+# requ_image_build live in roles/requ_defaults.
+requ_build_repo: https://github.com/nouhouari/requ-mcp.git
+requ_build_ref: main
+# Only needed if the image becomes private.
+requ_registry_username: ""
+requ_registry_password: ""
+
+# --- network (requ_bind_ip and requ_port live in roles/requ_defaults) --------
+# Exact addresses (not CIDRs) of the reverse proxy as the VM sees them.
+requ_trusted_proxies: []
+requ_cors_origins: []
+# The https URL users type. Used by the checks and the README only.
+requ_public_url: ""
+
+# --- database ----------------------------------------------------------------
+postgres_image: postgres:16-alpine
+pg_user: requ
+pg_db: requ
+pg_password: "{{ vault_pg_password }}"
+
+# --- authentication (requ_auth_mode lives in roles/requ_defaults) ------------
+requ_auth_secret: "{{ vault_requ_auth_secret }}"
+# Bootstrap administrators by username, for the first login before a group
+# mapping is proven. Remove them once the admin group works.
+requ_auth_admins: []
+# Users who sign in but match no group. `viewer` gives read-only access;
+# `none` refuses them.
+requ_auth_default_role: viewer
+requ_auth_session_ttl_hours: 12
+requ_auth_token_ttl_days: 0
+requ_audit: auto
+
+# --- LDAP (Active Directory) -------------------------------------------------
+requ_ldap_url: ""
+requ_ldap_base_dn: ""
+requ_ldap_bind_dn: ""
+requ_ldap_bind_password: "{{ vault_requ_ldap_bind_password | default('') }}"
+# Filters contain {{username}} placeholders the SERVER expands; when you
+# override one, mark it `!unsafe` so Ansible leaves it alone:
+#   requ_ldap_user_filter: !unsafe "(&(objectClass=user)(sAMAccountName={{username}}))"
+requ_ldap_user_filter: ""
+requ_ldap_user_dn_template: ""
+requ_ldap_group_base_dn: ""
+requ_ldap_group_filter: ""
+requ_ldap_group_attr: ""
+requ_ldap_memberof_attr: ""
+requ_ldap_timeout_ms: ""
+# Directory group -> requ role. Keys may be a group's CN or its full DN.
+requ_ldap_role_map: {}
+# Keep verification on; give requ the CA chain instead of turning it off.
+requ_ldap_tls_reject_unauthorized: true
+requ_ldap_allow_plaintext: false
+# The CA chain the domain controllers present, as a file on the control
+# machine or inline PEM text. Mounted into the container as NODE_EXTRA_CA_CERTS.
+requ_ldap_ca_cert_src: ""
+requ_ldap_ca_cert_pem: ""
+
+# --- second factor (requ_2fa lives in roles/requ_defaults) -------------------
+requ_2fa_required_roles: [admin]
+requ_2fa_issuer: requ
+
+# Any further REQU_* variable, verbatim.
+requ_extra_env: {}
+
+# Dump the database before recreating containers, when the stack already runs.
+requ_backup_before_deploy: true
+
+# Render the compose files and stop, without pulling or starting anything.
+# Useful to review what a change would do: -e requ_render_only=true
+requ_render_only: false

@@ -1,0 +1,49 @@
+# requ on the host. Secrets are referenced from vault.yml, never written here.
+# Every variable has a default in roles/requ_app/defaults/main.yml; this file
+# lists the ones a deployment normally sets.
+
+# --- image -------------------------------------------------------------------
+requ_tag: "2.1.0"
+# Until ghcr.io/nouhouari/requ-mcp is published, build on the VM instead:
+# requ_image_build: true
+# requ_build_ref: main
+
+# --- network -----------------------------------------------------------------
+# Exact address(es) of the reverse proxy as the VM sees them.
+requ_trusted_proxies: ["10.30.0.5"]
+requ_public_url: https://requ.example.com
+
+# --- Active Directory --------------------------------------------------------
+requ_ldap_url: ldaps://dc1.corp.example.com:636
+requ_ldap_base_dn: DC=corp,DC=example,DC=com
+requ_ldap_bind_dn: CN=svc-requ,OU=Service Accounts,DC=corp,DC=example,DC=com
+# The domain controllers' CA chain, so verification stays on.
+requ_ldap_ca_cert_src: "{{ inventory_dir }}/files/corp-ca.pem"
+# Directory group -> requ role.
+requ_ldap_role_map:
+  requ-admins: admin
+  requ-maintainers: maintainer
+  requ-product-owners: product-owner
+  requ-qa: qa
+  requ-developers: developer
+# Everyone else who signs in reads only; use `none` to refuse them.
+requ_auth_default_role: viewer
+# First administrators by username, until the requ-admins group is confirmed.
+requ_auth_admins: []
+# Overriding a filter? Mark it !unsafe so the {{username}} placeholder
+# reaches the server intact:
+# requ_ldap_user_filter: !unsafe "(&(objectClass=user)(sAMAccountName={{username}}))"
+
+# --- second factor -----------------------------------------------------------
+requ_2fa: optional
+requ_2fa_required_roles: [admin]
+
+# --- repositories requ inspects ----------------------------------------------
+# Cloned into /srv/requ/workspace and mounted read-only at /workspace.
+requ_workspace_repos: []
+#  - { name: my-app, repo: "git@git.example.com:team/my-app.git", ref: main }
+# requ_workspace_deploy_key: /root/.ssh/requ-deploy
+
+# --- backups -----------------------------------------------------------------
+backup_on_calendar: "*-*-* 02:30:00"
+backup_retention_days: 14

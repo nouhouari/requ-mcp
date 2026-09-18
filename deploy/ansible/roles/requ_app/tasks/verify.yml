@@ -1,0 +1,7 @@
+---
+- name: Report the running version
+  ansible.builtin.debug:
+    msg: >-
+      requ {{ requ_version.json.version }} on http://{{ requ_bind_ip }}:{{ requ_port }} —
+      auth {{ requ_auth_config.json.mode }}, 2FA {{ requ_auth_config.json.twoFactor }}
+  when: not (requ_render_only | bool)
