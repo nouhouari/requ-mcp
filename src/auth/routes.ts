@@ -119,7 +119,19 @@ export type AuthRouteContext = {
   /** Project slug from `?project=`, for project-scoped role resolution. */
   projectSlug: string | null;
   source: AuditSource;
+  /**
+   * Turn a project named in a URL or payload into the slug the server actually
+   * knows it by, or null when there is no such project. Without it a grant or a
+   * token scope could name a project that does not exist — harmless on its own,
+   * but the name then never lines up with the data it was meant to protect.
+   */
+  resolveProject?: (value: string) => string | null;
 };
+
+/** The canonical slug for a project the caller named, or null when unknown. */
+function knownProject(ctx: AuthRouteContext, value: string): string | null {
+  return ctx.resolveProject ? ctx.resolveProject(value) : value;
+}
 
 /**
  * Handle `/api/auth/*` and `/api/admin/*`. Returns true when the request was
@@ -443,8 +455,17 @@ export async function handleAuthRoutes(
 
     let projects: string[] | null = null;
     if (Array.isArray(payload.projects)) {
-      projects = payload.projects.filter((p): p is string => typeof p === "string" && p.trim() !== "");
-      if (projects.length === 0) projects = null;
+      const named = payload.projects.filter((p): p is string => typeof p === "string" && p.trim() !== "");
+      const resolved: string[] = [];
+      for (const name of named) {
+        const slug = knownProject(ctx, name.trim());
+        if (!slug) {
+          fail(res, 400, `Unknown project '${name}'. A token can only be scoped to a project this server has.`);
+          return true;
+        }
+        if (!resolved.includes(slug)) resolved.push(slug);
+      }
+      if (resolved.length > 0) projects = resolved;
     }
 
     // The ceiling role is checked where the token will actually be used: a
@@ -533,7 +554,8 @@ export async function handleAuthRoutes(
   const memberMatch = /^\/api\/projects\/([^/]+)\/members\/([^/]+)$/.exec(pathname);
 
   if (membersMatch || memberMatch) {
-    const targetProject = decodeURIComponent((membersMatch ?? memberMatch)![1]);
+    const namedProject = decodeURIComponent((membersMatch ?? memberMatch)![1]);
+    const targetProject = knownProject(ctx, namedProject) ?? namedProject;
     if (!(await canInScope(principal, "project:members", targetProject))) {
       audit({
         action: `members:${m} ${targetProject}`,
@@ -543,6 +565,10 @@ export async function handleAuthRoutes(
         projectId: targetProject,
       });
       fail(res, 403, `You need the admin role on project '${targetProject}' to manage its members.`);
+      return true;
+    }
+    if (knownProject(ctx, namedProject) === null) {
+      fail(res, 404, `Unknown project '${namedProject}'.`);
       return true;
     }
 
@@ -672,9 +698,10 @@ export async function handleAuthRoutes(
     pathname === "/api/roles" || sharedRoleMatch || projectRolesMatch || projectRoleMatch;
 
   if (isRolesRoute) {
-    const scope: string | null = projectRolesMatch || projectRoleMatch
+    const namedScope: string | null = projectRolesMatch || projectRoleMatch
       ? decodeURIComponent((projectRolesMatch ?? projectRoleMatch)![1])
       : null;
+    const scope: string | null = namedScope === null ? null : (knownProject(ctx, namedScope) ?? namedScope);
     const roleId = projectRoleMatch
       ? decodeURIComponent(projectRoleMatch[2])
       : sharedRoleMatch
@@ -685,6 +712,10 @@ export async function handleAuthRoutes(
     // roles belongs to whoever administers that project.
     const writePermission: Permission = scope === null ? "admin:users" : "project:members";
     const mayWrite = await canInScope(principal, writePermission, scope);
+    if (namedScope !== null && knownProject(ctx, namedScope) === null) {
+      fail(res, 404, `Unknown project '${namedScope}'.`);
+      return true;
+    }
     if (m !== "GET" && !mayWrite) {
       audit({
         action: `roles:${m} ${scope ?? "*"}`,

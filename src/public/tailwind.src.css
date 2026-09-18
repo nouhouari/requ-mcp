@@ -1,0 +1,6 @@
+/* Source for src/public/tailwind.css — regenerate with `npm run build:css`.
+   Preflight (base) is kept: style.css was written against the CDN build,
+   which also shipped it. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

@@ -503,6 +503,43 @@ The tables live wherever requ's own data does: in PostgreSQL when `REQU_PG_URL`
 is set, otherwise in a SQLite file (`REQU_AUTH_DB`, default `~/.requ/auth.db`)
 so a laptop still keeps its history across restarts.
 
+### Hardening
+
+Two settings decide what the server believes about where a request came from,
+and both default to the strict reading:
+
+```bash
+REQU_TRUSTED_PROXIES=10.0.0.5,::1          # peers whose X-Forwarded-For is believed
+REQU_CORS_ORIGINS=https://tools.example.com # browser origins allowed to call the API
+```
+
+- **`REQU_TRUSTED_PROXIES`** — the login throttle and the audit trail key on the
+  caller's address. `X-Forwarded-For` is only honoured when the socket peer is
+  one of these addresses; from anyone else it is ignored, so a caller cannot
+  pick a fresh address per attempt or lock a colleague's real address out.
+  Leave it empty when requ is reached directly.
+- **`REQU_CORS_ORIGINS`** — by default no CORS headers are sent: the dashboard is
+  same-origin and MCP clients are not browsers. List origins to let a page on
+  one of them drive the REST API with a token, or `*` for the old wildcard.
+  Credentials are never allowed, so the session cookie stays same-origin either
+  way.
+
+Beyond those, every response carries `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: SAMEORIGIN` and `Referrer-Policy: same-origin`, plus
+`Strict-Transport-Security` whenever the session cookie is `Secure`. The
+dashboard shell is served with a Content Security Policy that limits scripts to
+this server and the pinned jsDelivr files, with no inline scripts; the CDN tags
+carry Subresource Integrity hashes, and Tailwind is compiled at build time
+(`npm run build:css`) rather than in the browser. `/mcp` accepts access tokens
+only — never the dashboard cookie — so a session taken over through the browser
+cannot reach the tools. Unexpected failures answer with a reference id and put
+the real error in the server log, not in the response.
+
+`npm run smoke:auth` pins each of these so a regression fails CI: the project a
+request is authorised for must be the project served, every write route must
+have an explicit permission entry, the shell must carry its policy headers, the
+throttle must ignore a spoofed address, and cross-origin access must be opt-in.
+
 ### Testing against a directory
 
 `npm run smoke:auth` runs a **real LDAP server in the test process**

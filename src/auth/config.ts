@@ -88,6 +88,18 @@ export type AuthConfig = {
   cookieName: string;
   /** Send the session cookie with `Secure`. Defaults to on for ldap mode. */
   cookieSecure: boolean;
+  /**
+   * Peers whose `X-Forwarded-For` is believed. Empty means the header is
+   * ignored and the socket address is the client: honouring it from anyone
+   * lets a caller pick the address the login throttle keys on.
+   */
+  trustedProxies: string[];
+  /**
+   * Origins allowed to call the REST API from a browser. Empty means no CORS
+   * headers are sent at all — the dashboard is same-origin and MCP clients are
+   * not browsers. `*` restores the wildcard for a deployment that wants it.
+   */
+  corsOrigins: string[];
   /** Second factor (TOTP: Microsoft Authenticator, Google Authenticator, …). */
   twoFactor: TwoFactorMode;
   /**
@@ -302,6 +314,8 @@ export function loadAuthConfig(): AuthConfig {
       env("REQU_AUTH_DB") ?? path.join(os.homedir(), ".requ", "auth.db"),
     cookieName: env("REQU_AUTH_COOKIE") ?? "requ_session",
     cookieSecure: envBool("REQU_AUTH_COOKIE_SECURE", enabled),
+    trustedProxies: envList("REQU_TRUSTED_PROXIES"),
+    corsOrigins: envList("REQU_CORS_ORIGINS"),
     twoFactor: rawTwoFactor as TwoFactorMode,
     twoFactorRequiredRoles,
     twoFactorIssuer: env("REQU_2FA_ISSUER") ?? "requ",
