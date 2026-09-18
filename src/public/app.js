@@ -1686,8 +1686,7 @@ document.addEventListener('alpine:init', function () {
           blocks.push(body);
           return '\n\nREQU_MERMAID_' + (blocks.length - 1) + '_END\n\n';
         });
-        var html = this.renderMarkdown(stripped);
-        if (window.DOMPurify) html = window.DOMPurify.sanitize(html);
+        var html = this.renderMarkdown(stripped); // sanitized (or escaped) by renderMarkdown
         return html.replace(/REQU_MERMAID_(\d+)_END/g, function (_m, i) {
           var src = blocks[Number(i)] || '';
           var escaped = src
@@ -2005,14 +2004,19 @@ document.addEventListener('alpine:init', function () {
         };
       },
 
-      /** Produce highlighted, HTML-escaped markup for gherkin content. */
+      /**
+       * Produce highlighted, HTML-escaped markup for gherkin content (bound
+       * with x-html). hljs escapes its input, and the result is additionally
+       * run through DOMPurify; without the sanitizer we fall back to escaped
+       * plain text.
+       */
       highlightGherkin: function (text) {
         try {
-          if (window.hljs && window.hljs.getLanguage && window.hljs.getLanguage('gherkin')) {
-            return window.hljs.highlight(text, { language: 'gherkin' }).value;
+          if (window.DOMPurify && window.hljs && window.hljs.getLanguage && window.hljs.getLanguage('gherkin')) {
+            return window.DOMPurify.sanitize(window.hljs.highlight(text, { language: 'gherkin' }).value);
           }
         } catch (_) { /* fall through to escaped plain text */ }
-        return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return this.escapeHtml(text);
       },
 
       /** Resolve the tag expression to a set of matching scenario ids via the API. */
@@ -2678,17 +2682,37 @@ document.addEventListener('alpine:init', function () {
         });
       },
 
-      renderMarkdown: function(text) {
-        if (!text) return '';
-        if (window.marked) {
-          return window.marked.parse(text);
-        }
-        // safe plain-text fallback
-        return text
+      /** HTML-escape a string for insertion as text inside markup. */
+      escapeHtml: function (s) {
+        return String(s)
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;')
-          .replace(/\n/g, '<br>');
+          .replace(/"/g, '&quot;');
+      },
+
+      /**
+       * Markdown → HTML for x-html bindings (project brief, ADR bodies). The
+       * source is user-controlled, so marked's output always goes through
+       * DOMPurify. Fails closed: without the sanitizer the text is rendered
+       * escaped, never as raw marked output.
+       */
+      renderMarkdown: function(text) {
+        if (!text) return '';
+        if (window.marked && window.DOMPurify) {
+          return window.DOMPurify.sanitize(window.marked.parse(text));
+        }
+        return '<pre class="whitespace-pre-wrap font-sans">' + this.escapeHtml(text) + '</pre>';
+      },
+
+      /**
+       * Server-produced SVG (the 2FA enrolment QR code) for an x-html binding.
+       * Restricted to DOMPurify's SVG profile; without the sanitizer nothing is
+       * rendered (the secret is shown as text next to it either way).
+       */
+      safeSvg: function (svg) {
+        if (!svg || !window.DOMPurify) return '';
+        return window.DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true } });
       },
 
       // =========================================================================

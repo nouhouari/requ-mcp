@@ -21,7 +21,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startHarness, slugFor } from "./lib/http-harness.js";
+import { startHarness, slugFor, repoRoot } from "./lib/http-harness.js";
 import type { AuthConfig } from "../src/auth/config.js";
 import {
   BASE_DN,
@@ -1504,6 +1504,7 @@ async function main() {
     check("filter escaping neutralises a wildcard", escapeFilterValue("*") === "\\2a");
     check("filter escaping neutralises parentheses", escapeFilterValue(")(uid=admin") === "\\29\\28uid=admin");
 
+    await securityRegressionChecks(tmp);
     await roleCatalogueChecks(path.join(tmp, "roles-unit.db"));
 
     const { parseToken, mintToken, hashTokenSecret } = await import("../src/auth/tokens.js");
@@ -1541,6 +1542,188 @@ async function main() {
  * role for itself without touching anyone else, and capping a token can only
  * ever remove permissions.
  */
+// ---------------------------------------------------------------------------
+// Security regressions
+// ---------------------------------------------------------------------------
+//
+// Each block below pins a finding from the September 2026 security review so
+// it cannot come back quietly: the project named for authorisation must be the
+// project whose data is served; every write route must be in the permission
+// table; the dashboard shell must carry its policy headers; the login throttle
+// must key on an address the caller cannot choose; and cross-origin access
+// must be opt-in.
+async function securityRegressionChecks(tmp: string): Promise<void> {
+  console.log("\n— security regressions —");
+
+  const { permissionForRoute, explicitRoutePermission } = await import("../src/auth/rbac.js");
+  check("routes: activating a version requires version:manage",
+    permissionForRoute("POST", "/api/versions/active") === "version:manage",
+    permissionForRoute("POST", "/api/versions/active"));
+
+  // The route table is checked against the routes web-api.ts actually serves,
+  // so an entry that drifts from its route — the way `/activate` did — fails
+  // here instead of quietly handing the route to the method-based fallback.
+  const webApi = await fs.readFile(path.join(repoRoot, "src", "web-api.ts"), "utf-8");
+  const served = [...webApi.matchAll(/matchRoute\(pathname,\s*method,\s*"([^"]+)",\s*"([A-Z]+)"\)/g)]
+    .map((m) => ({ path: m[1], method: m[2] }));
+  check("routes: the parser sees the routes web-api.ts declares", served.length > 30, served.length);
+  const selfAuthorising = /^\/api\/(auth|admin|roles|projects\/[^/]+\/(members|roles))(\/|$)/;
+  const uncovered = served
+    .filter((r) => r.method !== "GET" && !selfAuthorising.test(r.path))
+    .filter((r) => explicitRoutePermission(r.method, r.path.replace(/:[a-zA-Z]+/g, "x")) === null)
+    .map((r) => `${r.method} ${r.path}`);
+  check("routes: every write route has an explicit permission entry", uncovered.length === 0, uncovered);
+
+  const root = path.join(tmp, "secproj");
+  await fs.mkdir(root, { recursive: true });
+  const slug = slugFor(root);
+  const fixture = await startLdapFixture({ groupDiscovery: "memberOf" });
+  const baseEnv = {
+    REQU_AUTH_MODE: "ldap",
+    REQU_AUTH_SECRET: SECRET,
+    REQU_AUDIT: "on",
+    REQU_LDAP_URL: fixture.url,
+    REQU_LDAP_ALLOW_PLAINTEXT: "true",
+    REQU_LDAP_BASE_DN: BASE_DN,
+    REQU_LDAP_BIND_DN: SERVICE_DN,
+    REQU_LDAP_BIND_PASSWORD: SERVICE_PASSWORD,
+    REQU_LDAP_GROUP_BASE_DN: GROUP_BASE_DN,
+    // mika administers; vera only reads.
+    REQU_LDAP_ROLE_MAP: "requ-readers=viewer;requ-maintainers=admin",
+    REQU_AUTH_DEFAULT_ROLE: "none",
+  };
+  const json = { "Content-Type": "application/json" };
+  const signIn = async (base: string, username: string) => {
+    const res = await fetch(`${base}/api/auth/login`, {
+      method: "POST", headers: json, body: JSON.stringify({ username, password: `${username}-secret` }),
+    });
+    return (res.headers.get("set-cookie") ?? "").split(";")[0];
+  };
+  const failLogin = async (base: string, username: string, forwardedFor: string) =>
+    (await fetch(`${base}/api/auth/login`, {
+      method: "POST", headers: { ...json, "X-Forwarded-For": forwardedFor },
+      body: JSON.stringify({ username, password: "not-it" }),
+    })).status;
+
+  // --- defaults: no trusted proxy, no CORS ---
+  {
+    const h = await startHarness([root], "smoke-auth-sec", {
+      env: { ...baseEnv, REQU_AUTH_DB: path.join(tmp, "sec-auth.db") }, connectMcp: false,
+    });
+    try {
+      const admin = await signIn(h.base, "mika");
+      const viewer = await signIn(h.base, "vera");
+      check("sec: both test users signed in", admin.startsWith("requ_session=") && viewer.startsWith("requ_session="));
+      const init = await fetch(`${h.base}/api/init?project=${slug}`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ name: "Security" }),
+      });
+      check("sec: the project initialises", init.status === 200, init.status);
+
+      // F-01 — the project named for authorisation is the project served.
+      const real = await getJson(`${h.base}/api/requirements?project=${slug}`, { Cookie: viewer });
+      check("scope: the real project name is served", real.status === 200, real.status);
+      const bogus = await getJson(`${h.base}/api/requirements?project=some-other-name`, { Cookie: viewer });
+      check("scope: an unknown project name is refused, not silently mapped to the only project",
+        bogus.status === 404, { status: bogus.status, body: bogus.body });
+
+      const badToken = await fetch(`${h.base}/api/auth/tokens`, {
+        method: "POST", headers: { ...json, Cookie: admin },
+        body: JSON.stringify({ name: "probe", projects: ["some-other-name"], maxRole: "viewer" }),
+      });
+      check("scope: a token cannot be scoped to a project the server does not have", badToken.status === 400, badToken.status);
+      const goodToken = await fetch(`${h.base}/api/auth/tokens`, {
+        method: "POST", headers: { ...json, Cookie: admin },
+        body: JSON.stringify({ name: "probe", projects: [slug], maxRole: "viewer" }),
+      });
+      check("scope: a token scoped to a real project is minted", goodToken.status === 201, goodToken.status);
+
+      const badGrant = await fetch(`${h.base}/api/projects/some-other-name/members`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ username: "vera", role: "viewer" }),
+      });
+      check("scope: a role cannot be granted on a project the server does not have", badGrant.status === 404, badGrant.status);
+      const goodGrant = await fetch(`${h.base}/api/projects/${slug}/members`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ username: "vera", role: "viewer" }),
+      });
+      check("scope: a grant on a real project still works", goodGrant.status < 300, goodGrant.status);
+
+      // F-02 — activation is a lifecycle action.
+      const viewerActivate = await fetch(`${h.base}/api/versions/active?project=${slug}`, {
+        method: "POST", headers: { ...json, Cookie: viewer }, body: JSON.stringify({ current: "1.0.0" }),
+      });
+      const viewerBody = await viewerActivate.json().catch(() => ({}));
+      check("versions: a viewer may not activate a version", viewerActivate.status === 403, viewerActivate.status);
+      check("versions: the refusal names version:manage", String(viewerBody.error).includes("version:manage"), viewerBody);
+      const ghost = await fetch(`${h.base}/api/versions/active?project=${slug}`, {
+        method: "POST", headers: { ...json, Cookie: admin }, body: JSON.stringify({ current: "9.9.9" }),
+      });
+      check("versions: a version that does not exist cannot be made current", ghost.status === 400, ghost.status);
+
+      // F-08 — /mcp is for token holders.
+      const mcpWithCookie = await fetch(`${h.base}/mcp`, {
+        method: "POST", headers: { ...json, Accept: "application/json, text/event-stream", Cookie: admin },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      check("mcp: a dashboard session cookie is not accepted", mcpWithCookie.status === 401, mcpWithCookie.status);
+
+      // F-06 — policy headers on the shell and the API.
+      const shell = await fetch(`${h.base}/`);
+      const csp = shell.headers.get("content-security-policy") ?? "";
+      const scriptSrc = /script-src ([^;]+)/.exec(csp)?.[1] ?? "";
+      check("headers: the dashboard shell carries a Content-Security-Policy", csp.length > 0);
+      check("headers: scripts are limited to this server and the pinned CDN", scriptSrc.includes("'self'") && scriptSrc.includes("https://cdn.jsdelivr.net"), scriptSrc);
+      check("headers: inline scripts are not allowed", !scriptSrc.includes("'unsafe-inline'"), scriptSrc);
+      check("headers: nosniff on the shell", shell.headers.get("x-content-type-options") === "nosniff");
+      check("headers: framing limited to the same origin", shell.headers.get("x-frame-options") === "SAMEORIGIN");
+      const api = await fetch(`${h.base}/api/version`, { headers: { Origin: "https://evil.example" } });
+      check("headers: nosniff on the API", api.headers.get("x-content-type-options") === "nosniff");
+
+      // F-09 — no CORS unless configured.
+      check("cors: no Access-Control-Allow-Origin by default", api.headers.get("access-control-allow-origin") === null,
+        api.headers.get("access-control-allow-origin"));
+
+      // F-04 — X-Forwarded-For from an untrusted peer is ignored.
+      for (let i = 1; i <= 5; i++) await failLogin(h.base, `ghost${i}`, "203.0.113.1");
+      const sixth = await failLogin(h.base, "ghost6", "203.0.113.2");
+      check("throttle: a spoofed X-Forwarded-For does not open a fresh bucket", sixth === 429, sixth);
+    } finally {
+      await h.stop();
+    }
+  }
+
+  // --- configured: a trusted proxy in front, one allowed browser origin ---
+  {
+    const h = await startHarness([root], "smoke-auth-sec-proxy", {
+      env: {
+        ...baseEnv,
+        REQU_AUTH_DB: path.join(tmp, "sec-proxy-auth.db"),
+        REQU_TRUSTED_PROXIES: "127.0.0.1,::1",
+        REQU_CORS_ORIGINS: "https://app.example",
+      },
+      connectMcp: false,
+    });
+    try {
+      for (let i = 1; i <= 5; i++) await failLogin(h.base, `spook${i}`, "203.0.113.1");
+      const other = await failLogin(h.base, "spook6", "203.0.113.2");
+      check("throttle: behind a trusted proxy the forwarded address is the one counted", other === 401, other);
+      const same = await failLogin(h.base, "spook7", "203.0.113.1");
+      check("throttle: …and the forwarded address that failed five times is throttled", same === 429, same);
+
+      const allowed = await fetch(`${h.base}/api/version`, { headers: { Origin: "https://app.example" } });
+      check("cors: a configured origin is allowed", allowed.headers.get("access-control-allow-origin") === "https://app.example",
+        allowed.headers.get("access-control-allow-origin"));
+      const denied = await fetch(`${h.base}/api/version`, { headers: { Origin: "https://evil.example" } });
+      check("cors: any other origin gets no CORS headers", denied.headers.get("access-control-allow-origin") === null);
+      const preflight = await fetch(`${h.base}/api/version`, { method: "OPTIONS", headers: { Origin: "https://app.example" } });
+      check("cors: preflight answers for the configured origin",
+        preflight.status === 204 && preflight.headers.get("access-control-allow-origin") === "https://app.example", preflight.status);
+      check("cors: credentials are never allowed", preflight.headers.get("access-control-allow-credentials") === null);
+    } finally {
+      await h.stop();
+      await fixture.stop();
+    }
+  }
+}
+
 async function roleCatalogueChecks(dbPath: string): Promise<void> {
   const { setAuthStore, authStore } = await import("../src/auth/store.js");
   const { resetAuthConfig } = await import("../src/auth/config.js");

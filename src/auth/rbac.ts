@@ -127,29 +127,12 @@ const ROUTE_PERMISSIONS: Array<{ method: string; pattern: RegExp; permission: Pe
   { method: "POST",  pattern: /^\/api\/versions$/,                  permission: "version:manage" },
   { method: "POST",  pattern: /^\/api\/versions\/[^/]+\/lock$/,     permission: "version:manage" },
   { method: "POST",  pattern: /^\/api\/versions\/[^/]+\/unlock$/,   permission: "version:manage" },
-  { method: "POST",  pattern: /^\/api\/versions\/[^/]+\/activate$/, permission: "version:manage" },
+  { method: "POST",  pattern: /^\/api\/versions\/active$/,           permission: "version:manage" },
   { method: "POST",  pattern: /^\/api\/scenarios\/execute$/,        permission: "execution:write" },
   { method: "POST",  pattern: /^\/api\/executions$/,                permission: "execution:write" },
   { method: "GET",   pattern: /^\/api\/audit$/,                     permission: "audit:read" },
   { method: "GET",   pattern: /^\/api\/history$/,                   permission: "history:read" },
   { method: "GET",   pattern: /^\/api\/history\/[^/]+\/[^/]+$/,     permission: "history:read" },
-  // Writes to an entity collection need that entity's permission.
-  { method: "POST",  pattern: /^\/api\/requirements(\/|$)/,         permission: "requirement:write" },
-  { method: "PATCH", pattern: /^\/api\/requirements(\/|$)/,         permission: "requirement:write" },
-  { method: "POST",  pattern: /^\/api\/stories(\/|$)/,              permission: "story:write" },
-  { method: "PATCH", pattern: /^\/api\/stories(\/|$)/,              permission: "story:write" },
-  { method: "POST",  pattern: /^\/api\/scenarios(\/|$)/,            permission: "scenario:write" },
-  { method: "PATCH", pattern: /^\/api\/scenarios(\/|$)/,            permission: "scenario:write" },
-  { method: "POST",  pattern: /^\/api\/screens(\/|$)/,              permission: "screen:write" },
-  { method: "PATCH", pattern: /^\/api\/screens(\/|$)/,              permission: "screen:write" },
-  { method: "POST",  pattern: /^\/api\/adrs(\/|$)/,                 permission: "adr:write" },
-  { method: "PATCH", pattern: /^\/api\/adrs(\/|$)/,                 permission: "adr:write" },
-  { method: "POST",  pattern: /^\/api\/components(\/|$)/,           permission: "component:write" },
-  { method: "PATCH", pattern: /^\/api\/components(\/|$)/,           permission: "component:write" },
-  { method: "POST",  pattern: /^\/api\/phases(\/|$)/,               permission: "phase:write" },
-  { method: "PATCH", pattern: /^\/api\/phases(\/|$)/,               permission: "phase:write" },
-  { method: "POST",  pattern: /^\/api\/vcs(\/|$)/,                  permission: "vcs:write" },
-  { method: "PATCH", pattern: /^\/api\/vcs(\/|$)/,                  permission: "vcs:write" },
 ];
 
 /**
@@ -182,6 +165,17 @@ export function isPublicRoute(method: string, pathname: string): boolean {
  * routes are exempt because they authorise themselves against a scope a blanket
  * check here could not name.
  */
+/**
+ * The table entry a REST route matches, or null when only the method-based
+ * fallback would answer. A write route that reaches the fallback is almost
+ * always a table entry that drifted from the route it was written for, which
+ * is how `POST /api/versions/active` came to require the wrong permission.
+ */
+export function explicitRoutePermission(method: string, pathname: string): Permission | null {
+  const m = method.toUpperCase();
+  return ROUTE_PERMISSIONS.find((r) => r.method === m && r.pattern.test(pathname))?.permission ?? null;
+}
+
 export function permissionForRoute(method: string, pathname: string): Permission | null {
   const m = method.toUpperCase();
   if (isPublicRoute(m, pathname)) return null;

@@ -3532,7 +3532,7 @@ async function startHttpServer(): Promise<void> {
     // Authenticate the MCP call before the transport sees it. The project the
     // call targets is not known yet — it is a tool argument — so roles are
     // resolved globally here and narrowed per call in the tool wrapper.
-    const attempt = await authenticateRequest(req, null);
+    const attempt = await authenticateRequest(req, null, { allowSession: false });
     if (!attempt.ok) {
       const body = JSON.stringify({
         jsonrpc: "2.0",

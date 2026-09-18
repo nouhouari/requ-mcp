@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { promises as fsp, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { SqliteStore } from "./sqlite-store.js";
 import { PostgresStore } from "./postgres-store.js";
@@ -38,6 +39,7 @@ import { buildOpenApiDocument } from "./openapi.js";
 import { audit, flushChanges, recordingStore } from "./audit.js";
 import { handleAuditRoutes } from "./audit-routes.js";
 import { authenticateRequest, clientIp } from "./auth/authenticate.js";
+import { authConfig } from "./auth/config.js";
 import { newContext, runWithContext, type RequestContext } from "./auth/context.js";
 import { can, devPrincipal, type Permission, type Principal } from "./auth/model.js";
 import { isPublicRoute, permissionForRoute } from "./auth/rbac.js";
@@ -76,22 +78,77 @@ const MIME: Record<string, string> = {
   ".attach": "text/plain; charset=utf-8",
 };
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-  // `Authorization` so a script can drive the REST API with a personal access
-  // token. Credentials are deliberately not allowed: the session cookie is
-  // same-origin only, so a wildcard origin cannot be used to ride it.
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requ-Token",
-};
+/**
+ * Kept for the many response sites that spread it; CORS headers are now set
+ * per request by `applyCors`, so this stays empty.
+ */
+const CORS_HEADERS: Record<string, string> = {};
+
+/**
+ * Cross-origin access is opt-in (REQU_CORS_ORIGINS). The dashboard is
+ * same-origin and MCP clients are not browsers, so by default no browser on
+ * another origin gets to drive the API — with a wildcard, any page could have
+ * used a leaked personal access token from a script. Credentials are never
+ * allowed: the session cookie stays same-origin whatever the list says.
+ */
+function applyCors(req: IncomingMessage, res: ServerResponse): void {
+  const origins = authConfig().corsOrigins;
+  if (origins.length === 0) return;
+  const origin = req.headers.origin;
+  if (typeof origin !== "string" || !origin) return;
+  const allowed = origins.includes("*") ? "*" : origins.includes(origin) ? origin : null;
+  if (!allowed) return;
+  res.setHeader("Access-Control-Allow-Origin", allowed);
+  if (allowed !== "*") res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requ-Token");
+}
+
+/**
+ * What the dashboard shell may load and do. Scripts come from this server and
+ * the pinned jsDelivr files only — no inline scripts, so a payload smuggled
+ * into rendered content cannot run even if a sanitiser is bypassed.
+ * `'unsafe-eval'` is Alpine evaluating the expressions in the markup; inline
+ * *styles* are Alpine's `x-show`. Screen mockups render in a sandboxed srcdoc
+ * frame, which is what `frame-src` is for.
+ */
+const DASHBOARD_CSP = [
+  "default-src 'self'",
+  "script-src 'self' https://cdn.jsdelivr.net 'unsafe-eval'",
+  "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "img-src 'self' data: blob:",
+  "connect-src 'self'",
+  "frame-src 'self' blob: data:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join("; ");
+
+/** Headers every response carries, whatever route produced it. */
+function applySecurityHeaders(res: ServerResponse): void {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("Referrer-Policy", "same-origin");
+  // Only meaningful over TLS, which is exactly when the cookie is Secure.
+  if (authConfig().cookieSecure) res.setHeader("Strict-Transport-Security", "max-age=31536000");
+}
+
+/**
+ * A failure the caller did not cause. The real error goes to the server log
+ * under a reference the caller is given; the response itself says nothing
+ * about drivers, file paths or column names.
+ */
+function internalError(res: ServerResponse, err: unknown, req: IncomingMessage): void {
+  const ref = randomBytes(4).toString("hex");
+  console.error(`[requ-mcp] ${req.method ?? "?"} ${(req.url ?? "").split("?")[0]} failed (ref ${ref}):`, err);
+  jsonError(res, 500, `Internal server error (ref ${ref}).`, "INTERNAL");
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function setHeaders(res: ServerResponse, headers: Record<string, string>): void {
-  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
-}
 
 function jsonOk(res: ServerResponse, data: unknown): void {
   const body = JSON.stringify(data);
@@ -220,10 +277,11 @@ async function serveIndexHtml(res: ServerResponse): Promise<void> {
   const filePath = path.join(PUBLIC_DIR, "index.html");
   try {
     let html = await fsp.readFile(filePath, "utf-8");
-    html = html.replace(/(\/public\/(?:app|style)\.[a-z]+)"/g, `$1?v=${SERVER_VERSION}"`);
+    html = html.replace(/(\/public\/(?:app|style|tailwind|mermaid-boot)\.[a-z]+)"/g, `$1?v=${SERVER_VERSION}"`);
     const buf = Buffer.from(html, "utf-8");
     res.writeHead(200, {
       ...CORS_HEADERS,
+      "Content-Security-Policy": DASHBOARD_CSP,
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-cache",
       "Content-Length": buf.length,
@@ -546,12 +604,18 @@ async function resolveStore(
     return { status: "ok", store: recordingStore(store.at(version) as AnyHttpStore, slug) };
   };
 
-  if (stores.size === 1) {
-    const [only] = [...stores.entries()];
-    return atVersion(only[1], only[0]);
-  }
+  // Whatever named the project for authorisation must name the data too. A
+  // single-project server may omit `?project=`, but when it is given it has to
+  // match: silently serving "the only project" for some other name let a role
+  // or token scoped to that other name act on this project's data.
   const slug = searchParams.get("project");
-  if (!slug) return { status: "ambiguous", available: [...stores.keys()] };
+  if (!slug) {
+    if (stores.size === 1) {
+      const [only] = [...stores.entries()];
+      return atVersion(only[1], only[0]);
+    }
+    return { status: "ambiguous", available: [...stores.keys()] };
+  }
   const store = stores.get(slug);
   if (!store) return { status: "unknown_project", slug };
   return atVersion(store, slug);
@@ -596,7 +660,10 @@ function handleStoreResult(
  */
 function projectSlugFor(stores: Map<string, AnyHttpStore>, searchParams: URLSearchParams): string | null {
   const explicit = searchParams.get("project");
-  if (explicit) return explicit;
+  // A name the server does not know resolves to no project at all, so only
+  // global roles apply — never a stale grant that happens to spell the same
+  // name, and never the one project that is loaded.
+  if (explicit) return stores.has(explicit) ? explicit : null;
   return stores.size === 1 ? [...stores.keys()][0] : null;
 }
 
@@ -617,9 +684,11 @@ export async function handleWebRequest(
   const rawUrl = req.url ?? "/";
   const method = req.method ?? "GET";
 
+  applySecurityHeaders(res);
+  applyCors(req, res);
+
   // Handle CORS preflight.
   if (method === "OPTIONS") {
-    setHeaders(res, CORS_HEADERS);
     res.writeHead(204).end();
     return true;
   }
@@ -665,7 +734,12 @@ export async function handleWebRequest(
     try {
       // Login, logout and "who am I" are how a caller becomes authenticated, so
       // they run before the guard.
-      if (await handleAuthRoutes(req, res, pathname, method, { principal, projectSlug, source: "web" })) {
+      if (await handleAuthRoutes(req, res, pathname, method, {
+        principal,
+        projectSlug,
+        source: "web",
+        resolveProject: (value) => (stores.has(value) ? value : null),
+      })) {
         return true;
       }
 
@@ -907,7 +981,7 @@ async function routeWebRequest(
         const url = stores.size > 1 ? `/allure/${slug}/` : "/allure/";
         jsonOk(res, { available, url });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1018,7 +1092,7 @@ async function routeWebRequest(
 
         jsonOk(res, { initialized: true, config: await store.readConfig() });
       } catch (err) {
-        jsonError(res, 500, (err as Error).message);
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1032,7 +1106,7 @@ async function routeWebRequest(
         const summary = await computeSummary(r.store);
         jsonOk(res, summary);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1077,7 +1151,7 @@ async function routeWebRequest(
           })
         );
         jsonOk(res, results.filter(Boolean));
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -1092,7 +1166,7 @@ async function routeWebRequest(
           draftVersion: cfg.draftVersion ?? null,
           versions,
         });
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -1126,7 +1200,7 @@ async function routeWebRequest(
           summary: { [entity]: diff.summary[entity] },
           entities: { [entity]: diff.entities[entity] },
         });
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -1140,7 +1214,7 @@ async function routeWebRequest(
         const result = await createVersion(r.store, body as never);
         if (!result.ok) { jsonError(res, 409, result.error); return true; }
         jsonOk(res, result.data);
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -1156,7 +1230,7 @@ async function routeWebRequest(
           const result = await lockVersion(r.store, params.version, body as never);
           if (!result.ok) { jsonError(res, 409, result.error); return true; }
           jsonOk(res, result.data);
-        } catch (err) { jsonError(res, 500, String(err)); }
+        } catch (err) { internalError(res, err, req); }
         return true;
       }
     }
@@ -1173,7 +1247,7 @@ async function routeWebRequest(
           const result = await unlockVersion(r.store, params.version, body as never);
           if (!result.ok) { jsonError(res, 409, result.error); return true; }
           jsonOk(res, result.data);
-        } catch (err) { jsonError(res, 500, String(err)); }
+        } catch (err) { internalError(res, err, req); }
         return true;
       }
     }
@@ -1188,7 +1262,7 @@ async function routeWebRequest(
         const result = await setActiveVersion(r.store, body as never);
         if (!result.ok) { jsonError(res, 400, result.error); return true; }
         jsonOk(res, result.data);
-      } catch (err) { jsonError(res, 500, String(err)); }
+      } catch (err) { internalError(res, err, req); }
       return true;
     }
 
@@ -1199,7 +1273,7 @@ async function routeWebRequest(
       try {
         jsonOk(res, await r.store.listRequirements());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1220,7 +1294,7 @@ async function routeWebRequest(
             .map((s) => s.id);
           jsonOk(res, { ...req_, linkedStoryIds });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1233,7 +1307,7 @@ async function routeWebRequest(
       try {
         jsonOk(res, await r.store.listStories());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1249,7 +1323,7 @@ async function routeWebRequest(
           if (!story) { jsonError(res, 404, `Story ${params.id} not found`); return true; }
           jsonOk(res, story);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1269,7 +1343,7 @@ async function routeWebRequest(
             .map((sc) => scenarioSummary(sc, storyById, undefined, true));
           jsonOk(res, list);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1321,7 +1395,7 @@ async function routeWebRequest(
           scenariosPassing,
         });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1352,7 +1426,7 @@ async function routeWebRequest(
           });
         jsonOk(res, { total: list.length, adrs: list });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1375,7 +1449,7 @@ async function routeWebRequest(
           });
           res.end(body);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1400,7 +1474,7 @@ async function routeWebRequest(
             supersedes: adrs.filter((a) => a.supersededBy === adr.id).map((a) => a.id),
           });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1442,7 +1516,7 @@ async function routeWebRequest(
           });
         jsonOk(res, { total: list.length, screens: list });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1467,7 +1541,7 @@ async function routeWebRequest(
           });
           res.end(body);
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1501,7 +1575,7 @@ async function routeWebRequest(
             usedBy: screens.filter((s) => s.uses.includes(screen.id)).map((s) => s.id),
           });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1534,7 +1608,7 @@ async function routeWebRequest(
           defaultPlatforms: config?.uiPlatforms ?? [],
         }));
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1546,7 +1620,7 @@ async function routeWebRequest(
       try {
         jsonOk(res, await r.store.listComponents());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1558,7 +1632,7 @@ async function routeWebRequest(
       try {
         jsonOk(res, await r.store.listPhases());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1571,7 +1645,7 @@ async function routeWebRequest(
         if (!await r.store.isInitialized()) return notInitialized(res);
         jsonOk(res, await r.store.readConfig());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1595,7 +1669,7 @@ async function routeWebRequest(
         await r.store.writeConfig(updated);
         jsonOk(res, await r.store.readConfig());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1607,7 +1681,7 @@ async function routeWebRequest(
       try {
         jsonOk(res, await r.store.listVcsRefs());
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1623,7 +1697,7 @@ async function routeWebRequest(
         const trend = buildTrend(requirements, stories, storyMap, executionsByPhase, phases, mode);
         jsonOk(res, trend);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1645,7 +1719,7 @@ async function routeWebRequest(
         const gaps = findGaps(requirements, stories, storyMap, status, phaseId, mode, phases);
         jsonOk(res, gaps);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1681,7 +1755,7 @@ async function routeWebRequest(
         };
         jsonOk(res, enriched);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1733,7 +1807,7 @@ async function routeWebRequest(
           scenarios: page.map((sc) => scenarioSummary(sc, storyById, statusMap?.get(sc.testKey), includeContent)),
         });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1760,7 +1834,7 @@ async function routeWebRequest(
             source: sc.source,
           });
         } catch (err) {
-          jsonError(res, 500, String(err));
+          internalError(res, err, req);
         }
         return true;
       }
@@ -1777,7 +1851,7 @@ async function routeWebRequest(
         const list = [...counts.entries()].map(([tag, count]) => ({ tag, count })).sort((a, b) => a.tag.localeCompare(b.tag));
         jsonOk(res, list);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1800,7 +1874,7 @@ async function routeWebRequest(
         });
         res.end(body);
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }
@@ -1837,7 +1911,7 @@ async function routeWebRequest(
       } catch (err) {
         const msg = (err as Error).message;
         if (msg === "Payload too large") { jsonError(res, 413, msg); }
-        else { jsonError(res, 500, msg); }
+        else { internalError(res, err, req); }
       }
       return true;
     }
@@ -1897,7 +1971,7 @@ async function routeWebRequest(
         await r.store.appendExecutions(phaseId, [exec]);
         jsonOk(res, { phase: phaseId, recorded: exec });
       } catch (err) {
-        jsonError(res, 500, String(err));
+        internalError(res, err, req);
       }
       return true;
     }

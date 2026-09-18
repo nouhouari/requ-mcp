@@ -13,7 +13,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\" && tsx scripts/gen-openapi.ts",
+    "build": "npm run build:css && tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\" && tsx scripts/gen-openapi.ts",
+    "build:css": "tailwindcss -c tailwind.config.js -i src/public/tailwind.src.css -o src/public/tailwind.css --minify",
     "gen:openapi": "tsx scripts/gen-openapi.ts",
     "start": "tsx src/index.ts",
     "start:http": "tsx src/index.ts",
@@ -25,8 +26,8 @@
     "smoke:versions": "tsx scripts/smoke-versions.ts",
     "smoke:auth": "tsx scripts/smoke-auth.ts",
     "smoke:pg": "tsx scripts/smoke-pg.ts",
-    "prepare": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
-    "prepublishOnly": "tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\""
+    "prepare": "npm run build:css && tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\"",
+    "prepublishOnly": "npm run build:css && tsc && node -e \"require('fs').cpSync('src/public','dist/public',{recursive:true})\""
   },
   "keywords": [
     "mcp",
@@ -69,6 +70,7 @@
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
     "ldapjs": "^3.0.7",
+    "tailwindcss": "^3.4.19",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }

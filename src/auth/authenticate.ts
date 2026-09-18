@@ -31,10 +31,34 @@ export function userIdFor(username: string): string {
   return username.trim().toLowerCase();
 }
 
+/** `::ffff:10.0.0.1` and `10.0.0.1` are the same peer. */
+function normaliseIp(ip: string): string {
+  const t = ip.trim().toLowerCase();
+  return t.startsWith("::ffff:") ? t.slice(7) : t;
+}
+
+/**
+ * The address a request came from, for throttling and the audit trail.
+ *
+ * `X-Forwarded-For` is only believed when the socket peer is a configured
+ * reverse proxy (REQU_TRUSTED_PROXIES). Trusting it from anyone would let a
+ * caller choose which address the login throttle counts against — dodging it
+ * with a fresh value per request, or locking a victim's real address out.
+ */
 export function clientIp(req: IncomingMessage): string | null {
+  const peer = req.socket?.remoteAddress ?? null;
   const fwd = req.headers["x-forwarded-for"];
-  if (typeof fwd === "string" && fwd.trim()) return fwd.split(",")[0].trim();
-  return req.socket?.remoteAddress ?? null;
+  if (typeof fwd === "string" && fwd.trim() && peer) {
+    const trusted = authConfig().trustedProxies.map(normaliseIp);
+    if (trusted.includes(normaliseIp(peer))) {
+      // The proxy appends the peer it saw; the client is the last hop it added.
+      // Taking the first entry would trust whatever the client itself sent.
+      const hops = fwd.split(",").map((h) => h.trim()).filter(Boolean);
+      const own = hops[hops.length - 1];
+      if (own) return own;
+    }
+  }
+  return peer;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,12 +322,24 @@ export type AuthAttempt =
  * project the request is actually about. Callers that do not know it yet pass
  * null and re-resolve later with `reauthorizeForProject`.
  */
+export type AuthenticateOptions = {
+  /**
+   * Accept the dashboard's session cookie. Off for `/mcp`: MCP clients hold a
+   * token, never a cookie, so a cookie arriving there is a browser being made
+   * to send it — and a session stolen through the dashboard should not also
+   * reach every tool.
+   */
+  allowSession?: boolean;
+};
+
 export async function authenticateRequest(
   req: IncomingMessage,
   projectKey: string | null,
+  options: AuthenticateOptions = {},
 ): Promise<AuthAttempt> {
   const cfg = authConfig();
   if (!cfg.enabled) return { ok: true, principal: devPrincipal() };
+  const allowSession = options.allowSession ?? true;
 
   const store = authStore();
 
@@ -347,7 +383,7 @@ export async function authenticateRequest(
   }
 
   // --- dashboard session cookie ---
-  const cookies = parseCookies(req.headers.cookie);
+  const cookies = allowSession ? parseCookies(req.headers.cookie) : {};
   const sessionId = verifySessionCookie(cookies[cfg.cookieName], cfg.secret);
   if (sessionId) {
     const session = await store.getSession(sessionId);

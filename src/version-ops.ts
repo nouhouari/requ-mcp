@@ -190,9 +190,13 @@ export async function setActiveVersion(
   const known = await store.listVersions();
   const byId = new Map(known.map((v) => [v.version, v]));
 
+  // A pointer to a version that does not exist is never right — not even when
+  // no versions exist yet, which used to slip through and leave the project
+  // pointing at a baseline nothing could ever resolve.
   for (const [field, value] of [["current", input.current], ["draft", input.draft]] as const) {
-    if (value && known.length && !byId.has(value)) {
-      return fail(`Unknown version '${value}' for ${field}. Known: [${known.map((v) => v.version).join(", ")}].`);
+    if (value && !byId.has(value)) {
+      const list = known.length ? `Known: [${known.map((v) => v.version).join(", ")}].` : "No versions exist yet — create one first.";
+      return fail(`Unknown version '${value}' for ${field}. ${list}`);
     }
   }
   if (input.draft && byId.get(input.draft)?.status === "locked") {

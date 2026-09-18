@@ -4,6 +4,35 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Security
+Findings from a review of the LDAP/RBAC branch against a live instance, each
+now covered by `npm run smoke:auth`:
+- **Project scope was not enforced against the data it gated.** With one project
+  loaded, the REST layer served that project for any `?project=` value while
+  permissions and token scopes were evaluated for the value given, so a role or
+  token bound to a made-up name acted on the real project. The store is now
+  resolved from the same name authorisation used; unknown names are 404, and a
+  token scope or role grant must name a project the server has.
+- **Activating a version required `requirement:write` instead of
+  `version:manage`.** The permission table guarded a route spelling the server
+  never served. Fixed, and the table is now checked against the routes
+  `web-api.ts` declares so a drifted entry fails the build. Setting a version
+  that does not exist as current or draft is refused even when no versions
+  exist yet.
+- **Stored XSS through the project brief.** The brief was rendered from
+  Markdown without sanitising, unlike architecture decisions. It now goes
+  through DOMPurify and falls back to escaped text if the sanitiser is missing.
+- **`X-Forwarded-For` was trusted from anyone**, letting a caller pick the
+  address the login throttle counted. It is now honoured only from
+  `REQU_TRUSTED_PROXIES`.
+- Response hardening: a Content Security Policy on the dashboard shell (no
+  inline scripts), `nosniff`, `X-Frame-Options`, `Referrer-Policy`, HSTS when
+  the cookie is `Secure`; CDN scripts pinned with Subresource Integrity; Tailwind
+  compiled at build time instead of the runtime CDN; CORS off unless
+  `REQU_CORS_ORIGINS` lists origins; `/mcp` accepts tokens only, never the
+  dashboard cookie; internal failures answer with a reference id instead of the
+  raw error text.
+
 ## [2.0.0] – unreleased
 
 ### Added

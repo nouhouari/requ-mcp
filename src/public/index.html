@@ -8,18 +8,14 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'] }
-        }
-      }
-    }
-  </script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/styles/github.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.12.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous">
   <link rel="stylesheet" href="/public/style.css">
+  <!-- Tailwind is compiled at build time (npm run build:css → tailwind.css) instead of the
+       Tailwind play-CDN runtime JIT, so no inline config script is needed. It is linked
+       LAST on purpose: the play CDN appended its stylesheet to the end of <head>, so
+       utilities have always overridden style.css at equal specificity (e.g. the gradient
+       on the Verified KPI card over .kpi-card's white background). -->
+  <link rel="stylesheet" href="/public/tailwind.css">
 </head>
 <body class="bg-slate-50 font-sans text-slate-800" x-data="requApp" x-init="init()" x-cloak>
 
@@ -88,7 +84,7 @@
           <span class="font-medium">Microsoft Authenticator</span> — or any authenticator app — then enter the code it shows.
         </p>
         <div x-show="twofaSetup" x-cloak class="flex justify-center">
-          <div class="w-44 h-44 [&>svg]:w-full [&>svg]:h-full" x-html="twofaSetup ? twofaSetup.qrSvg : ''"></div>
+          <div class="w-44 h-44 [&>svg]:w-full [&>svg]:h-full" x-html="safeSvg(twofaSetup ? twofaSetup.qrSvg : '')"></div>
         </div>
         <details x-show="twofaSetup" x-cloak class="text-xs text-slate-500">
           <summary class="cursor-pointer">Can't scan it?</summary>
@@ -2701,6 +2697,8 @@
                            never fires and the entire app is silently dead
     3. alpinejs  (defer) — fires alpine:init after DOMContentLoaded; app.js has
                            already registered the requApp data component by then
+    4. mermaid + mermaid-boot.js (defer, after Alpine) — may land late; every
+                           caller guards on window.mermaid
   -->
   <!-- ═══════════════════════════════════════════════════════════
        IMPORT MODAL
@@ -3238,7 +3236,7 @@
             </p>
             <div class="flex flex-col sm:flex-row gap-4 items-start">
               <div class="w-40 h-40 shrink-0 bg-white rounded border border-indigo-200 p-1 [&>svg]:w-full [&>svg]:h-full"
-                   x-html="twofaSetup ? twofaSetup.qrSvg : ''"></div>
+                   x-html="safeSvg(twofaSetup ? twofaSetup.qrSvg : '')"></div>
               <div class="flex-1 min-w-0">
                 <p class="text-xs text-indigo-900 mb-1">Or type this key in by hand:</p>
                 <code class="block font-mono text-[11px] bg-white border border-indigo-200 rounded p-2 break-all mb-3"
@@ -3458,19 +3456,21 @@
 
   </div><!-- /authenticated shell -->
 
-  <script src="https://cdn.jsdelivr.net/npm/marked@14/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/languages/gherkin.min.js"></script>
+  <!-- Every jsDelivr asset is pinned to an exact version and carries a Subresource
+       Integrity hash (sha384 of the pinned bytes). Bump version and hash together. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js" integrity="sha384-lqPzN0kmFw9t2syAMwVPM4VbAyqsz/lPyYWbb2Xt6nSPM0WPNrpSWCUBgdcAdgnC" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.min.js" integrity="sha384-uUMu9JDY09vBzRf9SPcK2VgUj+W/70J6Soc+Dded5P474ElQ63iv9j5N3DE7Kp3N" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.12.0/highlight.min.js" integrity="sha384-wjfDDhOPPdjtva8vWBhWeVprSpmxisEu5aYT3q1JyACqXpdKpo3PWZTMVq24MBix" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.12.0/languages/gherkin.min.js" integrity="sha384-nvNtLf3hmt8LjP5Z+rza+Li8AWt59cWAf4A8dQBTMNdJtAUGkTo+q0U5Pk8rDBEK" crossorigin="anonymous"></script>
   <script src="/public/app.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
-  <!-- mermaid 11 ships ESM only (no UMD entry), so import it and park it on window.
-       It resolves after Alpine boots; every caller guards on window.mermaid. -->
-  <script type="module">
-    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-    mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'neutral' });
-    window.mermaid = mermaid;
-  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.17.2/dist/cdn.min.js" integrity="sha384-lcaMFHdvRVsEXVuhit4fTnbxq6eTLm5HPdNzO7vXNZjr8HOCMouPmv4hSGF3PCJV" crossorigin="anonymous"></script>
+  <!-- mermaid: the single-file IIFE build (dist/mermaid.min.js) rather than the ESM entry —
+       an ESM module that imports further chunks cannot be integrity-protected. It sets
+       window.mermaid itself; mermaid-boot.js (external, no inline script under CSP) then
+       configures it. Both are deferred so they run in order after Alpine has booted;
+       every caller guards on window.mermaid. -->
+  <script defer src="https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.min.js" integrity="sha384-EOXBFmc3gx5mb+vn0vPvvGqACToJD24hhacX5Yx+8NUUQrHIle/Qi5Bg9o3zKwW2" crossorigin="anonymous"></script>
+  <script defer src="/public/mermaid-boot.js"></script>
 </body>
 </html>
