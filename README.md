@@ -74,6 +74,13 @@ Without `REQU_PG_URL` the server uses SQLite and takes its projects from
 *creation* requires Postgres.
 </details>
 
+### Deploying to a server
+
+For a real deployment — an Ubuntu VM on OpenStack running the published image
+next to PostgreSQL on a block volume, behind your reverse proxy, signing in
+against Active Directory — see [deploy/ansible/README.md](deploy/ansible/README.md).
+One playbook provisions the VM, configures it, and verifies the result.
+
 ## Web Dashboard
 
 The same server that answers MCP calls also serves a web dashboard, so there is

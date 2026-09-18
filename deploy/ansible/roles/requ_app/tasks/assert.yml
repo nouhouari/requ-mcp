@@ -1,0 +1,64 @@
+---
+# Everything here fails before the host is touched. The server validates its
+# configuration at boot and exits on anything ambiguous, so a mistake caught
+# here saves a crash-looping container later.
+- name: Database password is URL-safe and long enough
+  ansible.builtin.assert:
+    that: pg_password is match('^[A-Za-z0-9._~-]{16,}$')
+    fail_msg: "pg_password must be 16+ characters from A-Z a-z 0-9 . _ ~ - (it is embedded in the connection URL)."
+    quiet: true
+  no_log: true
+
+- name: Session secret is long enough
+  ansible.builtin.assert:
+    that: requ_auth_secret | length >= 32
+    fail_msg: "requ_auth_secret must be at least 32 characters (openssl rand -hex 32)."
+    quiet: true
+  no_log: true
+
+- name: Authentication mode is valid
+  ansible.builtin.assert:
+    that: requ_auth_mode in ['disabled', 'ldap']
+    fail_msg: "requ_auth_mode must be 'disabled' or 'ldap'."
+
+- name: LDAP settings are complete
+  ansible.builtin.assert:
+    that:
+      - requ_ldap_url | length > 0
+      - requ_ldap_base_dn | length > 0
+      - (requ_ldap_url is match('^ldaps://')) or (requ_ldap_allow_plaintext | bool)
+      - (requ_ldap_role_map | length > 0) or (requ_auth_admins | length > 0)
+    fail_msg: >-
+      In ldap mode set requ_ldap_url (ldaps://…) and requ_ldap_base_dn, and map at least one
+      group to admin in requ_ldap_role_map or name a bootstrap administrator in requ_auth_admins.
+  when: requ_auth_mode == 'ldap'
+
+- name: Trusted proxies are addresses, not networks
+  ansible.builtin.assert:
+    that: "'/' not in item"
+    fail_msg: "requ_trusted_proxies takes exact addresses; the server matches them exactly ({{ item }})."
+  loop: "{{ requ_trusted_proxies }}"
+
+- name: Second-factor settings are consistent
+  ansible.builtin.assert:
+    that:
+      - requ_2fa in ['off', 'optional', 'required']
+      - requ_2fa == 'off' or requ_auth_mode == 'ldap'
+      - requ_2fa != 'off' or requ_2fa_required_roles | length == 0
+    fail_msg: "requ_2fa must be off|optional|required, needs ldap mode when on, and requ_2fa_required_roles must be empty when off."
+
+- name: Values fit the single-quoted env file
+  ansible.builtin.assert:
+    that: "\"'\" not in (item.value | string)"
+    fail_msg: "{{ item.key }} contains a single quote, which the env file cannot carry."
+    quiet: true
+  loop: "{{ requ_env_map | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true
+
+- name: Building on the VM needs a ref with the Dockerfile
+  ansible.builtin.assert:
+    that: requ_build_ref | length > 0
+    fail_msg: "requ_image_build is on: set requ_build_ref to a branch or tag that contains Dockerfile."
+  when: requ_image_build | bool

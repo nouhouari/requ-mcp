@@ -1,0 +1,32 @@
+---
+- name: Install the dump script
+  ansible.builtin.template:
+    src: requ-backup.sh.j2
+    dest: /usr/local/bin/requ-backup.sh
+    mode: "0750"
+
+- name: Install the systemd service and timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - requ-backup.service
+    - requ-backup.timer
+  notify: Reload systemd
+
+- name: Flush handlers so the timer can be enabled
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the nightly timer
+  ansible.builtin.systemd_service:
+    name: requ-backup.timer
+    enabled: true
+    state: started
+
+- name: Take a first dump now
+  ansible.builtin.systemd_service:
+    name: requ-backup.service
+    state: started
+  when: backup_run_now | bool
+  changed_when: false

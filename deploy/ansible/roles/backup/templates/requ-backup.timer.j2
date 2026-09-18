@@ -1,0 +1,11 @@
+# Managed by Ansible (requ deployment).
+[Unit]
+Description=Nightly requ database dump
+
+[Timer]
+OnCalendar={{ backup_on_calendar }}
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

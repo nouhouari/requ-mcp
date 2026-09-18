@@ -1,0 +1,15 @@
+---
+- name: Check out the sources to build from
+  when: not (requ_render_only | bool)
+  ansible.builtin.git:
+    repo: "{{ requ_build_repo }}"
+    dest: "{{ requ_src_dir }}"
+    version: "{{ requ_build_ref }}"
+    depth: 1
+    force: true
+  register: requ_src
+
+- name: Name the image after the commit so a new commit recreates the container
+  ansible.builtin.set_fact:
+    requ_image_effective: requ-mcp
+    requ_tag_effective: "local-{{ requ_src.after[:12] | default('render') }}"

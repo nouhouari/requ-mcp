@@ -1,0 +1,6 @@
+# Encrypt this file before use and keep it out of the repository:
+#   ansible-vault encrypt inventory/group_vars/requ/vault.yml
+# Generate the first two with:  openssl rand -hex 32
+vault_pg_password: "replace-me-with-openssl-rand-hex-32"
+vault_requ_auth_secret: "replace-me-with-openssl-rand-hex-32"
+vault_requ_ldap_bind_password: "the svc-requ password from Active Directory"

@@ -1,0 +1,15 @@
+---
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-compose-plugin
+  - docker-buildx-plugin
+# live-restore keeps containers up across a daemon restart; the log caps are a
+# floor for anything started by hand (the compose file caps its own services).
+docker_daemon_json:
+  live-restore: true
+  log-driver: json-file
+  log-opts:
+    max-size: "10m"
+    max-file: "3"
