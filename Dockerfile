@@ -27,6 +27,7 @@ COPY package.json package-lock.json tsconfig.json ./
 # prepare needs src/ to compile; install with scripts off, build explicitly.
 RUN npm ci --ignore-scripts --no-audit --no-fund \
  && npm rebuild better-sqlite3
+COPY tailwind.config.js ./
 COPY src ./src
 COPY scripts ./scripts
 RUN npm run build \
