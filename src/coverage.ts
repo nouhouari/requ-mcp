@@ -292,6 +292,49 @@ export function countsByPhase(
   return rows;
 }
 
+/**
+ * The phases whose executions feed a coverage view, oldest first.
+ *
+ *   no target   → every phase ("All phases": latest result anywhere)
+ *   strict      → the target phase alone
+ *   cumulative  → the target phase and everything before it
+ *
+ * An unknown target yields no phases at all, so nothing counts as executed.
+ */
+export function feedingPhases(phases: Phase[], targetPhaseId: string | null, mode: CoverageMode): Phase[] {
+  if (!targetPhaseId) return [...phases].sort((a, b) => a.order - b.order);
+  const target = phases.find((p) => p.id === targetPhaseId);
+  if (!target) return [];
+  return mode === "strict"
+    ? [target]
+    : phases.filter((p) => p.order <= target.order).sort((a, b) => a.order - b.order);
+}
+
+/** An execution together with the phase it was recorded in. */
+export type LatestRun = Execution & { phase: string };
+
+/**
+ * Latest execution per scenario across the feeding phases: later phases and,
+ * within a phase, later `ranAt` overwrite earlier runs. A scenario absent from
+ * the result has never been executed in scope — a distinction `resolveStatuses`
+ * deliberately collapses into "pending".
+ */
+export function resolveLatestRuns(
+  executionsByPhase: Map<string, Execution[]>,
+  phases: Phase[],
+  targetPhaseId: string | null,
+  mode: CoverageMode,
+): Map<string, LatestRun> {
+  const out = new Map<string, LatestRun>();
+  for (const phase of feedingPhases(phases, targetPhaseId, mode)) {
+    const runs = [...(executionsByPhase.get(phase.id) ?? [])].sort((a, b) =>
+      a.ranAt < b.ranAt ? -1 : a.ranAt > b.ranAt ? 1 : 0,
+    );
+    for (const run of runs) out.set(testKey(run), { ...run, phase: phase.id }); // newer overwrites
+  }
+  return out;
+}
+
 export function resolveStatuses(
   executionsByPhase: Map<string, Execution[]>,
   phases: Phase[],
@@ -299,24 +342,8 @@ export function resolveStatuses(
   mode: CoverageMode,
 ): StatusMap {
   const out: StatusMap = new Map();
-  // "All phases" (no target): latest status per scenario across every phase.
-  let feeding: Phase[];
-  if (!targetPhaseId) {
-    feeding = [...phases].sort((a, b) => a.order - b.order);
-  } else {
-    const target = phases.find((p) => p.id === targetPhaseId);
-    if (!target) return out;
-    feeding =
-      mode === "strict"
-        ? [target]
-        : phases.filter((p) => p.order <= target.order).sort((a, b) => a.order - b.order);
-  }
-
-  for (const phase of feeding) {
-    const runs = [...(executionsByPhase.get(phase.id) ?? [])].sort((a, b) =>
-      a.ranAt < b.ranAt ? -1 : a.ranAt > b.ranAt ? 1 : 0,
-    );
-    for (const run of runs) out.set(testKey(run), run.status); // newer overwrites
+  for (const [key, run] of resolveLatestRuns(executionsByPhase, phases, targetPhaseId, mode)) {
+    out.set(key, run.status);
   }
   return out;
 }
@@ -666,4 +693,191 @@ export function findGaps(
   }
 
   return { phase: phaseId, mode, requirementsWithoutStory, storiesWithoutScenario, storiesNotCovered };
+}
+
+// ---------------------------------------------------------------------------
+// Traceability chain: requirement → story → scenario → latest result
+// ---------------------------------------------------------------------------
+
+/** `never_run` is a scenario with no execution in any feeding phase. */
+export type TraceScenarioStatus = TestStatus | "never_run";
+
+export interface TraceRequirement {
+  id: string;
+  title: string;
+  priority: string;
+  status: string;
+  phase: string | null;
+  storyIds: string[];
+  hasStory: boolean;
+  verified: boolean;
+}
+
+export interface TraceStory {
+  id: string;
+  title: string;
+  status: string;
+  requirementIds: string[];
+  scenarioIds: string[];
+  tested: boolean;
+  covered: boolean;
+}
+
+export interface TraceScenario {
+  /** testKey — `Feature::Scenario name`. */
+  id: string;
+  feature: string;
+  name: string;
+  file: string | null;
+  /** In-scope stories this scenario tests, plus any unknown ids it is tagged with. */
+  storyIds: string[];
+  valid: boolean;
+  status: TraceScenarioStatus;
+  lastRun: { ranAt: string; phase: string; runId?: string; source: string } | null;
+}
+
+export interface TraceabilityReport {
+  phase: string | null;
+  mode: CoverageMode;
+  requirements: TraceRequirement[];
+  stories: TraceStory[];
+  scenarios: TraceScenario[];
+  /** `@US-xxx` tags whose story does not exist. */
+  dangling: { scenarioId: string; storyId: string }[];
+  summary: {
+    requirementsTotal: number;
+    storiesTotal: number;
+    scenariosTotal: number;
+    requirementsWithoutStory: number;
+    requirementsVerified: number;
+    storiesWithoutScenario: number;
+    storiesNotCovered: number;
+    scenariosNeverRun: number;
+    scenariosFailing: number;
+    scenariosPending: number;
+    scenariosPassing: number;
+    danglingTags: number;
+  };
+}
+
+/**
+ * The full chain behind a coverage report, one node per entity, with the gap at
+ * every broken link made explicit. Requirements and stories follow the same
+ * phase scoping as `buildReport`; scenarios are those reachable from an in-scope
+ * story plus any scenario tagged with a story id that does not exist (a data
+ * error worth showing regardless of phase). Scenarios with no story tag at all
+ * are not part of the chain and are left out.
+ */
+export function buildTraceability(
+  requirements: Requirement[],
+  stories: UserStory[],
+  scenarios: Scenario[],
+  scenariosByStory: ScenariosByStory,
+  latestRuns: Map<string, LatestRun>,
+  phaseId: string | null,
+  mode: CoverageMode,
+  phases: Phase[] = [],
+): TraceabilityReport {
+  const status: StatusMap = new Map();
+  for (const [key, run] of latestRuns) status.set(key, run.status);
+  const report = buildReport(requirements, stories, scenariosByStory, status, phaseId, mode, [], phases);
+
+  const phaseById = new Map(requirements.map((r) => [r.id, r.phase ?? null] as const));
+  const knownStoryIds = new Set(stories.map((s) => s.id));
+  const storedByKey = new Map(scenarios.map((sc) => [sc.testKey, sc] as const));
+
+  const entries = new Map<string, TraceScenario>();
+  const entryFor = (key: string, feature: string, name: string): TraceScenario => {
+    let e = entries.get(key);
+    if (e) return e;
+    const stored = storedByKey.get(key);
+    const run = latestRuns.get(key);
+    e = {
+      id: key,
+      feature,
+      name,
+      file: stored?.file ?? null,
+      storyIds: [],
+      valid: stored?.valid ?? true,
+      status: run ? run.status : "never_run",
+      lastRun: run
+        ? { ranAt: run.ranAt, phase: run.phase, ...(run.runId ? { runId: run.runId } : {}), source: run.source }
+        : null,
+    };
+    entries.set(key, e);
+    return e;
+  };
+  const link = (e: TraceScenario, storyId: string) => {
+    if (!e.storyIds.includes(storyId)) e.storyIds.push(storyId);
+  };
+
+  const traceStories: TraceStory[] = report.stories.map((s) => {
+    const refs = scenariosByStory.get(s.id) ?? [];
+    const ids: string[] = [];
+    for (const ref of refs) {
+      const key = testKey(ref);
+      link(entryFor(key, ref.feature, ref.name), s.id);
+      if (!ids.includes(key)) ids.push(key);
+    }
+    return {
+      id: s.id,
+      title: s.title,
+      status: s.status,
+      requirementIds: s.requirements,
+      scenarioIds: ids,
+      tested: s.tested,
+      covered: s.covered,
+    };
+  });
+
+  const dangling: TraceabilityReport["dangling"] = [];
+  for (const sc of scenarios) {
+    const unknown = sc.stories.filter((id) => !knownStoryIds.has(id));
+    if (unknown.length === 0) continue;
+    const e = entryFor(sc.testKey, sc.feature, sc.name);
+    for (const id of unknown) {
+      link(e, id);
+      dangling.push({ scenarioId: sc.testKey, storyId: id });
+    }
+  }
+
+  const traceRequirements: TraceRequirement[] = report.requirements.map((r) => ({
+    id: r.id,
+    title: r.title,
+    priority: r.priority,
+    status: r.status,
+    phase: phaseById.get(r.id) ?? null,
+    storyIds: r.storyIds,
+    hasStory: r.hasStory,
+    verified: r.verified,
+  }));
+
+  const traceScenarios = [...entries.values()].sort((a, b) =>
+    a.feature === b.feature ? a.name.localeCompare(b.name) : a.feature.localeCompare(b.feature),
+  );
+
+  const count = <T,>(xs: T[], pred: (x: T) => boolean) => xs.reduce((n, x) => n + (pred(x) ? 1 : 0), 0);
+
+  return {
+    phase: phaseId,
+    mode,
+    requirements: traceRequirements,
+    stories: traceStories,
+    scenarios: traceScenarios,
+    dangling,
+    summary: {
+      requirementsTotal: traceRequirements.length,
+      storiesTotal: traceStories.length,
+      scenariosTotal: traceScenarios.length,
+      requirementsWithoutStory: count(traceRequirements, (r) => r.status === "active" && !r.hasStory),
+      requirementsVerified: count(traceRequirements, (r) => r.verified),
+      storiesWithoutScenario: count(traceStories, (s) => !s.tested),
+      storiesNotCovered: count(traceStories, (s) => s.tested && !s.covered),
+      scenariosNeverRun: count(traceScenarios, (s) => s.status === "never_run"),
+      scenariosFailing: count(traceScenarios, (s) => s.status === "fail"),
+      scenariosPending: count(traceScenarios, (s) => s.status === "pending"),
+      scenariosPassing: count(traceScenarios, (s) => s.status === "pass"),
+      danglingTags: dangling.length,
+    },
+  };
 }

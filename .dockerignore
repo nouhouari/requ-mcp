@@ -7,3 +7,5 @@ dist/
 .playwright-mcp/
 *.log
 .DS_Store
+# Never bake local credentials into an image.
+.env
