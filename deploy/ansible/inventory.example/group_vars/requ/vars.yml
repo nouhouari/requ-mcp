@@ -3,7 +3,7 @@
 # lists the ones a deployment normally sets.
 
 # --- image -------------------------------------------------------------------
-requ_tag: "2.1.0"
+requ_tag: "2.2.0"
 # Until ghcr.io/nouhouari/requ-mcp is published, build on the VM instead:
 # requ_image_build: true
 # requ_build_ref: main

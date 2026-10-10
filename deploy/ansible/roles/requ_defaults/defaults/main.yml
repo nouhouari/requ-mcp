@@ -8,7 +8,7 @@ requ_port: 8788
 # REQU_TRUSTED_PROXIES could not match.
 requ_bind_ip: "{{ ansible_facts.default_ipv4.address }}"
 # Pin a version for reproducible deploys; `latest` is pulled on every run.
-requ_tag: "2.1.0"
+requ_tag: "2.2.0"
 requ_image_build: false
 requ_auth_mode: ldap
 # off | optional | required

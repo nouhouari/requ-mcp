@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [2.2.0] – 2026-10-10
+
 ### Added
 - **Deep links.** The dashboard URL now follows what is on screen —
   `/projects/<slug>[/<tab>[/<id>]]` (plus `?version=` when a non-current
