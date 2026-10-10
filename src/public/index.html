@@ -898,7 +898,7 @@
                 </thead>
                 <template x-for="req in filteredRequirements()" :key="req.id">
                   <tbody>
-                    <tr @click="toggleReq(req.id)" :class="reqExpanded === req.id ? 'expanded' : ''">
+                    <tr :id="'req-row-' + req.id" @click="toggleReq(req.id)" :class="reqExpanded === req.id ? 'expanded' : ''">
                       <td>
                         <span class="badge" :class="reqStatusBadge(req).cls">
                           <span x-text="reqStatusBadge(req).icon"></span>
@@ -951,13 +951,21 @@
                                   <span>Source: <span class="text-slate-700 font-medium" x-text="req.source || '—'"></span></span>
                                   <span>Status: <span class="text-slate-700 font-medium" x-text="req.status"></span></span>
                                 </div>
-                                <button x-show="can('history:read') && auth.auditEnabled" x-cloak
-                                  class="mt-3 btn-secondary text-xs flex items-center gap-1.5"
-                                  @click.stop="openHistory('requirement', req.id)"
-                                  :aria-label="'Change history for ' + req.id">
-                                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
-                                  History
-                                </button>
+                                <div class="mt-3 flex flex-wrap gap-2">
+                                  <button x-show="can('history:read') && auth.auditEnabled" x-cloak
+                                    class="btn-secondary text-xs flex items-center gap-1.5"
+                                    @click.stop="openHistory('requirement', req.id)"
+                                    :aria-label="'Change history for ' + req.id">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+                                    History
+                                  </button>
+                                  <button class="btn-secondary text-xs flex items-center gap-1.5"
+                                    @click.stop="copyLink('requirements', req.id)"
+                                    :aria-label="'Copy link to ' + req.id">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
+                                    <span x-text="linkCopied === routePath('requirements', req.id) ? 'Copied' : 'Copy link'"></span>
+                                  </button>
+                                </div>
                                 <div class="mt-2 flex flex-wrap gap-1">
                                   <template x-for="tag in (req.tags || [])" :key="tag">
                                     <span class="chip" x-text="tag"></span>
@@ -2860,9 +2868,17 @@
             </span>
           </div>
         </div>
-        <button @click="closeAdr()" class="shrink-0 text-slate-400 hover:text-slate-600 p-1" aria-label="Close">
-          <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
-        </button>
+        <div class="flex items-center gap-2 shrink-0">
+          <button class="btn-secondary text-xs flex items-center gap-1.5"
+            @click.stop="copyLink('adrs', adrOpenId)"
+            :aria-label="'Copy link to ' + adrOpenId">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
+            <span x-text="linkCopied === routePath('adrs', adrOpenId) ? 'Copied' : 'Copy link'"></span>
+          </button>
+          <button @click="closeAdr()" class="shrink-0 text-slate-400 hover:text-slate-600 p-1" aria-label="Close">
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
       </div>
       <div class="overflow-auto px-6 py-5">
         <template x-if="adrDetail && (adrDetail.requirementDetails || []).length > 0">
@@ -3101,6 +3117,12 @@
           <label class="flex items-center gap-2 text-xs text-slate-600">
             <input type="checkbox" x-model="screenHighlight" class="rounded border-slate-300"> Highlight traced elements
           </label>
+          <button class="btn-secondary text-xs flex items-center gap-1.5"
+            @click.stop="copyLink('screens', screenOpenId)"
+            :aria-label="'Copy link to ' + screenOpenId">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
+            <span x-text="linkCopied === routePath('screens', screenOpenId) ? 'Copied' : 'Copy link'"></span>
+          </button>
           <button @click="closeScreen()" class="p-2 text-slate-400 hover:text-slate-600" aria-label="Close">
             <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
               <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
@@ -3230,11 +3252,19 @@
           </div>
           <h2 id="story-detail-title" class="font-semibold text-slate-800 text-base leading-snug" x-text="storyDetail?.title"></h2>
         </div>
-        <button x-ref="storyDetailClose" @click="closeStoryDetail()" class="p-2 text-slate-400 hover:text-slate-600 transition-colors shrink-0" aria-label="Close">
-          <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-            <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          </svg>
-        </button>
+        <div class="flex items-center gap-2 shrink-0">
+          <button class="btn-secondary text-xs flex items-center gap-1.5"
+            @click.stop="copyLink('stories', storyDetail?.id)"
+            :aria-label="'Copy link to ' + storyDetail?.id">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
+            <span x-text="linkCopied === routePath('stories', storyDetail?.id) ? 'Copied' : 'Copy link'"></span>
+          </button>
+          <button x-ref="storyDetailClose" @click="closeStoryDetail()" class="p-2 text-slate-400 hover:text-slate-600 transition-colors shrink-0" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+              <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
       </div>
 
       <!-- Body (scrollable) -->

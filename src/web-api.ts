@@ -390,6 +390,21 @@ async function serveAllureFile(
 // Summary helper (shared by GET /api/summary and SSE)
 // ---------------------------------------------------------------------------
 
+/**
+ * Cheap change fingerprint for an entity list: its length plus the newest
+ * `updatedAt`. The dashboard compares these across SSE ticks to decide which
+ * lists to re-fetch — a count alone misses in-place edits such as moving a
+ * requirement to another phase.
+ */
+function listRevision(items: ReadonlyArray<{ updatedAt?: string; createdAt?: string }>): string {
+  let newest = "";
+  for (const it of items) {
+    const t = it.updatedAt ?? it.createdAt ?? "";
+    if (t > newest) newest = t;
+  }
+  return `${items.length}:${newest}`;
+}
+
 async function computeSummary(store: AnyHttpStore): Promise<Record<string, unknown>> {
   const [requirements, stories, components, phases, scenarios] = await Promise.all([
     store.listRequirements(),
@@ -460,6 +475,15 @@ async function computeSummary(store: AnyHttpStore): Promise<Record<string, unkno
     deliveredVerified:          delivered.deliveredVerified,
     deliveredTotal:             delivered.deliveredTotal,
     activePhase,
+    // Per-list fingerprints; see listRevision().
+    revisions: {
+      requirements: listRevision(requirements),
+      stories:      listRevision(stories),
+      components:   listRevision(components),
+      phases:       listRevision(phases),
+      vcsRefs:      listRevision(vcsRefs),
+      adrs:         listRevision(adrs),
+    },
   };
 }
 
@@ -2011,10 +2035,12 @@ async function routeWebRequest(
   // Static files — only for GET requests that are NOT MCP or /events
   // -------------------------------------------------------------------------
   if (method !== "GET") return false;
-  if (rawUrl.includes("/mcp")) return false;
 
   // GET / → index.html
   const pathname = rawUrl.split("?")[0];
+  // Only the MCP endpoint itself — a dashboard deep link such as
+  // /projects/mcp-tools/requirements must still reach the SPA fallback.
+  if (pathname === "/mcp" || pathname.startsWith("/mcp/")) return false;
 
   if (pathname === "/") {
     await serveIndexHtml(res);
