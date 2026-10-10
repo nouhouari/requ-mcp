@@ -4,6 +4,28 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [2.2.0] – 2026-10-10
+
+### Added
+- **Deep links.** The dashboard URL now follows what is on screen —
+  `/projects/<slug>[/<tab>[/<id>]]` (plus `?version=` when a non-current
+  baseline is selected) — so a project, a tab, a requirement (row expanded and
+  scrolled into view), a story, an ADR or a screen can be opened straight from
+  a link. Back/Forward step through tabs and projects. A **Copy link** button
+  sits on the expanded requirement and in the story, ADR and screen viewers.
+- **`revisions`** in `GET /api/summary` and the `/events` stream: a per-list
+  fingerprint (count + newest `updatedAt`) for requirements, stories,
+  components, phases, VCS refs and ADRs.
+
+### Fixed
+- **Phase filter showed stale data.** The live dashboard only re-fetched a list
+  when its *count* changed, so in-place edits — assigning requirements to a
+  phase, renaming, re-prioritising — never reached an open tab: "Counts by
+  phase" was right while the Requirements phase filter found nothing and
+  "Unassigned" listed everything. Lists now reload when their revision changes.
+- A project slug containing `mcp` (e.g. `/projects/mcp-tools/...`) no longer
+  routes a dashboard page to the MCP endpoint.
+
 ## [2.1.0] – 2026-10-08
 
 ### Added

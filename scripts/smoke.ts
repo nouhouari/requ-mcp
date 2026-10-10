@@ -239,8 +239,24 @@ async function main() {
     const bulkAgain = await call("assign_requirements_to_phase", { phase: "P2", ids: ["REQ-005"] });
     check("bulk is idempotent (already on the phase)", bulkAgain.data.moved === 0 && bulkAgain.data.unchanged === 1, bulkAgain.data);
 
+    // The dashboard re-fetches a list when its summary revision changes; an
+    // in-place phase move keeps the count, so the revision must still move.
+    const summaryRev = async () =>
+      ((await (await fetch(`${h.base}/api/summary?project=${h.key}`)).json()) as any).revisions;
+    const revBefore = await summaryRev();
     const bulkBack = await call("assign_requirements_to_phase", { phase: "", ids: ["REQ-005"] });
     check("bulk unassigns with phase ''", bulkBack.data.moved === 1 && bulkBack.data.phase === null, bulkBack.data);
+    const revAfter = await summaryRev();
+    check("summary requirements revision changes on a phase move",
+      typeof revBefore?.requirements === "string" && revBefore.requirements !== revAfter?.requirements,
+      { revBefore, revAfter });
+    check("summary stories revision unchanged by a requirement edit",
+      revBefore?.stories === revAfter?.stories, { revBefore, revAfter });
+
+    // Deep links are served the dashboard shell, including a slug containing "mcp".
+    const deep = await fetch(`${h.base}/projects/mcp-tools/requirements/REQ-001`);
+    check("deep link serves the dashboard shell",
+      deep.status === 200 && (deep.headers.get("content-type") || "").startsWith("text/html"), deep.status);
 
     const bulkByComponent = await call("assign_requirements_to_phase", { phase: "P1", component: "auth", dryRun: true });
     check("bulk selects by component", bulkByComponent.data.selected === 1, bulkByComponent.data);

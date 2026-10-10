@@ -19,11 +19,22 @@ document.addEventListener('alpine:init', function () {
   var TRACE_MAX_PER_STORY = 5;    // scenarios shown per story before "+N more"
   var TRACE_MAX_SCENARIOS = 1500; // hard cap on scenario cards in one render
 
+  // Tabs a deep link may name (/projects/<slug>/<tab>/...). 'global' is "/".
+  var ROUTE_TABS = ['overview', 'requirements', 'adrs', 'stories', 'screens', 'coverage',
+    'traceability', 'components', 'vcs', 'scenarios', 'versions', 'audit', 'access'];
+
   Alpine.data('requApp', function () {
     return {
 
       // ── Navigation ──────────────────────────────────────────────────────────
       tab: 'overview',
+      // Deep links (/projects/<slug>/<tab>/<item>): the URL follows the state
+      // once the dashboard has booted; `_routing` mutes that while the state is
+      // being driven *from* the URL (first load, Back/Forward).
+      _routeReady: false,
+      _routing: false,
+      _routeWatching: false,
+      linkCopied: '',            // path just copied, for the button's ✓ feedback
 
       // ── Global state ────────────────────────────────────────────────────────
       notInitialized: false,
@@ -57,6 +68,7 @@ document.addEventListener('alpine:init', function () {
       screenStatusFilter: 'all',
       screenStaleOnly: false,
       screenDetailOpen: false,
+      screenOpenId: null,        // id asked for; screenDetail arrives later
       screenDetail: null,
       screenHtml: '',
       screenHighlight: true,
@@ -88,6 +100,7 @@ document.addEventListener('alpine:init', function () {
       adrSearch: '',
       adrStatusFilter: 'all',
       adrDetailOpen: false,
+      adrOpenId: null,           // id asked for; adrDetail arrives later
       adrDetail: null,
       adrHtml: '',
       adrLoading: false,
@@ -318,8 +331,14 @@ document.addEventListener('alpine:init', function () {
         var vd = await this._fetch('/api/version');
         if (vd && vd.version) this.appVersion = vd.version;
         await this.loadProjects();
-        if (this.projects.length > 1) { this.tab = 'global'; }
+        var route = this.parseRoute();
+        var routed = route && this.projects.find(function (p) { return p.slug === route.slug; });
+        if (routed) this.activeProject = routed;
+        else if (this.projects.length > 1) { this.tab = 'global'; }
         await this.loadVersions();
+        if (routed && route.version && this.versions.some(function (v) { return v.version === route.version; })) {
+          this.activeVersion = route.version;
+        }
         await this.loadConfig();
         await this.loadSummary();
         this.setupSSE();
@@ -337,6 +356,7 @@ document.addEventListener('alpine:init', function () {
         ];
         if (this.projects.length > 1) loaders.push(this.loadGlobalSummary());
         await Promise.all(loaders);
+        this._initRouting(routed ? route : null);
 
         this.$watch('scenariosSearch', function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
         this.$watch('scenariosTag',    function () { this.scenariosPage = 1; this.loadScenarios(); }.bind(this));
@@ -358,10 +378,12 @@ document.addEventListener('alpine:init', function () {
 
         // Browser Back/Forward drives the Traceability focus: leaving the focus
         // entry clears it; returning to it (Forward) re-applies it when possible.
+        // Any other entry is a deep-link step (tab, project or item): replay it.
         window.addEventListener('popstate', function (e) {
           var id = e.state && e.state.traceFocus;
           if (id && TRACE.byId[id]) { if (self.traceSelected !== id) self._traceFocus(id); }
           else if (self.traceSelected) { self.traceClear(true); }
+          if (!id) self.applyRoute(self.parseRoute());
         });
       },
 
@@ -1599,18 +1621,29 @@ document.addEventListener('alpine:init', function () {
                 }
                 self.notInitialized = false;
                 if (self.tab === 'global') { self.loadGlobalSummary(); }
-                if (!prev || d.requirements !== prev.requirements) self.loadRequirements();
-                if (!prev || d.stories !== prev.stories) self.loadStories();
-                if (!prev || d.components !== prev.components) self.loadComponents();
-                if (!prev || d.phases !== prev.phases) self.loadPhases();
-                if (!prev || d.vcsRefs !== prev.vcsRefs) self.loadVcsRefs();
-                if (!prev || d.adrs !== prev.adrs) self.loadAdrs();
+                // A list is re-fetched when its content changed, not only its
+                // size: `revisions` fingerprints each list (count + newest
+                // updatedAt), so an in-place edit such as moving a requirement
+                // to another phase reaches the open tab. Falls back to the
+                // count for a server that does not send revisions yet.
+                var changed = function (key) {
+                  if (!prev) return true;
+                  if (d.revisions && prev.revisions) return d.revisions[key] !== prev.revisions[key];
+                  return d[key] !== prev[key];
+                };
+                if (changed('requirements')) self.loadRequirements();
+                if (changed('stories')) self.loadStories();
+                if (changed('components')) self.loadComponents();
+                if (changed('phases')) self.loadPhases();
+                if (changed('vcsRefs')) self.loadVcsRefs();
+                if (changed('adrs')) self.loadAdrs();
                 var coverageChanged = !prev ||
                   d.verifiedPct !== prev.verifiedPct ||
                   d.verifiedPctCumulative !== prev.verifiedPctCumulative ||
                   d.storyCoveragePct !== prev.storyCoveragePct ||
-                  d.stories !== prev.stories ||
-                  d.requirements !== prev.requirements;
+                  changed('stories') ||
+                  changed('requirements') ||
+                  changed('phases');
                 if (coverageChanged) {
                   self.loadCoverage(); self.loadTrend(); self.loadGaps();
                   if (self.traceLoaded) self.loadTraceability(true);
@@ -1698,6 +1731,7 @@ document.addEventListener('alpine:init', function () {
        * then mermaid draws the fenced diagrams in place.
        */
       openAdr: async function (id) {
+        this.adrOpenId = id;
         this.adrDetailOpen = true;
         this.adrDetail = null;
         this.adrHtml = '';
@@ -1716,6 +1750,7 @@ document.addEventListener('alpine:init', function () {
       },
 
       closeAdr: function () {
+        this.adrOpenId = null;
         this.adrDetailOpen = false;
         this.adrDetail = null;
         this.adrHtml = '';
@@ -1776,6 +1811,7 @@ document.addEventListener('alpine:init', function () {
        * mockups, it never executes them.
        */
       openScreen: async function (id) {
+        this.screenOpenId = id;
         this.screenDetailOpen = true;
         this.screenDetail = null;
         this.screenHtml = '';
@@ -1790,6 +1826,7 @@ document.addEventListener('alpine:init', function () {
       },
 
       closeScreen: function () {
+        this.screenOpenId = null;
         this.screenDetailOpen = false;
         this.screenDetail = null;
         this.screenHtml = '';
@@ -1825,6 +1862,167 @@ document.addEventListener('alpine:init', function () {
         this.closeScreen();
         this.storySearch = storyId;
         this.navTo('stories');
+      },
+
+      // =========================================================================
+      // Deep links — /projects/<slug>[/<tab>[/<item>]][?version=<v>]
+      // =========================================================================
+      // The server answers any unknown GET with the dashboard shell, so every
+      // such path boots the app, which then reads the route from the URL. Back
+      // and Forward replay tab/project changes (pushed) while opening or closing
+      // an item within a tab only replaces the entry.
+
+      /** The current URL as {slug, tab, item, version}, or null for "/". */
+      parseRoute() {
+        var parts;
+        try {
+          parts = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+        } catch (_) { return null; }
+        if (parts[0] !== 'projects' || !parts[1]) return null;
+        var tab = ROUTE_TABS.indexOf(parts[2]) !== -1 ? parts[2] : 'overview';
+        return {
+          slug: parts[1],
+          tab: tab,
+          item: parts[2] === tab ? (parts[3] || '') : '',
+          version: new URLSearchParams(location.search).get('version') || '',
+        };
+      },
+
+      /**
+       * Path for a tab/item of the active project. The version is only spelled
+       * out when it is not the one the project opens on anyway.
+       */
+      routePath(tab, item) {
+        if (!this.activeProject || tab === 'global') return '/';
+        var p = '/projects/' + encodeURIComponent(this.activeProject.slug);
+        if (tab && tab !== 'overview') p += '/' + tab;
+        if (tab && tab !== 'overview' && item) p += '/' + encodeURIComponent(item);
+        if (this.versions.length > 1 && this.activeVersion &&
+            this.activeVersion !== this.versionMeta.currentVersion) {
+          p += '?version=' + encodeURIComponent(this.activeVersion);
+        }
+        return p;
+      },
+
+      /** The open item, as the URL should name it: a modal wins over the tab. */
+      currentRoutePath() {
+        if (this.screenDetailOpen && this.screenOpenId) return this.routePath('screens', this.screenOpenId);
+        if (this.adrDetailOpen && this.adrOpenId)       return this.routePath('adrs', this.adrOpenId);
+        if (this.storyDetailOpen && this.storyDetail)   return this.routePath('stories', this.storyDetail.id);
+        if (this.tab === 'requirements' && this.reqExpanded) return this.routePath('requirements', this.reqExpanded);
+        return this.routePath(this.tab, '');
+      },
+
+      /** Write the state into the URL: a new entry when `push`, else in place. */
+      syncUrl(push) {
+        if (!this._routeReady || this._routing) return;
+        var target = this.currentRoutePath();
+        if (target === location.pathname + location.search) return;
+        try {
+          if (push) history.pushState({}, '', target);
+          else history.replaceState(history.state, '', target);
+        } catch (_) {}
+      },
+
+      /** Start following the state, after first applying the boot route. */
+      _initRouting(route) {
+        var self = this;
+        if (route) this.applyRoute(route);
+        else this._routeReady = true;
+        // Signing in again after a session expiry re-runs bootDashboard().
+        if (this._routeWatching) return;
+        this._routeWatching = true;
+        ['tab', 'activeProject', 'activeVersion'].forEach(function (k) {
+          self.$watch(k, function () { self.syncUrl(true); });
+        });
+        ['reqExpanded', 'storyDetailOpen', 'adrDetailOpen', 'screenDetailOpen'].forEach(function (k) {
+          self.$watch(k, function () { self.syncUrl(false); });
+        });
+        // Normalise "/" (or a stale item) to the canonical path, in place.
+        this.$nextTick(function () { self.syncUrl(false); });
+      },
+
+      /** Drive the state from a route (boot or Back/Forward). */
+      async applyRoute(route) {
+        var self = this;
+        this._routing = true;
+        try {
+          if (!route) {
+            this._closeRouteModals('');
+            this.reqExpanded = null;
+            this.navTo(this.projects.length > 1 ? 'global' : 'overview');
+            return;
+          }
+          var proj = this.projects.find(function (p) { return p.slug === route.slug; });
+          if (!proj) return;
+          if (proj !== this.activeProject) await this.switchProject(proj.slug);
+          var version = route.version || this.versionMeta.currentVersion;
+          if (version && version !== this.activeVersion &&
+              this.versions.some(function (v) { return v.version === version; })) {
+            await this.switchVersion(version);
+          }
+          if (route.tab !== this.tab) this.navTo(route.tab);
+          this._openRouteItem(route);
+        } finally {
+          // Alpine runs watchers after the current tick; release only once the
+          // ones triggered above have seen `_routing` and stayed quiet.
+          setTimeout(function () {
+            self._routing = false;
+            self._routeReady = true;
+            self.syncUrl(false);
+          }, 0);
+        }
+      },
+
+      _closeRouteModals(keep) {
+        if (keep !== 'screens' && this.screenDetailOpen) this.closeScreen();
+        if (keep !== 'adrs' && this.adrDetailOpen) this.closeAdr();
+        if (keep !== 'stories' && this.storyDetailOpen) this.closeStoryDetail();
+      },
+
+      _openRouteItem(route) {
+        var id = route.item;
+        this._closeRouteModals(id ? route.tab : '');
+        if (route.tab === 'requirements') {
+          this.reqExpanded = id || null;
+          if (!id) return;
+          // A deep link must land on its row even if filters would hide it.
+          if (!this.filteredRequirements().some(function (r) { return r.id === id; })) {
+            this.reqSearch = '';
+            this.reqStatusFilter = 'all';
+            this.reqPriorityFilter = 'all';
+            this.reqComponentFilter = 'all';
+            this.reqPhaseFilter = 'all';
+          }
+          this.$nextTick(function () {
+            var el = document.getElementById('req-row-' + id);
+            if (el) el.scrollIntoView({ block: 'center' });
+          });
+          return;
+        }
+        if (!id) return;
+        if (route.tab === 'stories') {
+          if (this.storyDetailOpen && this.storyDetail && this.storyDetail.id === id) return;
+          var story = this.stories.find(function (s) { return s.id === id; });
+          if (story) this.openStoryDetail(story);
+        } else if (route.tab === 'adrs') {
+          if (this.adrOpenId !== id) this.openAdr(id);
+        } else if (route.tab === 'screens') {
+          if (this.screenOpenId !== id) this.openScreen(id);
+        }
+      },
+
+      /** Put the absolute link to an item (or tab) on the clipboard. */
+      copyLink(tab, item) {
+        var self = this;
+        var path = this.routePath(tab, item);
+        var done = function () {
+          self.linkCopied = path;
+          setTimeout(function () { if (self.linkCopied === path) self.linkCopied = ''; }, 1500);
+        };
+        try {
+          navigator.clipboard.writeText(location.origin + path).then(done, function () {});
+        } catch (_) {}
       },
 
       // =========================================================================
@@ -3229,8 +3427,8 @@ document.addEventListener('alpine:init', function () {
         // the focus to another node replaces that entry rather than stacking.
         try {
           var st = { traceFocus: n.id };
-          if (history.state && history.state.traceFocus) history.replaceState(st, '');
-          else history.pushState(st, '');
+          if (history.state && history.state.traceFocus) history.replaceState(st, '', location.href);
+          else history.pushState(st, '', location.href);
         } catch (_) {}
       },
 
